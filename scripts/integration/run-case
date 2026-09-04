@@ -66,6 +66,7 @@ peerprobe=''
 direct_mutation_file=''
 canonical_rebinding_mutation_file=''
 canonical_mtu_mutation_file=''
+shutdown_mutation_file=''
 rsprobe=''
 pollutionprobe=''
 shutdownprobe=''
@@ -188,6 +189,7 @@ cleanup_case_worker() {
 	if ! cleanup_direct_single_carrier; then cleanup_status=1; fi
 	if ! cleanup_canonical_rebinding; then cleanup_status=1; fi
 	if ! cleanup_canonical_mtu; then cleanup_status=1; fi
+	if ! cleanup_shutdown_mutations; then cleanup_status=1; fi
 	if (( worker_status == 0 && cleanup_status != 0 )); then worker_status=1; fi
 	exit "${worker_status}"
 }
@@ -760,6 +762,31 @@ cleanup_canonical_mtu() {
 			"$(mpudp_it_ns t1)" "out${family}" \
 			"$(mpudp_it_ns bob)" "b${family}p1")
 	done
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_shutdown_mutations() {
+	local marker=${shutdown_mutation_file:-${MPUDP_IT_STATE_DIR:-}/shutdown-cleanup.mutations}
+	local cleanup_path t_ns status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for cleanup_path in 1 2 3 4 5; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction both >/dev/null 2>&1; then
+			status=1
+		fi
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop \
+			--path "${cleanup_path}" --family 4 >/dev/null 2>&1; then
+			status=1
+		fi
+		t_ns=$(mpudp_it_ns "t${cleanup_path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "shutdown shard-drop rule remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ! assert_no_netem 4; then status=1; fi
 	if (( status == 0 )); then rm -f -- "${marker}"; fi
 	return "${status}"
 }
@@ -2292,11 +2319,13 @@ run_peer_shutdown_cleanup() {
 	local family=$1 path shard shard_hex baseline expected current stable attempt table nft_family
 	build_shutdownprobe
 	shutdown_fault_events=${MPUDP_IT_STATE_DIR}/${case_name}-faults.ndjson
+	shutdown_mutation_file=${MPUDP_IT_STATE_DIR}/shutdown-cleanup.mutations
 	: >"${shutdown_fault_events}"
 	table=${MPUDP_IT_TABLE4}; nft_family=ip
 	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
 
 	start_shutdown_pair active-transfer close "${family}"
+	: >"${shutdown_mutation_file}"
 	apply_shutdown_netem "${family}" forward delay 500ms
 	record_shutdown_fault fault_applied active-transfer 'forward-delay-500ms-all-paths'
 	printf 'send\n' >"${shutdown_send_file}"
@@ -2369,6 +2398,7 @@ run_peer_shutdown_cleanup() {
 		mpudp_it_die "shutdown diagnostics contain a forbidden sensitive field"
 		return 1
 	fi
+	cleanup_shutdown_mutations
 	sed -n 'p' "${shutdown_fault_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
 	mpudp_it_log "case passed: ${case_name} (four phases completed bounded signal/API shutdown with every fault cleared)"
 }

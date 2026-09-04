@@ -136,10 +136,12 @@ func TestCanonicalMutationCasesHaveWorkerExitCleanup(t *testing.T) {
 	for _, required := range []string{
 		`if ! cleanup_canonical_rebinding; then cleanup_status=1; fi`,
 		`if ! cleanup_canonical_mtu; then cleanup_status=1; fi`,
+		`if ! cleanup_shutdown_mutations; then cleanup_status=1; fi`,
 		`--kill-after=10s`,
 		`trap "exit 143" TERM`,
 		`canonical_rebinding_mutation_file=${MPUDP_IT_STATE_DIR}/endpoint-rebinding-and-expiry.mutations`,
 		`canonical_mtu_mutation_file=${MPUDP_IT_STATE_DIR}/mtu-budget-no-fragment.mutations`,
+		`shutdown_mutation_file=${MPUDP_IT_STATE_DIR}/shutdown-cleanup.mutations`,
 		`mpudp-expired-endpoint-drop`,
 		`for family in 4 6; do`,
 		`--path 1 --family "${family}" --value 1500`,
