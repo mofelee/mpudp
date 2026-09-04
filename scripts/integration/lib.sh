@@ -292,7 +292,7 @@ mpudp_it_process_matches_run() {
 			found_run_id=1
 		fi
 		case ${argument} in
-			*/netprobe | */peerprobe | */rsprobe | */capture-fragments | */capture-udp) found_helper=1 ;;
+			*/netprobe | */peerprobe | */rsprobe | */pollutionprobe | */shutdownprobe | */capture-fragments | */capture-udp) found_helper=1 ;;
 		esac
 	done <"/proc/${pid}/cmdline"
 	(( found_run_id != 0 && found_helper != 0 ))

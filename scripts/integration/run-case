@@ -67,6 +67,8 @@ direct_mutation_file=''
 canonical_rebinding_mutation_file=''
 canonical_mtu_mutation_file=''
 rsprobe=''
+pollutionprobe=''
+shutdownprobe=''
 build_netprobe() {
 	netprobe=${MPUDP_IT_STATE_DIR}/bin/netprobe
 	if [[ -x ${netprobe} ]]; then return 0; fi
@@ -109,6 +111,36 @@ build_rsprobe() {
 	)
 	chmod 0700 "${temporary}"
 	mv -- "${temporary}" "${rsprobe}"
+	trap - RETURN
+}
+
+build_pollutionprobe() {
+	pollutionprobe=${MPUDP_IT_STATE_DIR}/bin/pollutionprobe
+	if [[ -x ${pollutionprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${pollutionprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/pollutionprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${pollutionprobe}"
+	trap - RETURN
+}
+
+build_shutdownprobe() {
+	shutdownprobe=${MPUDP_IT_STATE_DIR}/bin/shutdownprobe
+	if [[ -x ${shutdownprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${shutdownprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/shutdownprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${shutdownprobe}"
 	trap - RETURN
 }
 
@@ -1913,6 +1945,434 @@ run_rs_scenario() {
 	mpudp_it_log "case passed: ${case_name} (deterministic authenticated Session/FEC invariants)"
 }
 
+assert_counter_delta_at_least() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4 baseline=$5 minimum_delta=$6 value delta
+	value=$(counter_for_comment "${namespace}" "${nft_family}" "${table}" "${comment}")
+	if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "${namespace} ${comment} counter is missing"
+		return 1
+	fi
+	delta=$((value - baseline))
+	if (( delta < minimum_delta )); then
+		mpudp_it_die "${namespace} ${comment} delta=${delta}, want >=${minimum_delta}"
+		return 1
+	fi
+}
+
+run_peer_auth_pollution() {
+	local family=$1 alice_ns bob_ns listen_address target targets table nft_family path kind
+	local listener_events attacker_events client_events listener_log attacker_log client_log
+	local ready_file attack_done_file checked_file reply_complete_file exit_file final_file
+	local listener_pid client_pid listener_status client_status
+	local -a path_counter_snapshot=() forward_before=() reverse_before=() legit_forward_before=() legit_reverse_before=()
+	build_pollutionprobe
+	build_peerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	target=$(mpudp_it_target "${family}" 1)
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-listener.ndjson
+	attacker_events=${MPUDP_IT_STATE_DIR}/${case_name}-attacker.ndjson
+	client_events=${MPUDP_IT_STATE_DIR}/${case_name}-legitimate.ndjson
+	listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-listener.log
+	attacker_log=${MPUDP_IT_STATE_DIR}/${case_name}-attacker.log
+	client_log=${MPUDP_IT_STATE_DIR}/${case_name}-legitimate.log
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	attack_done_file=${MPUDP_IT_STATE_DIR}/${case_name}.attack-done
+	checked_file=${MPUDP_IT_STATE_DIR}/${case_name}.checked
+	reply_complete_file=${MPUDP_IT_STATE_DIR}/${case_name}.reply-complete
+	exit_file=${MPUDP_IT_STATE_DIR}/${case_name}.exit
+	final_file=${MPUDP_IT_STATE_DIR}/${case_name}.final
+	rm -f -- "${ready_file}" "${attack_done_file}" "${checked_file}" "${reply_complete_file}" "${exit_file}" "${final_file}"
+	: >"${listener_log}"
+	: >"${attacker_log}"
+	: >"${client_log}"
+
+	snapshot_path_counters "${family}" mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	ip netns exec "${bob_ns}" "${pollutionprobe}" \
+		--role listener --family "${family}" --listen "${listen_address}" --max-udp-payload 1200 \
+		--high-sources 128 --body-bytes 512 --reply-bytes 257 --timeout "${case_timeout}s" \
+		--run-id "${MPUDP_IT_RUN_ID}" --events "${listener_events}" --ready-file "${ready_file}" \
+		--attack-done-file "${attack_done_file}" --checked-file "${checked_file}" \
+		--reply-complete-file "${reply_complete_file}" --exit-file "${exit_file}" --final-file "${final_file}" \
+		>"${listener_log}" 2>&1 &
+	listener_pid=$!
+	mpudp_it_record_pid "${listener_pid}"
+	if ! wait_ready "${ready_file}" "${listener_pid}"; then
+		mpudp_it_die "pollution listener did not become ready; see ${listener_log}"
+		return 1
+	fi
+
+	if ! timeout --signal=TERM --kill-after=2s 12s \
+		ip netns exec "${alice_ns}" "${pollutionprobe}" \
+			--role attacker --family "${family}" --target "${target}" --max-udp-payload 1200 \
+			--high-sources 128 --timeout 10s --run-id "${MPUDP_IT_RUN_ID}" --events "${attacker_events}" \
+			>"${attacker_log}" 2>&1; then
+		mpudp_it_die "pollution attack probe failed; see ${attacker_log}"
+		return 1
+	fi
+	printf 'done\n' >"${attack_done_file}"
+	if ! wait_ready "${checked_file}" "${listener_pid}"; then
+		mpudp_it_die "listener did not prove clean state after attacks; see ${listener_log}"
+		return 1
+	fi
+	assert_counter_delta_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-forward "${forward_before[0]}" 133
+	for path in 1 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+	done
+	for kind in wrong-psk single-bit-tamper forged-session-id malformed oversized; do
+		grep -q "\"event\":\"attack_class_complete\".*\"packets\":1.*\"phase\":\"${kind}\".*\"responses\":0" \
+			"${attacker_events}" || { mpudp_it_die "missing zero-response evidence for ${kind}"; return 1; }
+	done
+	grep -q '"event":"attack_class_complete".*"packets":128.*"phase":"high-cardinality".*"responses":0' \
+		"${attacker_events}" || { mpudp_it_die "missing high-cardinality zero-response evidence"; return 1; }
+	grep -q '"event":"attack_batch_complete".*"packets":133.*"responses":0.*"unique_sources":133' \
+		"${attacker_events}" || { mpudp_it_die "attack batch did not retain 133 unique zero-response sources"; return 1; }
+	grep -q '"event":"pollution_state_clean".*"sessions":0' "${listener_events}" || {
+		mpudp_it_die "listener did not record bounded zero-Session state"
+		return 1
+	}
+
+	snapshot_path_counters "${family}" mpudp-forward-data
+	legit_forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse-data
+	legit_reverse_before=("${path_counter_snapshot[@]}")
+	targets=$(mpudp_it_join_targets "${family}")
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${alice_ns}" "${peerprobe}" \
+			--role initiator --flow pollution-live --family "${family}" --carriers "${targets}" \
+			--max-udp-payload 1200 --body-bytes 512 --reply-bytes 257 --timeout "${case_timeout}s" \
+			--run-id "${MPUDP_IT_RUN_ID}" --events "${client_events}" \
+			--reply-complete-file "${reply_complete_file}" --exit-file "${exit_file}" --final-file "${final_file}" \
+			>"${client_log}" 2>&1 &
+	client_pid=$!
+	mpudp_it_record_pid "${client_pid}"
+	if ! wait_ready "${exit_file}" "${client_pid}"; then
+		mpudp_it_die "legitimate client did not complete after pollution; see ${client_log}"
+		return 1
+	fi
+	printf 'finish\n' >"${final_file}"
+	set +e
+	wait "${client_pid}"
+	client_status=$?
+	if (( client_status != 0 )) && kill -0 "${listener_pid}" 2>/dev/null; then kill -TERM "${listener_pid}" 2>/dev/null || true; fi
+	wait "${listener_pid}"
+	listener_status=$?
+	set -e
+	if (( client_status != 0 || listener_status != 0 )); then
+		mpudp_it_die "post-pollution liveness process failure: client=${client_status} listener=${listener_status}; see ${client_log} and ${listener_log}"
+		return 1
+	fi
+	grep -q '"event":"legitimate_exchange_complete".*"received_bytes":512.*"reply_bytes":257' "${listener_events}" || {
+		mpudp_it_die "attacked listener did not complete the legitimate exchange"
+		return 1
+	}
+	grep -q '"event":"datagram_received","phase":"main","bytes":257' "${client_events}" || {
+		mpudp_it_die "legitimate client did not receive the post-attack reply"
+		return 1
+	}
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-data "${legit_forward_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-data "${legit_reverse_before[$((path - 1))]}"
+	done
+	if grep -Fqi 'integration-test-key' "${listener_events}" "${attacker_events}" "${client_events}" ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${listener_events}" "${attacker_events}" "${client_events}"; then
+		mpudp_it_die "pollution diagnostics contain a forbidden sensitive field"
+		return 1
+	fi
+	sed -n 'p' "${listener_events}" "${attacker_events}" "${client_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (six attack classes retained no state or responses; attacked Peer remained live)"
+}
+
+sum_path_counters() {
+	local family=$1 comment=$2 table nft_family path value total=0
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	for path in 1 2 3 4 5; do
+		value=$(counter_for_comment "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" "${comment}")
+		if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "T${path} ${comment} counter is missing"
+			return 1
+		fi
+		total=$((total + value))
+	done
+	printf '%s\n' "${total}"
+}
+
+assert_no_netem() {
+	local family=$1 path alice_ns bob_ns alice_if bob_if
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	for path in 1 2 3 4 5; do
+		alice_if=$(mpudp_it_alice_if "${family}" "${path}")
+		bob_if=$(mpudp_it_bob_if "${family}" "${path}")
+		if ip netns exec "${alice_ns}" tc qdisc show dev "${alice_if}" | grep ' netem ' >/dev/null ||
+			ip netns exec "${bob_ns}" tc qdisc show dev "${bob_if}" | grep ' netem ' >/dev/null; then
+			mpudp_it_die "netem residue remains on path ${path}"
+			return 1
+		fi
+	done
+}
+
+apply_shutdown_netem() {
+	local family=$1 direction=$2 kind=$3 value=$4 path
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path "${path}" --family "${family}" \
+			--direction "${direction}" "--${kind}" "${value}"
+	done
+}
+
+clear_shutdown_netem() {
+	local family=$1 direction=$2 path
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path "${path}" --family "${family}" \
+			--direction "${direction}"
+	done
+	assert_no_netem "${family}"
+}
+
+record_shutdown_fault() {
+	local event_name=$1 phase=$2 fault=$3
+	printf '{"event":"%s","fault":"%s","phase":"%s","run_id":"%s"}\n' \
+		"${event_name}" "${fault}" "${phase}" "${MPUDP_IT_RUN_ID}" >>"${shutdown_fault_events}"
+}
+
+start_shutdown_pair() {
+	local phase=$1 action=$2 family=$3 alice_ns bob_ns listen_address targets table nft_family path attempt all_ready current
+	local -a listener_args initiator_args path_counter_snapshot=() ack_before=()
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	targets=$(mpudp_it_join_targets "${family}")
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	if [[ ${phase} != handshake ]]; then
+		snapshot_path_counters "${family}" mpudp-reverse-control
+		ack_before=("${path_counter_snapshot[@]}")
+	fi
+	shutdown_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-bob.ndjson
+	shutdown_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-alice.ndjson
+	shutdown_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-bob.log
+	shutdown_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-alice.log
+	shutdown_ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.ready
+	shutdown_listener_phase=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.bob-phase
+	shutdown_initiator_phase=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.alice-phase
+	shutdown_bootstrap_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.bootstrap
+	shutdown_send_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.send
+	shutdown_sent_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.sent
+	shutdown_close_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.close
+	rm -f -- "${shutdown_ready_file}" "${shutdown_listener_phase}" "${shutdown_initiator_phase}" \
+		"${shutdown_bootstrap_file}" "${shutdown_send_file}" "${shutdown_sent_file}" "${shutdown_close_file}"
+	: >"${shutdown_listener_log}"
+	: >"${shutdown_initiator_log}"
+	listener_args=(
+		--role listener --phase "${phase}" --action "${action}" --family "${family}" --listen "${listen_address}"
+		--body-bytes 1536 --timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}"
+		--events "${shutdown_listener_events}" --ready-file "${shutdown_ready_file}"
+		--phase-ready-file "${shutdown_listener_phase}"
+	)
+	initiator_args=(
+		--role initiator --phase "${phase}" --action "${action}" --family "${family}" --carriers "${targets}"
+		--body-bytes 1536 --timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}"
+		--events "${shutdown_initiator_events}" --phase-ready-file "${shutdown_initiator_phase}"
+	)
+	if [[ ${action} == close ]]; then
+		listener_args+=(--close-file "${shutdown_close_file}")
+		initiator_args+=(--close-file "${shutdown_close_file}")
+	fi
+	if [[ ${phase} == active-transfer || ${phase} == decode-incomplete ]]; then
+		initiator_args+=(--send-file "${shutdown_send_file}" --sent-file "${shutdown_sent_file}")
+	fi
+	if [[ ${phase} != handshake ]]; then
+		initiator_args+=(--bootstrap-file "${shutdown_bootstrap_file}")
+	fi
+	ip netns exec "${bob_ns}" "${shutdownprobe}" "${listener_args[@]}" >"${shutdown_listener_log}" 2>&1 &
+	shutdown_listener_pid=$!
+	mpudp_it_record_pid "${shutdown_listener_pid}"
+	if ! wait_ready "${shutdown_ready_file}" "${shutdown_listener_pid}"; then
+		mpudp_it_die "${phase} listener did not bind; see ${shutdown_listener_log}"
+		return 1
+	fi
+	if [[ ${phase} == handshake ]]; then
+		apply_shutdown_netem "${family}" forward loss 100%
+		record_shutdown_fault fault_applied "${phase}" 'forward-loss-100-percent-all-paths'
+	fi
+	ip netns exec "${alice_ns}" "${shutdownprobe}" "${initiator_args[@]}" >"${shutdown_initiator_log}" 2>&1 &
+	shutdown_initiator_pid=$!
+	mpudp_it_record_pid "${shutdown_initiator_pid}"
+	if [[ ${phase} != handshake ]]; then
+		all_ready=0
+		for attempt in $(seq 1 100); do
+			all_ready=1
+			for path in 1 2 3 4 5; do
+				current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" mpudp-reverse-control)
+				if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= ack_before[$((path - 1))] )); then
+					all_ready=0
+				fi
+			done
+			if (( all_ready != 0 )); then break; fi
+			if ! kill -0 "${shutdown_initiator_pid}" 2>/dev/null || ! kill -0 "${shutdown_listener_pid}" 2>/dev/null; then break; fi
+			sleep 0.05
+		done
+		if (( all_ready == 0 )); then
+			mpudp_it_die "${phase} did not authenticate all five Carriers before bootstrap"
+			return 1
+		fi
+		printf 'bootstrap\n' >"${shutdown_bootstrap_file}"
+	fi
+	if ! wait_ready "${shutdown_listener_phase}" "${shutdown_listener_pid}" ||
+		! wait_ready "${shutdown_initiator_phase}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "${phase} helpers did not reach the requested lifecycle phase; see ${shutdown_listener_log} and ${shutdown_initiator_log}"
+		return 1
+	fi
+}
+
+wait_shutdown_helper() {
+	local pid=$1 log=$2 label=$3 attempt status
+	for attempt in $(seq 1 60); do
+		if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+		sleep 0.05
+	done
+	if kill -0 "${pid}" 2>/dev/null; then
+		mpudp_it_die "${label} did not exit within 3 seconds; see ${log}"
+		return 1
+	fi
+	set +e
+	wait "${pid}"
+	status=$?
+	set -e
+	if (( status != 0 )); then
+		mpudp_it_die "${label} exited ${status}; see ${log}"
+		return 1
+	fi
+}
+
+finish_shutdown_pair() {
+	local phase=$1 action=$2 events
+	if [[ ${action} == signal ]]; then
+		kill -TERM "${shutdown_listener_pid}" "${shutdown_initiator_pid}"
+	else
+		printf 'close\n' >"${shutdown_close_file}"
+	fi
+	wait_shutdown_helper "${shutdown_initiator_pid}" "${shutdown_initiator_log}" "${phase} initiator"
+	wait_shutdown_helper "${shutdown_listener_pid}" "${shutdown_listener_log}" "${phase} listener"
+	for events in "${shutdown_listener_events}" "${shutdown_initiator_events}"; do
+		grep -q "\"event\":\"phase_ready\".*\"phase\":\"${phase}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not record phase readiness"
+			return 1
+		}
+		grep -q "\"event\":\"shutdown_trigger\".*\"phase\":\"${phase}\".*\"trigger\":\"${action}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not record ${action} trigger"
+			return 1
+		}
+		grep -q "\"event\":\"peer_close_complete\".*\"phase\":\"${phase}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not complete bounded Peer.Close"
+			return 1
+		}
+	done
+	if [[ -e /proc/${shutdown_listener_pid} || -e /proc/${shutdown_initiator_pid} ]]; then
+		mpudp_it_die "${phase} left a helper process after bounded shutdown"
+		return 1
+	fi
+	sed -n 'p' "${shutdown_listener_events}" "${shutdown_initiator_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+}
+
+run_peer_shutdown_cleanup() {
+	local family=$1 path shard shard_hex baseline expected current stable attempt table nft_family
+	build_shutdownprobe
+	shutdown_fault_events=${MPUDP_IT_STATE_DIR}/${case_name}-faults.ndjson
+	: >"${shutdown_fault_events}"
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+
+	start_shutdown_pair active-transfer close "${family}"
+	apply_shutdown_netem "${family}" forward delay 500ms
+	record_shutdown_fault fault_applied active-transfer 'forward-delay-500ms-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "active-transfer initiator did not place the in-flight Datagram"
+		return 1
+	fi
+	finish_shutdown_pair active-transfer close
+	clear_shutdown_netem "${family}" forward
+	record_shutdown_fault fault_cleared active-transfer 'forward-delay-500ms-all-paths'
+
+	start_shutdown_pair decode-incomplete signal "${family}"
+	baseline=$(sum_path_counters "${family}" mpudp-forward-data)
+	for path in 1 2 3 4 5; do
+		for shard in 2 3 4; do
+			printf -v shard_hex '%02x' "${shard}"
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${path}" --family "${family}" \
+				--offset 34 --hex "${shard_hex}"
+		done
+	done
+	record_shutdown_fault fault_applied decode-incomplete 'drop-shard-indexes-2-3-4-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "decode-incomplete initiator did not send its Datagram"
+		return 1
+	fi
+	expected=$((baseline + 2))
+	stable=0
+	for attempt in $(seq 1 40); do
+		current=$(sum_path_counters "${family}" mpudp-forward-data)
+		if (( current > expected )); then
+			mpudp_it_die "decode-incomplete delivered $((current - baseline)) shards, want exactly 2"
+			return 1
+		fi
+		if (( current == expected )); then stable=$((stable + 1)); else stable=0; fi
+		if (( stable == 3 )); then break; fi
+		sleep 0.05
+	done
+	if (( stable != 3 )); then
+		mpudp_it_die "decode-incomplete did not stabilize at exactly 2 delivered shards"
+		return 1
+	fi
+	finish_shutdown_pair decode-incomplete signal
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path "${path}" --family "${family}"
+		if ip netns exec "$(mpudp_it_ns "t${path}")" nft list chain "${nft_family}" "${table}" forward | grep 'mpudp-drop-' >/dev/null; then
+			mpudp_it_die "decode-incomplete left a shard drop rule on path ${path}"
+			return 1
+		fi
+	done
+	record_shutdown_fault fault_cleared decode-incomplete 'drop-shard-indexes-2-3-4-all-paths'
+
+	start_shutdown_pair network-fault close "${family}"
+	apply_shutdown_netem "${family}" both loss 100%
+	record_shutdown_fault fault_applied network-fault 'bidirectional-loss-100-percent-all-paths'
+	finish_shutdown_pair network-fault close
+	clear_shutdown_netem "${family}" both
+	record_shutdown_fault fault_cleared network-fault 'bidirectional-loss-100-percent-all-paths'
+
+	# Run the abandoned handshake last so its live UDP conntrack tuples cannot
+	# alias a later fresh process that happens to reuse the same source ports.
+	start_shutdown_pair handshake signal "${family}"
+	finish_shutdown_pair handshake signal
+	clear_shutdown_netem "${family}" forward
+	record_shutdown_fault fault_cleared handshake 'forward-loss-100-percent-all-paths'
+
+	if grep -Fqi 'integration-test-key' "${MPUDP_IT_STATE_DIR}"/${case_name}-*.ndjson ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${MPUDP_IT_STATE_DIR}"/${case_name}-*.ndjson; then
+		mpudp_it_die "shutdown diagnostics contain a forbidden sensitive field"
+		return 1
+	fi
+	sed -n 'p' "${shutdown_fault_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (four phases completed bounded signal/API shutdown with every fault cleared)"
+}
+
 run_case_worker() {
 	state_dir=$1
 	case_name=$2
@@ -1941,6 +2401,8 @@ run_case_worker() {
 		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
 		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;
 		peer-endpoint-expiry) run_peer_endpoint_expiry "${family}" ;;
+		peer-auth-pollution) run_peer_auth_pollution "${family}" ;;
+		peer-shutdown-cleanup) run_peer_shutdown_cleanup "${family}" ;;
 		*) mpudp_it_die "unsupported runner ${runner}"; return 2 ;;
 	esac
 }
