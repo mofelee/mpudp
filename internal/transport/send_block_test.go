@@ -142,6 +142,9 @@ func TestSendBlockRecomputesAvailableSetForLaterBlocks(t *testing.T) {
 	if got, want := []string{result.Attempts[0].PathID, result.Attempts[1].PathID, result.Attempts[2].PathID}, []string{"C", "B", "C"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("second block paths = %v, want %v", got, want)
 	}
+	if got, want := []int{result.Attempts[0].PathIndex, result.Attempts[1].PathIndex, result.Attempts[2].PathIndex}, []int{2, 1, 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("second block input indexes = %v, want %v", got, want)
+	}
 }
 
 func TestSendBlockBoundsAvailablePathsBeforeScheduling(t *testing.T) {

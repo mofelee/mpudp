@@ -11,9 +11,11 @@ import (
 // on success. It contains no packet bytes.
 type ShardAttempt struct {
 	ShardIndex int
-	PathIndex  int
-	PathID     string
-	Err        error
+	// PathIndex indexes the paths slice passed to SendBlock, even when
+	// unavailable entries were filtered before scheduling.
+	PathIndex int
+	PathID    string
+	Err       error
 }
 
 // BlockSendResult describes every attempted shard send. PathsAvailable is the
@@ -58,10 +60,14 @@ func SendBlock(ctx context.Context, packetID uint64, shards [][]byte, paths []Pa
 		return result, invalidArgument("nil send context")
 	}
 
-	available := make([]Path, 0, len(paths))
-	for _, path := range paths {
+	type availablePath struct {
+		path       Path
+		inputIndex int
+	}
+	available := make([]availablePath, 0, len(paths))
+	for inputIndex, path := range paths {
 		if path != nil && path.Available() {
-			available = append(available, path)
+			available = append(available, availablePath{path: path, inputIndex: inputIndex})
 		}
 	}
 	result.PathsAvailable = len(available)
@@ -79,15 +85,15 @@ func SendBlock(ctx context.Context, packetID uint64, shards [][]byte, paths []Pa
 	}
 
 	result.Attempts = make([]ShardAttempt, 0, len(shards))
-	for shardIndex, pathIndex := range assignments {
-		path := available[pathIndex]
+	for shardIndex, availableIndex := range assignments {
+		selected := available[availableIndex]
 		attempt := ShardAttempt{
 			ShardIndex: shardIndex,
-			PathIndex:  pathIndex,
-			PathID:     path.PathID(),
+			PathIndex:  selected.inputIndex,
+			PathID:     selected.path.PathID(),
 		}
 		result.Attempted++
-		if sendErr := path.Send(ctx, shards[shardIndex]); sendErr != nil {
+		if sendErr := selected.path.Send(ctx, shards[shardIndex]); sendErr != nil {
 			attempt.Err = sendErr
 		} else {
 			result.Succeeded++
