@@ -451,7 +451,8 @@ assert_five_carrier_sockets() {
 start_peer_exchange() {
 	local family=$1 flow=$2 listener_budget=$3 initiator_budget=$4 body_bytes=$5 reply_bytes=$6
 	local oversize_bytes=$7 expect_partial_mtu=$8 reject_second_session=$9
-	local targets_override=${10:-} alice_ns bob_ns listen_address targets peer_start_marker peer_start_phase
+	local targets_override=${10:-} endpoint_ttl=${11:-} keepalive=${12:-} expiry_wait=${13:-}
+	local alice_ns bob_ns listen_address targets peer_start_marker peer_start_phase
 	local -a listener_arguments initiator_arguments
 	build_peerprobe
 	alice_ns=$(mpudp_it_ns alice)
@@ -478,7 +479,7 @@ start_peer_exchange() {
 	peer_has_oversize=0
 	rm -f -- "${peer_ready_file}" "${peer_oversize_ready_file}" "${peer_oversize_continue_file}" \
 		"${peer_oversize_done_file}" "${peer_phase_file}" "${peer_continue_file}" "${peer_reply_complete_file}" \
-		"${peer_exit_file}" "${peer_final_file}"
+		"${peer_exit_file}" "${peer_final_file}" "${peer_final_file}.post-expiry-done"
 	: >"${peer_listener_log}"
 	: >"${peer_initiator_log}"
 	listener_arguments=(
@@ -489,6 +490,9 @@ start_peer_exchange() {
 		--exit-file "${peer_exit_file}" --final-file "${peer_final_file}"
 	)
 	if [[ ${reject_second_session} == true ]]; then listener_arguments+=(--reject-second-session); fi
+	if [[ -n ${endpoint_ttl} ]]; then listener_arguments+=(--endpoint-ttl "${endpoint_ttl}"); fi
+	if [[ -n ${keepalive} ]]; then listener_arguments+=(--keepalive "${keepalive}"); fi
+	if [[ -n ${expiry_wait} ]]; then listener_arguments+=(--expiry-wait "${expiry_wait}"); fi
 	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
 		ip netns exec "${bob_ns}" "${peerprobe}" "${listener_arguments[@]}" >"${peer_listener_log}" 2>&1 &
 	peer_listener_pid=$!
@@ -506,6 +510,9 @@ start_peer_exchange() {
 		--reply-complete-file "${peer_reply_complete_file}" --exit-file "${peer_exit_file}"
 		--final-file "${peer_final_file}"
 	)
+	if [[ -n ${endpoint_ttl} ]]; then initiator_arguments+=(--endpoint-ttl "${endpoint_ttl}"); fi
+	if [[ -n ${keepalive} ]]; then initiator_arguments+=(--keepalive "${keepalive}"); fi
+	if [[ -n ${expiry_wait} ]]; then initiator_arguments+=(--expiry-wait "${expiry_wait}"); fi
 	if (( oversize_bytes != 0 )); then
 		peer_has_oversize=1
 		initiator_arguments+=(
@@ -840,6 +847,205 @@ run_direct_single_carrier() {
 	mpudp_it_log "case passed: ${case_name} (direct IPv4, one stable OS-assigned Carrier, exact non-empty/empty Datagram boundaries)"
 }
 
+assert_transit_namespaces_idle() {
+	local path namespace
+	for path in 1 2 3 4 5; do
+		namespace=$(mpudp_it_ns "t${path}")
+		if [[ -n $(ip netns pids "${namespace}") ]]; then
+			mpudp_it_die "T${path} runs a process; transparent forwarding must use only kernel nftables/conntrack"
+			return 1
+		fi
+	done
+}
+
+assert_event_count() {
+	local file=$1 event_name=$2 phase=$3 bytes=$4 expected=$5 description=$6 marker count
+	marker="\"event\":\"${event_name}\",\"phase\":\"${phase}\",\"bytes\":${bytes}"
+	count=$(awk -v marker="${marker}" 'index($0, marker) {count++} END {print count+0}' "${file}")
+	if [[ ${count} != "${expected}" ]]; then
+		mpudp_it_die "${description} event count=${count}, want ${expected}"
+		return 1
+	fi
+}
+
+run_transparent_nat_reverse_path() {
+	local family=$1 path alice_ns bob_ns bob_address alice_address table nft_family
+	local forward_bytes=1541 reply_bytes=887 forward_wire=585 reverse_wire=367
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	local -a path_counter_snapshot=() forward_before=() reverse_before=()
+	local -a forward_data_before=() reverse_data_before=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "transparent-nat-reverse-path currently has an explicit IPv4 contract"
+		return 2
+	fi
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	table=${MPUDP_IT_TABLE4}
+	nft_family=ip
+	assert_transit_namespaces_idle
+	for path in 1 2 3 4 5; do
+		bob_address=$(mpudp_it_bob_addr 4 "${path}")
+		alice_address=$(mpudp_it_alice_addr 4 "${path}")
+		if ip -n "${alice_ns}" -4 route get "${bob_address}" >/dev/null 2>&1; then
+			mpudp_it_die "Alice unexpectedly has a route to Bob path ${path}; the Carrier must target T${path}"
+			return 1
+		fi
+		if ip -n "${bob_ns}" -4 route get "${alice_address}" >/dev/null 2>&1; then
+			mpudp_it_die "Bob unexpectedly has a route to Alice path ${path}; reverse traffic must use conntrack"
+			return 1
+		fi
+	done
+
+	start_fragment_observers 4 canonical-nat
+	start_udp_observers 4 both canonical-nat
+	snapshot_path_counters 4 mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-forward-data
+	forward_data_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-reverse-data
+	reverse_data_before=("${path_counter_snapshot[@]}")
+
+	start_peer_exchange 4 transparent-nat-reverse-path 1200 1200 \
+		"${forward_bytes}" "${reply_bytes}" 0 false false
+	assert_five_carrier_sockets 4 canonical-nat
+	release_peer_exchange
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more canonical NAT UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more canonical NAT fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_length_all_paths_direction "${forward_wire}" forward
+	assert_udp_length_all_paths_direction "${reverse_wire}" reverse
+	assert_no_wire_fragments
+	assert_transit_namespaces_idle
+
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-data "${forward_data_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-data "${reverse_data_before[$((path - 1))]}"
+	done
+	assert_event_count "${peer_listener_events}" datagram_received main "${forward_bytes}" 1 \
+		"Bob canonical NAT delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received main "${reply_bytes}" 1 \
+		"Alice canonical NAT reverse delivery"
+	mpudp_it_log "case passed: ${case_name} (five kernel-only DNAT/SNAT paths and listener-port conntrack replies)"
+}
+
+assert_reverse_endpoint_length() {
+	local expected=$1 port=$2 mode=$3 pattern
+	pattern="\\.9000 > [^ ]+\\.${port}: UDP, length ${expected}$"
+	if [[ ${mode} == present ]]; then
+		if ! grep -Eq "${pattern}" "${udp_event_files[0]}"; then
+			mpudp_it_die "T1 did not observe reverse UDP length ${expected} to NAT port ${port}"
+			return 1
+		fi
+	elif grep -Eq "${pattern}" "${udp_event_files[0]}"; then
+		mpudp_it_die "T1 observed post-expiry UDP length ${expected} to expired NAT port ${port}"
+		return 1
+	fi
+}
+
+run_endpoint_rebinding_and_expiry() {
+	local family=$1 path t1_ns old_drop_before old_drop_after wait_started expired elapsed accepted_count
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "endpoint-rebinding-and-expiry currently has an explicit IPv4 contract"
+		return 2
+	fi
+	t1_ns=$(mpudp_it_ns t1)
+	cleanup_canonical_rebinding() {
+		for cleanup_path in 2 3; do
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+				--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1 || true
+		done
+		remove_nft_rules_with_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" forward \
+			mpudp-expired-endpoint-drop >/dev/null 2>&1 || true
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-rebind \
+			--path 1 --family 4 >/dev/null 2>&1 || true
+	}
+	trap cleanup_canonical_rebinding RETURN
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family 4 --zone 101 --source-port 41001
+	start_fragment_observers 4 canonical-rebinding
+	start_udp_observers 4 both canonical-rebinding
+	start_peer_exchange 4 endpoint-rebinding-and-expiry 1200 1200 2049 1027 0 false true "" 5s 1s 6s
+	wait_for_udp_source_port 1 41001
+	assert_five_carrier_sockets 4 before-canonical-rebind
+
+	ip netns exec "${t1_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname out4 ct zone 101 udp sport 9000 counter drop comment mpudp-expired-endpoint-drop
+	old_drop_before=$(counter_for_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-expired-endpoint-drop)
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family 4 --zone 102 --source-port 41002
+	for path in 2 3; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem \
+			--path "${path}" --family 4 --direction forward --loss 100%
+	done
+
+	release_peer_exchange
+	wait_for_udp_source_port 1 41002
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more canonical rebinding UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more canonical rebinding fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_no_wire_fragments
+	assert_udp_lengths_at_most 1200
+	assert_udp_length_paths_direction 754 forward 1 4 5
+	assert_udp_length_absent_direction 754 forward 2
+	assert_udp_length_absent_direction 754 forward 3
+	assert_udp_length_paths_direction 182 reverse 1 4 5
+	assert_udp_length_absent_direction 182 reverse 2
+	assert_udp_length_absent_direction 182 reverse 3
+	assert_reverse_endpoint_length 182 41002 present
+	assert_reverse_endpoint_length 182 41001 absent
+
+	old_drop_after=$(counter_for_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-expired-endpoint-drop)
+	if [[ ! ${old_drop_before} =~ ^[0-9]+$ || ! ${old_drop_after} =~ ^[0-9]+$ ]] ||
+		(( old_drop_after <= old_drop_before )); then
+		mpudp_it_die "the old Endpoint did not fail on the isolated zone-101 reverse path"
+		return 1
+	fi
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-snat-101-41001 1
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-snat-102-41002 1
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-reverse-102-41002 1
+	accepted_count=$(grep -c '"event":"session_accepted"' "${peer_listener_events}" || true)
+	if [[ ${accepted_count} != 1 ]] ||
+		! grep -q '"event":"single_session_retained","phase":"main"' "${peer_listener_events}"; then
+		mpudp_it_die "rebinding did not retain exactly one accepted Session"
+		return 1
+	fi
+	wait_started=$(sed -n 's/.*"event":"expiry_wait_started".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' \
+		"${peer_listener_events}" | sed -n '1p')
+	expired=$(sed -n 's/.*"event":"endpoint_expiry_verified".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' \
+		"${peer_listener_events}" | sed -n '1p')
+	if [[ ! ${wait_started} =~ ^[0-9]+$ || ! ${expired} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "rebinding expiry timing metadata is missing"
+		return 1
+	fi
+	elapsed=$((expired - wait_started))
+	if (( elapsed < 5000 )); then
+		mpudp_it_die "old Endpoint expiry proof completed after only ${elapsed}ms"
+		return 1
+	fi
+	assert_event_count "${peer_listener_events}" datagram_received main 2049 1 \
+		"Bob rebound-path delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received post-expiry 333 1 \
+		"Alice post-expiry delivery"
+
+	cleanup_canonical_rebinding
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (41001 failed, 41002 joined, old Endpoint expired after ${elapsed}ms, same Session survived)"
+}
+
 run_peer_smoke() {
 	local family=$1 path table nft_family before_sockets after_sockets socket_difference
 	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
@@ -896,6 +1102,122 @@ run_peer_smoke() {
 	grep -q '"event":"datagram_received","phase":"main","bytes":2048' "${peer_listener_events}" || { mpudp_it_die "Bob did not record the 2048-byte public Datagram"; return 1; }
 	grep -q '"event":"datagram_received","phase":"main","bytes":1025' "${peer_initiator_events}" || { mpudp_it_die "Alice did not record the 1025-byte public reply"; return 1; }
 	mpudp_it_log "case passed: ${case_name} (public Peer 3+2 Datagram crossed five stable Carrier sockets)"
+}
+
+run_canonical_mtu_safe_phase() {
+	local family=$1 flow=$2 path_mtu=$3 listener_budget=$4 initiator_budget=$5
+	local exact_bytes=$6 wire_budget=$7 oversize_bytes path table nft_family
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=() udp_event_counts=()
+	local -a path_counter_snapshot=() forward_before=() reverse_before=()
+	oversize_bytes=$((exact_bytes + 1))
+	table=${MPUDP_IT_TABLE4}
+	nft_family=ip
+	if [[ ${family} == 6 ]]; then
+		table=${MPUDP_IT_TABLE6}
+		nft_family=ip6
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+		--path 1 --family "${family}" --value "${path_mtu}"
+	start_fragment_observers "${family}" "${flow}"
+	start_udp_observers "${family}" both "${flow}"
+	start_peer_exchange "${family}" "${flow}" "${listener_budget}" "${initiator_budget}" \
+		"${exact_bytes}" "${exact_bytes}" "${oversize_bytes}" false false
+	assert_five_carrier_sockets "${family}" "${flow}"
+	# The probe is blocked before either tested WritePacket, so this snapshot
+	# distinguishes local exact-limit+1 rejection from any emitted shard.
+	sleep 0.2
+	snapshot_udp_event_counts
+	snapshot_path_counters "${family}" mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	release_peer_oversize
+	sleep 0.1
+	assert_udp_event_counts_unchanged
+	for path in 1 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+	done
+	release_peer_exchange
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "${flow} UDP observer exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "${flow} fragment observer exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most "${wire_budget}"
+	assert_udp_length_all_paths_direction "${wire_budget}" forward
+	assert_udp_length_all_paths_direction "${wire_budget}" reverse
+	assert_no_wire_fragments
+	assert_event_count "${peer_listener_events}" datagram_received main "${exact_bytes}" 1 \
+		"${flow} exact-limit forward delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received main "${exact_bytes}" 1 \
+		"${flow} exact-limit reverse delivery"
+	if ! grep -q "\"event\":\"oversize_rejected\",\"phase\":\"oversize\",\"bytes\":${oversize_bytes}.*\"error_kinds\":\\[\"message_too_large\"\\]" \
+		"${peer_initiator_events}"; then
+		mpudp_it_die "${flow} exact-limit+1 rejection metadata is missing"
+		return 1
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+		--path 1 --family "${family}" --value 1500
+}
+
+run_mtu_budget_no_fragment() {
+	local _manifest_family=$1 path
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	local -a path_counter_snapshot=() failure_forward_before=()
+	mpudp_it_require_commands tcpdump grep
+	restore_canonical_mtu() {
+		for restore_family in 4 6; do
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+				--path 1 --family "${restore_family}" --value 1500 >/dev/null 2>&1 || true
+		done
+	}
+	trap restore_canonical_mtu RETURN
+
+	# The first exchange freezes min(1200,1000) in both directions.
+	run_canonical_mtu_safe_phase 4 mtu-negotiate 1500 1000 1200 2787 1000
+	# The second runs at IPv6's minimum link MTU with the default safe budget.
+	run_canonical_mtu_safe_phase 6 mtu-ipv6-minimum 1280 1200 1200 3387 1200
+	# The third proves an explicitly lowered global tunnel budget over IPv4.
+	run_canonical_mtu_safe_phase 4 mtu-small-tunnel 576 520 1200 1347 520
+
+	# Finally, deliberately overstate path 1's budget. Linux DF/PMTU must
+	# reject its full-size shard while the remaining paths recover the block.
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 1 --family 4 --value 576
+	start_fragment_observers 4 mtu-pmtu-failure
+	start_udp_observers 4 both mtu-pmtu-failure
+	start_peer_exchange 4 mtu-pmtu-failure 1200 1200 3387 257 0 true false
+	snapshot_path_counters 4 mpudp-forward
+	failure_forward_before=("${path_counter_snapshot[@]}")
+	release_peer_exchange
+	assert_counter_equal "$(mpudp_it_ns t1)" ip "${MPUDP_IT_TABLE4}" \
+		mpudp-forward "${failure_forward_before[0]}"
+	for path in 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" \
+			mpudp-forward "${failure_forward_before[$((path - 1))]}"
+	done
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "PMTU failure UDP observer exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "PMTU failure fragment observer exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most 1200
+	assert_udp_length_absent_direction 1200 forward 1
+	assert_udp_length_paths_direction 1200 forward 2 3 4 5
+	assert_no_wire_fragments
+	if ! grep -q '"event":"datagram_partially_sent","phase":"main","bytes":3387.*"error_kinds":\["partial_send","path_mtu_exceeded"\]' \
+		"${peer_initiator_events}"; then
+		mpudp_it_die "PMTU failure did not expose partial_send plus path_mtu_exceeded"
+		return 1
+	fi
+	assert_event_count "${peer_listener_events}" datagram_received main 3387 1 \
+		"PMTU surviving-path recovery"
+
+	restore_canonical_mtu
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (1200/1000 negotiation, IPv6 1280, 520 tunnel budget, exact/+1, PMTU, zero fragments)"
 }
 
 run_peer_payload_mtu() {
@@ -1466,6 +1788,9 @@ run_case_worker() {
 		path-controls) run_path_controls "${family}" ;;
 		nat-rebinding-trigger) run_nat_rebinding_trigger "${family}" ;;
 		direct-single-carrier) run_direct_single_carrier "${family}" ;;
+		transparent-nat-reverse-path) run_transparent_nat_reverse_path "${family}" ;;
+		endpoint-rebinding-and-expiry) run_endpoint_rebinding_and_expiry "${family}" ;;
+		mtu-budget-no-fragment) run_mtu_budget_no_fragment "${family}" ;;
 		peer-smoke) run_peer_smoke "${family}" ;;
 		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
 		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;

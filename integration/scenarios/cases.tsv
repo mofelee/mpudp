@@ -14,3 +14,6 @@ peer-nat-rebinding-v6	peer-nat-rebinding	6	35	false
 peer-endpoint-expiry-v4	peer-endpoint-expiry	4	25	false
 peer-endpoint-expiry-v6	peer-endpoint-expiry	6	25	false
 direct-single-carrier	direct-single-carrier	4	30	false
+transparent-nat-reverse-path	transparent-nat-reverse-path	4	35	false
+endpoint-rebinding-and-expiry	endpoint-rebinding-and-expiry	4	40	false
+mtu-budget-no-fragment	mtu-budget-no-fragment	dual	70	false

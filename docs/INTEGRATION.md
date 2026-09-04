@@ -185,6 +185,26 @@ spurious partial-send result.
   processes must then close cleanly. Direct wire metadata, unchanged baseline
   DNAT/SNAT counters, and the removal of every temporary route/rule prove this
   is not the five-path NAT smoke under another name;
+- `transparent-nat-reverse-path` is the canonical five-Carrier IPv4 NAT
+  contract. Alice has no route to any Bob address and configures only T1-T5;
+  Bob has no route to Alice and configures only its listener. Every T namespace
+  remains process-free. Distinct forward/reverse Datagram sizes must cross all
+  five DNAT+SNAT mappings, with reverse DATA sourced from Bob's listening port,
+  per-path control/DATA counter deltas, and no fragments;
+- `endpoint-rebinding-and-expiry` holds one accepted Session while path 1
+  changes conntrack zone/source port from 41001 to 41002. The old reverse
+  Endpoint is then isolated, paths 2 and 3 lose forward traffic, and a 1-second
+  keepalive preserves only the authenticated new/surviving Endpoints across a
+  measured 5-second TTL. A unique post-expiry shard size must target 41002 and
+  paths 1/4/5, never 41001 or expired paths 2/3, while bidirectional delivery
+  and the original Session continue;
+- `mtu-budget-no-fragment` is one dual-stack canonical row rather than an
+  alias for the foundation MTU cases. It runs a 1200/1000 negotiation in both
+  directions, IPv6 at link MTU 1280, an explicit 520-byte IPv4 tunnel budget,
+  exact-limit and limit+1 writes, then an intentionally overstated path-1
+  budget. Header-only capture proves every safe packet stays within budget and
+  produces zero fragments; the bad path reports `ErrPartialSend` plus
+  `ErrPathMTUExceeded` while four surviving paths recover the Datagram;
 - `peer-smoke-v4` and `peer-smoke-v6` require five connected Carrier sockets,
   stable local/remote socket tuples across the exchange, one 754-byte shard on
   each path for a 2048-byte Datagram, per-path forward/reverse control and DATA

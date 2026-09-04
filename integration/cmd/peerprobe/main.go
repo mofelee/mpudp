@@ -31,6 +31,8 @@ const (
 	carrierSettleDuration = 500 * time.Millisecond
 	duplicateQuietPeriod  = 100 * time.Millisecond
 	directFlow            = "direct-single-carrier"
+	rebindExpiryFlow      = "endpoint-rebinding-and-expiry"
+	postExpiryBytes       = 333
 )
 
 var (
@@ -156,14 +158,18 @@ func validateOptions(opts options) error {
 	if opts.bodyBytes < 0 || opts.replyBytes < 0 || opts.oversizeBytes < 0 {
 		return errors.New("Datagram sizes must not be negative")
 	}
-	if opts.flow == "expiry" {
+	if opts.flow == "expiry" || opts.flow == rebindExpiryFlow {
 		if opts.expiryWait <= opts.endpointTTL {
 			return errors.New("expiry-wait must exceed endpoint-ttl")
 		}
-		if opts.keepaliveInterval <= opts.expiryWait {
+		if opts.flow == "expiry" && opts.keepaliveInterval <= opts.expiryWait {
 			return errors.New("keepalive must exceed expiry-wait")
 		}
-	} else if opts.bodyBytes == 0 || opts.replyBytes == 0 {
+		if opts.flow == rebindExpiryFlow && opts.keepaliveInterval >= opts.endpointTTL {
+			return errors.New("rebinding expiry flow requires keepalive below endpoint-ttl")
+		}
+	}
+	if opts.flow != "expiry" && (opts.bodyBytes == 0 || opts.replyBytes == 0) {
 		return errors.New("non-expiry flows require positive body-bytes and reply-bytes")
 	}
 	if opts.flow == directFlow {
@@ -176,6 +182,9 @@ func validateOptions(opts options) error {
 		if opts.role == "initiator" && strings.Contains(opts.carriers, ",") {
 			return errors.New("direct flow requires exactly one Carrier")
 		}
+	}
+	if opts.flow == rebindExpiryFlow && opts.finalPath == "" {
+		return errors.New("rebinding expiry flow requires final-file for the post-expiry barrier")
 	}
 	if opts.role == "listener" {
 		if opts.listen == "" || opts.carriers != "" || opts.readyPath == "" ||
@@ -360,6 +369,24 @@ func runListener(ctx context.Context, opts options, log *eventLog, peer *mpudp.P
 			}
 		}
 		if opts.finalPath != "" {
+			if opts.flow == rebindExpiryFlow {
+				if err := log.write("expiry_wait_started", "post-rebind", nil, nil); err != nil {
+					return err
+				}
+				if err := waitDuration(ctx, opts.expiryWait); err != nil {
+					return err
+				}
+				postExpiry := makeDatagram(postExpiryBytes, 0x6a)
+				if err := writeExpected(log, accepted, "post-expiry", postExpiry, false); err != nil {
+					return err
+				}
+				if err := waitForMarker(ctx, opts.finalPath+".post-expiry-done"); err != nil {
+					return fmt.Errorf("wait for post-expiry delivery: %w", err)
+				}
+				if err := log.write("endpoint_expiry_verified", "post-expiry", nil, nil); err != nil {
+					return err
+				}
+			}
 			if err := waitForMarker(ctx, opts.finalPath); err != nil {
 				return fmt.Errorf("wait for final shutdown release: %w", err)
 			}
@@ -479,6 +506,15 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 		return fmt.Errorf("write initiator completion marker: %w", err)
 	}
 	if opts.finalPath != "" {
+		if opts.flow == rebindExpiryFlow {
+			postExpiry := makeDatagram(postExpiryBytes, 0x6a)
+			if err := readExpected(ctx, log, current, "post-expiry", postExpiry); err != nil {
+				return err
+			}
+			if err := createMarker(opts.finalPath + ".post-expiry-done"); err != nil {
+				return fmt.Errorf("write post-expiry completion marker: %w", err)
+			}
+		}
 		if err := waitForMarker(ctx, opts.finalPath); err != nil {
 			return fmt.Errorf("wait for final shutdown release: %w", err)
 		}

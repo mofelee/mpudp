@@ -201,6 +201,35 @@ func TestValidateOptionsRequiresOneDirectCarrierAndFinalBarrier(t *testing.T) {
 	}
 }
 
+func TestValidateOptionsRequiresBoundedRebindingExpiryWindow(t *testing.T) {
+	base := options{
+		role: "initiator", flow: rebindExpiryFlow, family: 4,
+		carriers: "127.0.0.1:9000", maxUDPPayload: 1200,
+		bodyBytes: 2049, replyBytes: 1027, endpointTTL: 5 * time.Second,
+		keepaliveInterval: time.Second, expiryWait: 6 * time.Second,
+		timeout: 10 * time.Second, runID: "validation", eventsPath: "events",
+		replyCompletePath: "reply-complete", exitPath: "exit",
+		phasePath: "phase", continuePath: "continue", finalPath: "final",
+	}
+	if err := validateOptions(base); err != nil {
+		t.Fatalf("valid rebinding/expiry options rejected: %v", err)
+	}
+	base.finalPath = ""
+	if err := validateOptions(base); err == nil || !strings.Contains(err.Error(), "final-file") {
+		t.Fatalf("missing post-expiry barrier error = %v", err)
+	}
+	base.finalPath = "final"
+	base.expiryWait = base.endpointTTL
+	if err := validateOptions(base); err == nil || !strings.Contains(err.Error(), "exceed endpoint-ttl") {
+		t.Fatalf("short expiry window error = %v", err)
+	}
+	base.expiryWait = 6 * time.Second
+	base.keepaliveInterval = base.endpointTTL
+	if err := validateOptions(base); err == nil || !strings.Contains(err.Error(), "keepalive below") {
+		t.Fatalf("non-refreshing keepalive error = %v", err)
+	}
+}
+
 func assertDirectEvents(t *testing.T, events []event, role string) {
 	t.Helper()
 	type eventKey struct {
