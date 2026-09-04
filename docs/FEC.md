@@ -13,6 +13,8 @@ shard 编码、恢复和短期去重，不感知 Carrier 或网络路径。
 - `parity_shards = r > 0`；
 - `n = k + r <= 256`。
 
+精确模块版本、传递依赖和分发义务见 [依赖与许可证审计](DEPENDENCIES.md)。
+
 参数先由 FEC 层以防整数溢出的方式校验，再交给库构造函数复核。codec 固定使用
 `WithMaxGoroutines(1)` 和 `WithInversionCache(false)`：单次编解码不使用库的并行
 分片，并且不会让不同缺失组合累积 inversion cache。项目本身要求 Go 1.24。
@@ -53,6 +55,11 @@ Datagram 长度可以恰好等于 `EffectiveLimit`。多一个 byte 会在取得
 `C` 内，因此完整 `DATA_SHARD` UDP payload 不超过协商预算。只有当该预算不高于真实路径
 安全 UDP payload 且 Linux DF/PMTU mode 生效时，网络层才能进一步保证不产生本地 IP
 fragment；FEC 层本身只保证不会把一个 shard 再做协议内分片。
+
+v0.1 的一个 block 始终使用同一个冻结 Session budget 和等长 shard。由
+[#13](https://github.com/mofelee/mpudp/issues/13) 跟踪的未来 PLPMTUD 不改变这一现有
+契约；由 [#14](https://github.com/mofelee/mpudp/issues/14) 跟踪的不等长/per-Carrier
+shard 必须经过新的 wire、FEC、恢复阈值和互操作设计评审，不能直接套用本编码格式。
 
 ## 编码语义
 

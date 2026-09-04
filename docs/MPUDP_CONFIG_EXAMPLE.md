@@ -10,6 +10,9 @@
 - Alice 只知道 T1–T5 的 UDP 入口，不知道这些转发节点最终把数据送往哪里。
 
 > 下列地址均来自文档保留网段，部署时必须替换为真实地址。
+>
+> 下列 `development-only-example-key` 仅用于开发测试。生产部署必须按
+> [PSK 管理指南](CONFIGURATION.md#psk-管理)安全注入独立的高熵密钥。
 
 ## 1. 拓扑
 
@@ -49,7 +52,7 @@ fec:
   data_shards: 3
   parity_shards: 2
 
-psk: "secret"
+psk: "development-only-example-key"
 
 transport:
   # 完整 MPUDP UDP payload 上限，不是 IP MTU 或纯 shard payload。
@@ -94,7 +97,7 @@ fec:
   data_shards: 3
   parity_shards: 2
 
-psk: "secret"
+psk: "development-only-example-key"
 
 transport:
   # 完整 MPUDP UDP payload 上限，不是 IP MTU 或纯 shard payload。
@@ -119,6 +122,21 @@ Bob 向这些已学习 Endpoint 发送 UDP，T1–T5 的 conntrack 会把返回�
 
 Bob 必须使用监听在 `203.0.113.20:9000` 的同一个 UDP socket 发送返回数据，不能另建随机源端口的 socket；否则 T1–T5 上的 conntrack 可能无法把返回包匹配到原来的转发状态。
 
+Alice 和 Bob 可以声明不同的 `transport.max_udp_payload`，握手后整个 Session 使用两者的
+较小值：
+
+```text
+negotiated_max_udp_payload = min(alice_capability, bob_capability)
+shard_capacity             = negotiated_max_udp_payload - 71
+effective_datagram_limit   = min(3 * shard_capacity, limits.max_datagram_size)
+```
+
+该值是完整 MPUDP UDP payload budget，并全局用于当前 Session 的所有 Carrier。部署者必须
+选择所有路径都能安全承载的最小值；Linux DF/PMTU 模式不能解决 ICMP Packet Too Big 被过滤
+造成的静默黑洞。自适应 PLPMTUD 由 [#13](https://github.com/mofelee/mpudp/issues/13)
+跟踪，per-Carrier budget/不等长 shard 由
+[#14](https://github.com/mofelee/mpudp/issues/14) 跟踪，均不属于 v0.1。
+
 ## 4. T1 配置
 
 T1 公网地址：`192.0.2.11`
@@ -139,7 +157,8 @@ EOF_SYSCTL
 sysctl --system
 ```
 
-`/etc/nftables.conf`：
+`/etc/nftables.conf` 中需要等价规则。以下独立 ruleset 仅便于说明；实际 T 节点必须把规则
+合并进现有 ruleset，绝不能通过覆盖文件或 `flush ruleset` 删除无关防火墙状态：
 
 ```nftables
 table ip mpudp {
@@ -341,6 +360,9 @@ Upper Datagram
 
 Bob 收到任意 3 个有效 shard 即可恢复原始 Datagram。
 
+上图只表示一个 block。下一个 PacketID 会轮转起始 Carrier；固定规则是
+`start = PacketID % path_count`，不是让 shard 0 永久绑定 T1。
+
 Bob 到 Alice：
 
 ```text
@@ -402,3 +424,10 @@ T1–T5 不需要知道 PSK。
 6. Bob 只能向认证成功且尚未过期的 Endpoint 发送返回数据。
 7. Alice 冷启动时必须主动向 T1–T5 发包。Bob 无法在 NAT 映射尚未建立时凭空连接 Alice。
 8. Session 建立后，Alice 和 Bob 在数据面完全对等，任意一端都可以发送上层 Datagram。
+
+## 13. 可复现测试环境
+
+仓库的 [Linux namespace harness](INTEGRATION.md) 可执行这套拓扑的真实双栈变体。它为每次
+运行生成唯一 namespace、veth、nft table、state 和 run ID，执行精确 teardown/audit；它
+不会写入这里展示的持久 `/etc/sysctl.d` 或 `/etc/nftables.conf` 示例，也不会覆盖主机已有
+ruleset。

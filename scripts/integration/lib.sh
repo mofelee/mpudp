@@ -75,7 +75,7 @@ mpudp_it_default_state_dir() {
 
 mpudp_it_require_root() {
 	if (( EUID != 0 )); then
-		mpudp_it_die "root or equivalent CAP_NET_ADMIN/CAP_SYS_ADMIN is required"
+		mpudp_it_die "root (EUID 0) is required"
 		return 1
 	fi
 }

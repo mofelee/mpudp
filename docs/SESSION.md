@@ -2,7 +2,8 @@
 
 `internal/session` 实现认证驱动的 Session bootstrap、Endpoint learning、keepalive、
 方向性 UDP payload budget 和 FEC 数据面编排。它不创建或关闭 UDP socket，也不修改公开
-`Peer` API；`peer.go` 的队列、Accept/Read/Write 包装和 transport callback 投递由 #7 集成。
+`Peer` API；当前 `peer.go` 运行时拥有 bounded ingress、单 dispatcher、Accept/Read/Write
+包装以及 transport callback 投递。
 
 ## 分层边界
 
@@ -23,9 +24,9 @@ capability 都不会创建或刷新 Session/Endpoint/deadline/FEC state，也不
 诊断字符串不包含 PSK、packet payload、完整 tag 或完整 SessionID；`Session.String`
 只显示 SessionID 的短 SHA-256 fingerprint。
 
-Transport 的 receive callback 是同步的。#7 必须先向有界 ingress queue 做非阻塞投递，
-再由 worker 调用 Session；不得在 callback 内执行 FEC 恢复、同步 Close 或 Rebuild，也不
-得为每个 packet 启动 goroutine。
+Transport 的 receive callback 是同步的。Peer 先向有界 ingress queue 做非阻塞投递，
+再由唯一 dispatcher 调用 Session；不得在 callback 内执行认证、FEC 恢复、同步 Close 或
+Rebuild，也不得为每个 packet 启动 goroutine。队列满时丢弃最新 event。
 
 ## 状态迁移
 
@@ -69,7 +70,7 @@ reply window 才标记耗尽。已经建立 Session 中仍未确认且耗尽的 
 
 Listener 只允许认证且与本地 FEC 匹配的 HELLO 创建 Session。SessionID map 受
 `MaxSessions` 硬限制；达到上限时确定性拒绝新 Session，不驱逐现有 Session。重复 HELLO
-只返回既有 Session，Accept 通知由 #7 对 `HandleResult.Created` 恰好投递一次。
+只返回既有 Session；Peer 仅在 `HandleResult.Created` 为 true 时向 Accept queue 投递一次。
 
 Endpoint identity 包含 transport PathID、socket generation、local address 和 remote
 address，记录 generation-bound ReplyPath、最后认证活动时间、health 和最近 RTT。发送
@@ -94,9 +95,11 @@ send_max_udp_payload    = min(local_capability, peer_capability)
 receive_max_udp_payload = min(local_capability, peer_capability)
 ```
 
-例如双方声明 1200/1000 时，两个方向均为 1000。所有 HELLO、ACK、PING、PONG、CLOSE 和
-DATA_SHARD 编码都受适用预算检查；已认证但超过冻结 receive budget 的 packet 不进入
-Endpoint 或 FEC state。
+例如双方声明 1200/1000 时，两个方向均为 1000。HELLO packet 使用发送方本地 budget；
+HELLO_ACK 使用双方能力的较小值。握手建立后，PING、PONG、DATA_SHARD 和 CLOSE 都使用
+冻结的 negotiated budget。已认证但超过冻结 receive budget 的 packet 不进入 Endpoint
+或 FEC state；即使是不对称握手后的 Close 也不得退回本地较大值。该回归由
+`TestCloseUsesFrozenNegotiatedBudgetAfterAsymmetricHandshake` 固定。
 
 建立时为该方向创建一个 `fec.Encoder` 和一个 `fec.Decoder`：
 
@@ -125,7 +128,9 @@ shard 继续尝试，其他路径仍可双向发送，Session 保持 `establishe
 Unhealthy Carrier 仍收到小型 keepalive PING，以便观察恢复，但不会继续承担 DATA。
 匹配的认证流量会恢复该路径；transport rebuild 或外部诊断也可调用
 `SetPathHealthy(pathID, true)` 明确恢复。v0.1 不动态改变全 Session shard size，不把一个
-shard 切小重发，也不实现 PLPMTUD。
+shard 切小重发，也不实现由 [#13](https://github.com/mofelee/mpudp/issues/13) 跟踪的
+PLPMTUD/自适应 budget。由 [#14](https://github.com/mofelee/mpudp/issues/14) 跟踪的
+per-Carrier budget 和不等长 shard 需要新的版本化 wire/FEC 设计。
 
 ## Keepalive 与 RTT
 
@@ -164,7 +169,7 @@ timer 或 worker 需要回收。
 单元测试使用 fake Clock 和 fake ReplyPath，不依赖 sleep 或公网，覆盖：
 
 - 任一 ACK 建立、其他 Carrier 后续加入、重复/不兼容握手；
-- 1200/1000 双向协商和 `config == wire == transport` UDP hard limit；
+- 1200/1000 双向协商、冻结预算 CLOSE 和 `config == wire == transport` UDP hard limit；
 - 未认证输入、非法 `0xffff` capability 的零状态/零响应不变量；
 - retry jitter 上限、attempt 耗尽和 Close 取消；
 - Endpoint cap/reject-new、TTL 和 Session cap；

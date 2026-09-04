@@ -1,11 +1,11 @@
 # MPUDP Linux Integration Harness
 
 `scripts/integration` provides the repository-owned Linux network-namespace
-harness for issue #8. It creates the topology, runs named scenarios, collects
-redacted diagnostics, and removes only resources owned by one unique run ID.
-GitHub Actions calls the same commands and scenario manifest.
+harness. It creates the topology, runs named scenarios, collects redacted
+diagnostics, and removes only resources owned by one unique run ID. GitHub
+Actions calls the same commands and scenario manifest.
 
-This loop does not create, inspect, or remove libvirt VMs. A developer may run
+The harness does not create, inspect, or remove libvirt VMs. A developer may run
 the repository scripts inside a disposable Debian VM, but the harness itself
 has no dependency on Codex skills, libvirt URIs, host storage pools, or an
 external hypervisor.
@@ -14,11 +14,10 @@ external hypervisor.
 
 - Linux with network namespace, veth, IPv4/IPv6 forwarding, netfilter NAT, and
   traffic-control support;
-- root, or an environment providing the equivalent `CAP_NET_ADMIN` and
-  `CAP_SYS_ADMIN` capabilities;
-- `bash`, `ip`, `ping`, `tc`, `nft`, `tcpdump`, `sysctl`, `timeout`, `awk`,
-  `sed`, `sha256sum`, `realpath`, and Go;
-- `conntrack` for tuple diagnostics and the final full #8 gate;
+- root (the current harness requires EUID 0 before probing kernel features);
+- `bash`, `find`, `grep`, `ip`, `ping`, `tc`, `nft`, `tcpdump`, `sysctl`,
+  `timeout`, `awk`, `sed`, `sha256sum`, `realpath`, `stat`, and Go;
+- `conntrack` for tuple diagnostics and the hosted canonical gate;
 - `ss` and `diff` for public Peer Carrier identity checks.
 
 On Debian/Ubuntu the normal package surface is:
@@ -33,9 +32,21 @@ is active. If the binary is absent, setup records `missing` and collect omits
 tuple dumps. CI can enforce the full diagnostic prerequisite with:
 
 ```bash
-sudo env MPUDP_IT_REQUIRE_CONNTRACK=1 scripts/integration/run \
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false \
+  MPUDP_IT_REQUIRE_CONNTRACK=1 scripts/integration/run \
   --case transparent-nat-v4
 ```
+
+## Troubleshooting
+
+| Symptom | Check and recovery |
+|---|---|
+| setup reports that root is required | Run through `sudo` as EUID 0; capability-only non-root execution is not supported by the current harness. |
+| required `conntrack` is missing | Install the package, or omit `MPUDP_IT_REQUIRE_CONNTRACK=1` only for a local case that does not require tuple evidence. |
+| qdisc/drop/counter barrier does not advance | Inspect the retained case events and exact path/family/direction, then verify `tc`/`nft` support before retrying the same seed. |
+| capture reports dropped packets or fragments | Treat the case as failed; inspect header-only observer logs and MTU controls rather than accepting incomplete capture as proof. |
+| a case reaches its timeout | Use the emitted run ID, case, and seed to inspect diagnostics and replay that case; do not bypass the manifest timeout. |
+| teardown retains state | Preserve that validated state directory, correct the reported exact cleanup failure, rerun teardown with its run ID, then run `audit --expect-clean`. |
 
 ## One-command workflow
 
@@ -43,13 +54,13 @@ The default performs setup, the IPv4 transparent-NAT smoke, teardown, and a
 clean-resource audit:
 
 ```bash
-sudo scripts/integration/run
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false scripts/integration/run
 ```
 
 Several base cases can share one topology:
 
 ```bash
-sudo scripts/integration/run \
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false scripts/integration/run \
   --case transparent-nat-v4 \
   --case transparent-nat-v6 \
   --case path-controls-v4 \
@@ -59,7 +70,7 @@ sudo scripts/integration/run \
 The public Datagram runtime cases can likewise share one setup:
 
 ```bash
-sudo scripts/integration/run \
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false scripts/integration/run \
   --case direct-single-carrier \
   --case peer-smoke-v4 --case peer-smoke-v6 \
   --case peer-payload-mtu-v4 --case peer-payload-mtu-v6 \
@@ -67,13 +78,17 @@ sudo scripts/integration/run \
   --case peer-endpoint-expiry-v4 --case peer-endpoint-expiry-v6
 ```
 
+The exact command that runs all nine hosted canonical cases in one topology is
+kept in the repository [README](../README.md#ci-与网络集成).
+
 `run` installs EXIT/HUP/INT/TERM handling. On failure it calls `collect` before
 `teardown`; without `--artifacts`, a short sanitized diagnostic summary is
 printed and the temporary state is removed. To retain diagnostics outside the
 run state:
 
 ```bash
-sudo scripts/integration/run --artifacts /var/tmp/mpudp-it-artifacts
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false scripts/integration/run \
+  --artifacts /var/tmp/mpudp-it-artifacts
 ```
 
 The runner rejects an artifact destination whose per-run output would overlap
@@ -86,14 +101,18 @@ state path to stdout; progress goes to stderr.
 
 ```bash
 run_id=manual-$(date -u +%Y%m%d%H%M%S)
-state=$(sudo scripts/integration/setup --run-id "${run_id}")
-trap 'sudo scripts/integration/teardown --state "${state}" --run-id "${run_id}"' EXIT
+state=$(sudo env "PATH=${PATH}" scripts/integration/setup --run-id "${run_id}")
+trap 'sudo env "PATH=${PATH}" scripts/integration/teardown --state "${state}" --run-id "${run_id}"' EXIT
 
-sudo scripts/integration/run-case --state "${state}" transparent-nat-v4
-sudo scripts/integration/collect --state "${state}" --output /var/tmp/mpudp-diagnostics
-sudo scripts/integration/teardown --state "${state}" --run-id "${run_id}"
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false \
+  scripts/integration/run-case --state "${state}" transparent-nat-v4
+sudo env "PATH=${PATH}" scripts/integration/collect \
+  --state "${state}" --output /var/tmp/mpudp-diagnostics
+sudo env "PATH=${PATH}" scripts/integration/teardown \
+  --state "${state}" --run-id "${run_id}"
 trap - EXIT
-sudo scripts/integration/audit --run-id "${run_id}" --state "${state}" --expect-clean
+sudo env "PATH=${PATH}" scripts/integration/audit \
+  --run-id "${run_id}" --state "${state}" --expect-clean
 ```
 
 `teardown` is idempotent. Supplying both state and run ID adds a consistency
@@ -147,11 +166,25 @@ metadata and a 12-hex SHA-256 prefix, never packet contents.
 ## Scenario contract
 
 `integration/scenarios/cases.tsv` is the single case manifest consumed by
-`run-case` and intended for #9 matrix generation:
+`run-case` and the GitHub Actions matrix:
 
 ```bash
 scripts/integration/run-case --list
 ```
+
+The hosted workflow publishes these nine canonical cases in this exact order:
+
+<!-- mpudp-canonical-cases:start -->
+- `direct-single-carrier`
+- `rs53-five-carrier-loss`
+- `rs53-two-carrier-rotation`
+- `slow-path-early-recovery`
+- `transparent-nat-reverse-path`
+- `endpoint-rebinding-and-expiry`
+- `auth-and-state-pollution`
+- `mtu-budget-no-fragment`
+- `shutdown-cleanup`
+<!-- mpudp-canonical-cases:end -->
 
 The final column records whether a case requires a runtime unavailable in this
 checkout. All maintained rows are currently runnable (`false`); a future row
@@ -276,16 +309,16 @@ All controls require state, path 1..5, and address family 4 or 6.
 
 ```bash
 # One deterministic egress per direction: forward=Alice, reverse=Bob.
-sudo scripts/integration/control --state "${state}" netem \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" netem \
   --path 2 --family 4 --direction forward --delay 50ms --loss 10%
 
-sudo scripts/integration/control --state "${state}" clear-netem \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" clear-netem \
   --path 2 --family 4 --direction forward
 
-sudo scripts/integration/control --state "${state}" link \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" link \
   --path 3 --family 6 --link-state down
 
-sudo scripts/integration/control --state "${state}" mtu \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" mtu \
   --path 5 --family 6 --value 1280
 ```
 
@@ -297,9 +330,9 @@ Wire-aware tests can drop an exact packet/shard field without hard-coding the
 wire layout in this harness:
 
 ```bash
-sudo scripts/integration/control --state "${state}" drop-match \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" drop-match \
   --path 1 --family 4 --offset 24 --hex 0000002a
-sudo scripts/integration/control --state "${state}" clear-drop \
+sudo env "PATH=${PATH}" scripts/integration/control --state "${state}" clear-drop \
   --path 1 --family 4
 ```
 
@@ -340,9 +373,11 @@ HUP/INT/TERM, `repeat` terminates and waits for every active child, performs an
 exact run-ID teardown/audit for each, and only then removes its logs:
 
 ```bash
-sudo scripts/integration/repeat --count 20 --parallel 1 \
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false \
+  scripts/integration/repeat --count 20 --parallel 1 \
   --case transparent-nat-v4
-sudo scripts/integration/repeat --count 8 --parallel 4 \
+sudo env "PATH=${PATH}" GOFLAGS=-buildvcs=false \
+  scripts/integration/repeat --count 8 --parallel 4 \
   --case transparent-nat-v4
 ```
 
@@ -359,10 +394,10 @@ logs are sanitized again while copying.
 
 ## Scope boundary
 
-Issue #8 owns this reusable topology, the public Peer smoke/MTU/rebinding/expiry
-cases, diagnostics, hard timeouts, repetition, and exact cleanup. Issue #9 adds
-the canonical public RS/loss/latency, authentication-pollution, shutdown, and
-GitHub-hosted matrix contracts on the same repository-owned harness.
+This repository-owned harness covers the reusable topology, public Peer
+smoke/MTU/rebinding/expiry cases, canonical RS/loss/latency cases,
+authentication-pollution and shutdown behavior, diagnostics, hard timeouts,
+repetition, hosted matrix contracts, and exact cleanup.
 
 The optional disposable Debian VM development record also remains outside this
 repository run. It requires an explicitly selected libvirt URI and a separate

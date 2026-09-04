@@ -53,7 +53,8 @@ is the only excluded field. Implementations MUST compare tags in constant time.
 The HMAC key is the exact UTF-8 byte sequence of the configured PSK scalar. It
 is not trimmed, normalized, or passed through a protocol-level KDF. An empty
 key is invalid. Applications should inject a high-entropy PSK through an
-appropriately protected configuration mechanism.
+appropriately protected configuration mechanism; the parser and deployment
+boundaries are specified in [PSK management](CONFIGURATION.md#psk-管理).
 
 HMAC supplies authentication and integrity only. MPUDP v0.1 does **not**
 encrypt payloads and provides no confidentiality.
@@ -83,6 +84,14 @@ After an authenticated handshake, each direction uses:
 ```text
 negotiated_max_udp_payload = min(local_capability, peer_capability)
 ```
+
+The packet budget is phase-specific and deterministic:
+
+- HELLO uses the sender's local capability;
+- HELLO_ACK uses the negotiated minimum, even though its body advertises the
+  responder's local capability;
+- established PING, PONG, DATA_SHARD, and CLOSE packets use the frozen
+  negotiated budget in their direction.
 
 FEC parameters must match exactly. Once a Session is established, a duplicate
 HELLO or HELLO_ACK carrying different FEC or capability values is rejected; it
@@ -226,3 +235,10 @@ tags and payloads, tests report only these SHA-256 fingerprints:
 | CLOSE | Empty body | `1f6d406c87b59d56c4104c6f4074fccffe975e9b234f9f86cc2111dc52917357` |
 
 These values are protocol fixtures, not production credentials or traffic.
+
+PLPMTUD/adaptive Session budgets ([#13](https://github.com/mofelee/mpudp/issues/13))
+and per-Carrier budgets/unequal shard sizing
+([#14](https://github.com/mofelee/mpudp/issues/14)) are post-v0.1 protocol work.
+Neither may be introduced as a silent change to version 1; any incompatible
+field, packet, or sizing semantics require an explicitly reviewed versioned
+extension.

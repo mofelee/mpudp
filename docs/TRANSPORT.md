@@ -10,7 +10,11 @@
 |---|---:|
 | FEC shards / block | 1..256 |
 | 当前可用 Carrier/Endpoint | 1..256 |
-| 单个 UDP payload | 1..65507 bytes |
+| raw transport 单个 UDP payload | 1..65507 bytes |
+
+`transport` 包自身接受 1..65507 bytes，以便保持通用 UDP 边界；有效 MPUDP 配置的
+`transport.max_udp_payload` 范围更窄，为 72..65507 bytes，因为最小 authenticated
+控制包需要 72 bytes。
 
 `scheduler.Assign(packetID, shardCount, pathCount)` 在任何内存分配之前检查两个 count。
 257、`MaxInt`、零和负数均返回 typed `CountError`。这使遗漏上游 Config 校验时也不会
@@ -114,7 +118,10 @@ Carrier 或 Session；同一 block 的其他路径继续发送。
 
 这不是动态 PMTU 探测器。远端 ICMP Packet Too Big 被过滤时，错误可能不会同步返回，
 流量会静默黑洞。部署者必须把 `transport.max_udp_payload` 配置为所有 Carrier 的已知安全
-最小 UDP payload；v0.1 不实现 PLPMTUD、自动提高预算或每 Carrier 可变 shard size。
+最小 UDP payload；v0.1 不实现由 [#13](https://github.com/mofelee/mpudp/issues/13)
+跟踪的 PLPMTUD/自适应预算，也不实现由
+[#14](https://github.com/mofelee/mpudp/issues/14) 跟踪的 per-Carrier budget 或不等长
+shard。
 
 非 Linux build 的 `PMTUDiscoverySupported()` 明确返回 false。默认仍可使用 UDP，但不
 声称具备无 IP fragmentation 保证；设置 `RequirePMTU` 会以 `ErrPMTUUnsupported` 拒绝
@@ -125,7 +132,9 @@ Carrier 或 Session；同一 block 的其他路径继续发送。
 单元测试使用可注入 dial/packet connection 覆盖 rebuild、旧 read loop 退出、generation
 路由、超限、partial/all/no-path 和并发 Close。真实 loopback 测试覆盖每 Carrier 独立源
 端口及长期复用、Listener 同源端口回复，并在 Linux IPv6 loopback 上验证 DF 模式产生
-真实 `EMSGSIZE` 后小 packet 仍可发送。
+真实 `EMSGSIZE` 后小 packet 仍可发送。`TestLinuxDualStackListenerConfiguresIPv4AndIPv6PMTU`
+还固定 dual-stack Listener 同时配置 IPv4/IPv6 PMTU option 的要求。
 
-跨 namespace 的小 MTU、IPv4/IPv6 Packet Too Big 抓包及 0 IP fragment 证据属于 #8/#11
-集成基座；本包测试不创建 namespace、nftables 规则或 VM。
+跨 namespace 的小 MTU、1200/1000 capability negotiation、exact-limit/+1、
+`ErrPathMTUExceeded` 和 0 IP fragment 证据由 canonical
+`mtu-budget-no-fragment` 场景覆盖；本包测试不创建 namespace、nftables 规则或 VM。

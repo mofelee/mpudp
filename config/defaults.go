@@ -21,7 +21,7 @@ const (
 )
 
 // Upper Datagram resource limits are independent of the negotiated wire
-// budget. A later protocol layer applies the smaller effective limit.
+// budget. The Session/FEC layer applies the smaller effective limit.
 const (
 	DefaultMaxDatagramSize = 64 * 1024
 	MinMaxDatagramSize     = 1

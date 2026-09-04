@@ -1,28 +1,154 @@
 # MPUDP
 
-MPUDP 是一个用 Go 实现的用户态 Multipath UDP Datagram Tunnel。当前仓库已完成
-v0.1 Loop 1：严格配置模型、公共 Datagram API 和无网络副作用的生命周期骨架。
-Wire codec、Reed-Solomon 数据面、UDP Carrier 和握手将在后续 loop 实现；当前命令
-只校验配置，不会打开 socket 或启动后台任务。
+[![CI](https://github.com/mofelee/mpudp/actions/workflows/ci.yml/badge.svg)](https://github.com/mofelee/mpudp/actions/workflows/ci.yml)
 
-## 开发环境
+MPUDP 是一个用 Go 实现的用户态 Multipath UDP Datagram Tunnel。它把一个应用 Datagram
+编码成一个 Reed-Solomon block，把 shard 轮转分配到多个长期 UDP Carrier，并在对端恢复
+原始 Datagram。v0.1 已包含严格配置、认证 Wire 协议、FEC、调度、UDP transport、
+initiator/listener/dual Session 运行时和可复现的 Linux 网络集成测试。
+
+```text
+Application Datagram API
+          |
+          v
+  Peer -> Session -> FEC block -> shard scheduler -> long-lived UDP Carriers
+   ^                                                        |
+   |                                                        v
+Listener <- authenticated HELLO and learned reverse path <- UDP network
+```
+
+公共 API 保留 Datagram 边界；它不提供可靠、有序或 stream 语义。当前 CLI 也不是 TUN、
+SOCKS、TCP proxy 或通用 stream adapter。
+
+## 支持范围
 
 - Go 1.24 或更高版本；`go.mod` 的最低版本为 1.24。
-- v0.1 运行时支持目标为 Linux `amd64` 和 `arm64`。
-- 配置与 API 骨架使用可移植 Go；能在其他平台构建不代表该平台进入 v0.1 支持范围。
+- v0.1 运行时支持 Linux `amd64` 和 `arm64`。
+- 其他平台可能通过部分构建或单元测试，但不属于 v0.1 的运行支持范围。
 
 ```bash
 go build ./...
-go test ./...
-go test -race ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
 go vet ./...
 ```
 
-## CI 与经典网络场景
+## 启动 CLI
 
-GitHub Actions 在 pull request、`main` push 和手动触发时运行以下 11 个稳定
-check 名称；分支保护应直接使用这些名称：
+最小 initiator 配置如下。示例 PSK 仅供本机开发测试；生产环境必须注入高熵密钥，并按
+[受保护的 PSK 配置](docs/CONFIGURATION.md#psk-管理)限制文件权限、日志和分发路径。
 
+```yaml
+carriers:
+  - "127.0.0.1:9000"
+fec:
+  data_shards: 3
+  parity_shards: 2
+psk: "development-only-example-key"
+```
+
+```bash
+go run ./cmd/mpudp -config ./initiator.yaml
+```
+
+命令会解析并校验配置、打开所需 socket，然后运行到 SIGINT 或 SIGTERM。initiator 和
+dual 配置会自动创建一个 outbound Session；listener 配置接受经过认证的 inbound
+Session。CLI 当前不会从 Session 读写业务 Datagram，因此要实际承载应用流量，应嵌入
+下面的 Go API 或实现一个显式的上层 adapter。
+
+## 公共 Datagram API
+
+下面省略了启动阶段的错误分支，但展示了双向数据路径。`NewSession` 会立即返回；握手完成
+前 `WritePacket` 返回 `mpudp.ErrNotReady`。生产调用方必须处理该状态以及其他稳定错误类别。
+
+```go
+listenerPeer, err := mpudp.NewPeerContext(ctx, listenerConfig)
+if err != nil {
+    return err
+}
+defer listenerPeer.Close()
+
+listener, err := listenerPeer.Listener()
+if err != nil {
+    return err
+}
+type acceptResult struct {
+    session mpudp.Session
+    err     error
+}
+accepted := make(chan acceptResult, 1)
+go func() {
+    session, acceptErr := listener.Accept(ctx)
+    accepted <- acceptResult{session: session, err: acceptErr}
+}()
+
+initiatorPeer, err := mpudp.NewPeerContext(ctx, initiatorConfig)
+if err != nil {
+    return err
+}
+defer initiatorPeer.Close()
+outbound, err := initiatorPeer.NewSession()
+if err != nil {
+    return err
+}
+
+for {
+    err = outbound.WritePacket(request)
+    if !errors.Is(err, mpudp.ErrNotReady) {
+        break
+    }
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-time.After(10 * time.Millisecond):
+    }
+}
+if err != nil {
+    return err
+}
+result := <-accepted
+if result.err != nil {
+    return result.err
+}
+inbound := result.session
+requestCopy, err := inbound.ReadPacket()
+if err != nil {
+    return err
+}
+if err := inbound.WritePacket(replyFor(requestCopy)); err != nil {
+    return err
+}
+reply, err := outbound.ReadPacket()
+if err != nil {
+    return err
+}
+fmt.Printf("received %d-byte reply\n", len(reply))
+return nil
+```
+
+完整的角色、并发、关闭、错误和容量契约见 [公共 API](docs/API.md) 与
+[Session 运行时](docs/SESSION.md)。
+
+## v0.1 非目标
+
+- 不提供 DATA ACK/NACK、重传、可靠或有序交付、拥塞控制、动态 FEC、加权调度或
+  按流公平性。
+- 不内置 TUN/TAP、SOCKS、TCP、VPN 路由、stream 适配层或具体上层协议适配。
+- 不提供 STUN/ICE/TURN、自有 Relay 或 Mesh；T1-T5 的 nftables 转发只属于测试和部署
+  环境，不是 MPUDP 产品能力。
+- PSK/HMAC 只认证 packet 并保护完整性，不加密 Payload，也不提供保密性。
+- 不在已建立 Session 内执行 PLPMTUD 或自适应调整 payload budget；该扩展由
+  [#13](https://github.com/mofelee/mpudp/issues/13) 跟踪。
+- 不为每个 Carrier 协商不同 budget，也不生成不等长 shard；该协议扩展由
+  [#14](https://github.com/mofelee/mpudp/issues/14) 跟踪。
+- 不提供内核模块、eBPF、XDP 或 DPDK 数据面。
+
+## CI 与网络集成
+
+GitHub Actions 在 pull request、`main` push 和手动触发时发布以下 11 个稳定 check 名称；
+分支保护应直接使用这些名称。
+
+<!-- mpudp-ci-checks:start -->
 - `build-unit`
 - `race`
 - `integration / direct-single-carrier`
@@ -34,61 +160,43 @@ check 名称；分支保护应直接使用这些名称：
 - `integration / auth-and-state-pollution`
 - `integration / mtu-budget-no-fragment`
 - `integration / shutdown-cleanup`
+<!-- mpudp-ci-checks:end -->
 
-`build-unit` 的本地等价门禁为：
-
-```bash
-test -z "$(gofmt -l .)"
-go mod verify
-go vet ./...
-go build ./...
-go test -count=1 ./...
-go test ./internal/wire -run '^$' -fuzz '^FuzzDecodeArbitrary$' -fuzztime 3s -timeout 1m
-go test ./internal/wire -run '^$' -fuzz '^FuzzRoundTripBounded$' -fuzztime 3s -timeout 1m
-go test ./internal/wire -run '^$' -fuzz '^FuzzSingleBitTamper$' -fuzztime 3s -timeout 1m
-```
-
-`race` 的本地等价命令是 `go test -race -count=1 ./...`。集成场景仅支持
-Linux，并需要 root 或等价的网络管理权限。Debian/Ubuntu 环境安装与 CI 相同的
-依赖：
+本地一次运行全部九个 canonical case：
 
 ```bash
-sudo apt-get update
-sudo apt-get install --yes --no-install-recommends \
-  conntrack diffutils iproute2 iputils-ping nftables procps tcpdump
-```
-
-使用固定 case、run ID 和 seed 可以重放 CI 失败。state 与诊断目录必须分离；
-seed 是 1..128 个字母、数字、点、下划线、冒号、加号或连字符组成的文本；未指定时
-使用 run ID。harness 会校验并把它写入 state、case-start 事件和失败诊断。
-以下命令无论成功或失败都会执行精确 teardown 和残留审计：
-
-```bash
-case_name=direct-single-carrier
-run_id=local-direct-single-carrier
-seed=local-1001
+run_id=local-all
 sudo env PATH="${PATH}" GOFLAGS=-buildvcs=false \
-  MPUDP_IT_REQUIRE_CONNTRACK=1 MPUDP_IT_SEED="${seed}" \
+  MPUDP_IT_REQUIRE_CONNTRACK=1 MPUDP_IT_SEED=local-all \
   scripts/integration/run \
     --run-id "${run_id}" \
     --state "/tmp/mpudp-it-state-${run_id}" \
     --artifacts /tmp/mpudp-it-artifacts \
-    --case "${case_name}"
+    --case direct-single-carrier \
+    --case rs53-five-carrier-loss \
+    --case rs53-two-carrier-rotation \
+    --case slow-path-early-recovery \
+    --case transparent-nat-reverse-path \
+    --case endpoint-rebinding-and-expiry \
+    --case auth-and-state-pollution \
+    --case mtu-budget-no-fragment \
+    --case shutdown-cleanup
 ```
 
-失败时，脱敏诊断位于 `/tmp/mpudp-it-artifacts/<run-id>`；CI 的短期 failure
-artifact 还包含 commit、case、run ID 和 seed。成功运行不上传 artifact。拓扑结构、
-场景列表、诊断内容和分阶段排障命令见 [集成测试参考](docs/INTEGRATION.md)。
+当前 harness 明确要求以 root 身份运行（EUID 0），并依赖 `conntrack`、`iproute2`、
+`nftables`、`tc`、`tcpdump` 等 Linux 工具。拓扑、依赖、可复现参数、诊断和清理边界见
+[集成测试](docs/INTEGRATION.md)。
 
-## 配置校验
+## 文档索引
 
-```bash
-go run ./cmd/mpudp -config ./alice.yaml
-```
-
-成功时命令输出配置模式并退出。配置错误可通过库中的
-`errors.Is(err, mpudp.ErrInvalidConfig)` 判断；错误和格式化输出不会包含 PSK。
-
-配置字段、默认值及严格校验规则见 [配置参考](docs/CONFIGURATION.md)，公共类型和
-并发契约见 [API 参考](docs/API.md)。完整产品语义见
-[需求文档](docs/MPUDP_REQUIREMENTS.md)。
+- [公共 API](docs/API.md)
+- [配置参考](docs/CONFIGURATION.md)
+- [Session 与握手](docs/SESSION.md)
+- [UDP Transport](docs/TRANSPORT.md)
+- [Wire 协议](docs/WIRE_PROTOCOL.md)
+- [FEC 与调度](docs/FEC.md)
+- [集成测试](docs/INTEGRATION.md)
+- [完整配置示例](docs/MPUDP_CONFIG_EXAMPLE.md)
+- [v0.1 需求](docs/MPUDP_REQUIREMENTS.md)
+- [需求追踪矩阵](docs/TRACEABILITY.md)
+- [依赖与许可证审计](docs/DEPENDENCIES.md)
