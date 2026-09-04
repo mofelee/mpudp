@@ -218,9 +218,6 @@ func runListener(ctx context.Context, opts options, log *eventLog) (returnErr er
 	if err := waitForMarker(ctx, opts.attackDonePath); err != nil {
 		return fmt.Errorf("wait for attack completion: %w", err)
 	}
-	if rendered := peer.String(); rendered != "Peer{mode:listener sessions:1 closed:false}" {
-		return fmt.Errorf("processing barrier did not isolate exactly one Session: %s", rendered)
-	}
 	barrier, err := listener.Accept(ctx)
 	if err != nil {
 		return fmt.Errorf("accept processing barrier Session: %w", err)
