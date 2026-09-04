@@ -55,7 +55,7 @@ Linux，并需要 root 或等价的网络管理权限。Debian/Ubuntu 环境安�
 ```bash
 sudo apt-get update
 sudo apt-get install --yes --no-install-recommends \
-  conntrack iproute2 iputils-ping nftables procps tcpdump
+  conntrack diffutils iproute2 iputils-ping nftables procps tcpdump
 ```
 
 使用固定 case、run ID 和 seed 可以重放 CI 失败。state 与诊断目录必须分离；

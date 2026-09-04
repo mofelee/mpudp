@@ -137,11 +137,13 @@ func TestCanonicalMutationCasesHaveWorkerExitCleanup(t *testing.T) {
 		`if ! cleanup_canonical_rebinding; then cleanup_status=1; fi`,
 		`if ! cleanup_canonical_mtu; then cleanup_status=1; fi`,
 		`if ! cleanup_shutdown_mutations; then cleanup_status=1; fi`,
+		`if ! cleanup_rs_network_mutations; then cleanup_status=1; fi`,
 		`--kill-after=10s`,
 		`trap "exit 143" TERM`,
 		`canonical_rebinding_mutation_file=${MPUDP_IT_STATE_DIR}/endpoint-rebinding-and-expiry.mutations`,
 		`canonical_mtu_mutation_file=${MPUDP_IT_STATE_DIR}/mtu-budget-no-fragment.mutations`,
 		`shutdown_mutation_file=${MPUDP_IT_STATE_DIR}/shutdown-cleanup.mutations`,
+		`rs_network_mutation_file=${MPUDP_IT_STATE_DIR}/rs-network.mutations`,
 		`mpudp-expired-endpoint-drop`,
 		`for family in 4 6; do`,
 		`--path 1 --family "${family}" --value 1500`,
@@ -149,6 +151,40 @@ func TestCanonicalMutationCasesHaveWorkerExitCleanup(t *testing.T) {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("canonical worker-exit cleanup is missing %q", required)
 		}
+	}
+}
+
+func TestCanonicalRSScenariosUsePublicPeersAndRealNamespacePaths(t *testing.T) {
+	repository, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := os.ReadFile(filepath.Join(repository, "scripts", "integration", "run-case"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(runner)
+	for _, required := range []string{
+		`go build -trimpath -o "${temporary}" ./integration/cmd/rspeerprobe`,
+		`ip netns exec "${bob_ns}" "${rspeerprobe}"`,
+		`ip netns exec "${alice_ns}" "${rspeerprobe}"`,
+		`--role listener --scenario "${case_name}"`,
+		`--role initiator --scenario "${case_name}"`,
+		`drop-match --path "${first_path}" --family 4 --offset 34`,
+		`two-shards-dropped-third-arrives-after-decode-timeout`,
+		`--direction forward --delay 600ms`,
+		`snapshot_path_counters "${family}" mpudp-reverse`,
+		`assert_socket_snapshots_equal "${rs_socket_start}"`,
+		`run_rs_five_carrier_loss`,
+		`run_rs_two_carrier_rotation`,
+		`run_rs_slow_path`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("canonical RS namespace runner is missing %q", required)
+		}
+	}
+	if strings.Contains(contents, `rs-scenario) run_rs_scenario`) {
+		t.Fatal("canonical RS dispatch still uses the in-memory scenario runner")
 	}
 }
 
@@ -535,7 +571,7 @@ MPUDP_IT_RUN_ID=$3
 mpudp_it_process_matches_run "$4"
 `
 	for _, helper := range []string{
-		"netprobe", "peerprobe", "rsprobe", "pollutionprobe", "shutdownprobe", "capture-fragments", "capture-udp",
+		"netprobe", "peerprobe", "rsprobe", "rspeerprobe", "pollutionprobe", "shutdownprobe", "capture-fragments", "capture-udp",
 	} {
 		t.Run(helper, func(t *testing.T) {
 			const exactRunID = "argv-exact-long"

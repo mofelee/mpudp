@@ -17,8 +17,8 @@ direct-single-carrier	direct-single-carrier	4	30	false
 transparent-nat-reverse-path	transparent-nat-reverse-path	4	35	false
 endpoint-rebinding-and-expiry	endpoint-rebinding-and-expiry	4	40	false
 mtu-budget-no-fragment	mtu-budget-no-fragment	dual	70	false
-rs53-five-carrier-loss	rs-scenario	protocol	20	false
-rs53-two-carrier-rotation	rs-scenario	protocol	20	false
-slow-path-early-recovery	rs-scenario	protocol	20	false
+rs53-five-carrier-loss	peer-rs-network	4	40	false
+rs53-two-carrier-rotation	peer-rs-network	4	30	false
+slow-path-early-recovery	peer-rs-network	4	25	false
 auth-and-state-pollution	peer-auth-pollution	4	45	false
 shutdown-cleanup	peer-shutdown-cleanup	4	90	false

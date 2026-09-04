@@ -3,7 +3,7 @@
 `scripts/integration` provides the repository-owned Linux network-namespace
 harness for issue #8. It creates the topology, runs named scenarios, collects
 redacted diagnostics, and removes only resources owned by one unique run ID.
-GitHub Actions in issue #9 can call the same commands and scenario manifest.
+GitHub Actions calls the same commands and scenario manifest.
 
 This loop does not create, inspect, or remove libvirt VMs. A developer may run
 the repository scripts inside a disposable Debian VM, but the harness itself
@@ -24,7 +24,7 @@ external hypervisor.
 On Debian/Ubuntu the normal package surface is:
 
 ```text
-iproute2 iputils-ping nftables conntrack tcpdump
+conntrack diffutils iproute2 iputils-ping nftables procps tcpdump
 ```
 
 The raw NAT smoke does not require the `conntrack` CLI: successful reverse
@@ -166,22 +166,27 @@ Topology and control cases:
 - `nat-rebinding-trigger-v4` and `nat-rebinding-trigger-v6` create two explicit
   Alice source ports and require Bob to observe two distinct NAT Endpoints.
 
-Deterministic RS(5,3) cases run the production encoder, authenticated wire
-codec, Session state machines, scheduler, one-shot transport sender, and
-decoder through test-only in-memory paths. The injected logical clock makes
-exact shard loss and arrival ordering observable without wall-clock sleeps;
-the outer namespace runner still owns timeout, diagnostics, and cleanup:
+The three canonical RS(5,3) cases launch `rspeerprobe` as separate public
+`mpudp.Peer` processes in Alice and Bob. Every configured Carrier is a real,
+long-lived UDP socket through its own T namespace. Marker barriers release one
+public `WritePacket` at a time; nft DATA/drop counters and timestamp-only packet
+observers make the resulting wire behavior independently visible. A separate
+in-memory `rsprobe` remains as fast component coverage, but it is not used as a
+canonical network check:
 
-- `rs53-five-carrier-loss` covers all ten two-shard loss combinations, injects
-  a duplicate after every recovery, then expires a three-loss block while
-  asserting five one-shot DATA attempts and no reverse DATA response;
+- `rs53-five-carrier-loss` maps all ten two-shard combinations onto five real
+  paths, requires exactly two matching nft drops plus three surviving shards
+  and one public delivery for each, then rejects both a three-loss block and a
+  late third shard arriving after `decode_timeout`. The same Session recovers;
+  aggregate counters forbid reverse responses or forward retries;
 - `rs53-two-carrier-rotation` proves four consecutive `3/2`, `2/3` mappings,
-  recovery when the two-shard Carrier is lost, non-delivery when the
-  three-shard Carrier is lost, and subsequent Session recovery;
-- `slow-path-early-recovery` injects logical arrivals at 10ms, 20ms, 30ms, and
-  500ms while dropping the fifth shard. Its event order requires delivery
-  immediately after the third arrival and before the late shard, with no
-  second delivery.
+  using exact T1/T2 DATA deltas, recovery when the two-shard Carrier is lost,
+  non-delivery when the three-shard Carrier is lost, and subsequent delivery on
+  the same public Session;
+- `slow-path-early-recovery` maps one block to real 10ms, 20ms, 30ms, and 500ms
+  netem paths plus a 100% loss path. Capture and public-delivery timestamps must
+  order the first three shards before delivery and the 500ms shard afterward;
+  a bounded quiet read rejects a second delivery from the late shard.
 
 Public `mpudp.Peer` cases use only the exported Datagram API with fixed RS(5,3)
 and a test-only PSK:
@@ -355,10 +360,9 @@ logs are sanitized again while copying.
 ## Scope boundary
 
 Issue #8 owns this reusable topology, the public Peer smoke/MTU/rebinding/expiry
-cases, diagnostics, hard timeouts, repetition, and exact cleanup. Broader
-protocol matrices remain with issue #9, including authentication-rejection and
-state-pollution attacks, duplicate-delivery coverage under shard loss/late
-arrival, and GitHub-hosted workflow orchestration.
+cases, diagnostics, hard timeouts, repetition, and exact cleanup. Issue #9 adds
+the canonical public RS/loss/latency, authentication-pollution, shutdown, and
+GitHub-hosted matrix contracts on the same repository-owned harness.
 
 The optional disposable Debian VM development record also remains outside this
 repository run. It requires an explicitly selected libvirt URI and a separate

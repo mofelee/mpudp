@@ -50,9 +50,9 @@ type canonicalCaseContract struct {
 
 var canonicalCaseContracts = []canonicalCaseContract{
 	{Name: "direct-single-carrier", Runner: "direct-single-carrier", Family: "4", Timeout: 30},
-	{Name: "rs53-five-carrier-loss", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
-	{Name: "rs53-two-carrier-rotation", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
-	{Name: "slow-path-early-recovery", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
+	{Name: "rs53-five-carrier-loss", Runner: "peer-rs-network", Family: "4", Timeout: 40},
+	{Name: "rs53-two-carrier-rotation", Runner: "peer-rs-network", Family: "4", Timeout: 30},
+	{Name: "slow-path-early-recovery", Runner: "peer-rs-network", Family: "4", Timeout: 25},
 	{Name: "transparent-nat-reverse-path", Runner: "transparent-nat-reverse-path", Family: "4", Timeout: 35},
 	{Name: "endpoint-rebinding-and-expiry", Runner: "endpoint-rebinding-and-expiry", Family: "4", Timeout: 40},
 	{Name: "auth-and-state-pollution", Runner: "peer-auth-pollution", Family: "4", Timeout: 45},

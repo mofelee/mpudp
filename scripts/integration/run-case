@@ -53,7 +53,7 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	fi
 	if [[ ${runner} == raw-nat-smoke || ${runner} == peer-* ]]; then mpudp_it_require_commands tcpdump grep; fi
 	if [[ ${runner} == path-controls ]]; then mpudp_it_require_commands ping; fi
-	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding || ${runner} == direct-single-carrier ]]; then
+	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding || ${runner} == direct-single-carrier || ${runner} == peer-rs-network ]]; then
 		mpudp_it_require_commands ss diff
 	fi
 	exec timeout --signal=TERM --kill-after=10s "${case_timeout}s" \
@@ -67,7 +67,9 @@ direct_mutation_file=''
 canonical_rebinding_mutation_file=''
 canonical_mtu_mutation_file=''
 shutdown_mutation_file=''
-rsprobe=''
+rs_network_mutation_file=''
+rspeerprobe=''
+rs_socket_start=''
 pollutionprobe=''
 shutdownprobe=''
 build_netprobe() {
@@ -100,18 +102,18 @@ build_peerprobe() {
 	trap - RETURN
 }
 
-build_rsprobe() {
-	rsprobe=${MPUDP_IT_STATE_DIR}/bin/rsprobe
-	if [[ -x ${rsprobe} ]]; then return 0; fi
+build_rspeerprobe() {
+	rspeerprobe=${MPUDP_IT_STATE_DIR}/bin/rspeerprobe
+	if [[ -x ${rspeerprobe} ]]; then return 0; fi
 	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
-	temporary=${rsprobe}.tmp.$$
+	temporary=${rspeerprobe}.tmp.$$
 	trap 'rm -f -- "${temporary}"' RETURN
 	(
 		cd "${MPUDP_IT_REPO_ROOT}"
-		go build -trimpath -o "${temporary}" ./integration/cmd/rsprobe
+		go build -trimpath -o "${temporary}" ./integration/cmd/rspeerprobe
 	)
 	chmod 0700 "${temporary}"
-	mv -- "${temporary}" "${rsprobe}"
+	mv -- "${temporary}" "${rspeerprobe}"
 	trap - RETURN
 }
 
@@ -190,6 +192,7 @@ cleanup_case_worker() {
 	if ! cleanup_canonical_rebinding; then cleanup_status=1; fi
 	if ! cleanup_canonical_mtu; then cleanup_status=1; fi
 	if ! cleanup_shutdown_mutations; then cleanup_status=1; fi
+	if ! cleanup_rs_network_mutations; then cleanup_status=1; fi
 	if (( worker_status == 0 && cleanup_status != 0 )); then worker_status=1; fi
 	exit "${worker_status}"
 }
@@ -783,6 +786,31 @@ cleanup_shutdown_mutations() {
 		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
 			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
 			mpudp_it_die "shutdown shard-drop rule remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ! assert_no_netem 4; then status=1; fi
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_rs_network_mutations() {
+	local marker=${rs_network_mutation_file:-${MPUDP_IT_STATE_DIR:-}/rs-network.mutations}
+	local cleanup_path t_ns status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for cleanup_path in 1 2 3 4 5; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1; then
+			status=1
+		fi
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop \
+			--path "${cleanup_path}" --family 4 >/dev/null 2>&1; then
+			status=1
+		fi
+		t_ns=$(mpudp_it_ns "t${cleanup_path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "RS network drop rule remains on path ${cleanup_path}"
 			status=1
 		fi
 	done
@@ -1896,80 +1924,488 @@ run_nat_rebinding_trigger() {
 	mpudp_it_log "case passed: ${case_name} (source ports 41001 -> 41002 produced distinct NAT endpoints)"
 }
 
-run_rs_scenario() {
-	local events_file log_file ready_file continue_file rsprobe_pid rsprobe_status
-	local complete_count primary_count boundary_count
-	build_rsprobe
-	events_file=${MPUDP_IT_STATE_DIR}/${case_name}-events.ndjson
-	log_file=${MPUDP_IT_STATE_DIR}/${case_name}.log
-	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
-	continue_file=${MPUDP_IT_STATE_DIR}/${case_name}.continue
-	: >"${events_file}"
-	: >"${log_file}"
-	rm -f -- "${ready_file}" "${continue_file}"
-	"${rsprobe}" --scenario "${case_name}" --run-id "${MPUDP_IT_RUN_ID}" \
-		--timeout "${case_timeout}s" --events "${events_file}" \
-		--ready-file "${ready_file}" --continue-file "${continue_file}" >"${log_file}" 2>&1 &
-	rsprobe_pid=$!
-	if ! mpudp_it_record_pid "${rsprobe_pid}"; then
-		kill -TERM "${rsprobe_pid}" 2>/dev/null || true
-		wait "${rsprobe_pid}" 2>/dev/null || true
+rs_marker() {
+	printf '%s/%s\n' "${rs_sync_dir}" "$1"
+}
+
+rs_step_marker() {
+	printf '%s/step-%02d-%s\n' "${rs_sync_dir}" "$1" "$2"
+}
+
+assert_rs_carrier_sockets() {
+	local expected=$1 family=$2 alice_ns socket_count unique_count path address
+	alice_ns=$(mpudp_it_ns alice)
+	rs_socket_start=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets-start.log
+	ip netns exec "${alice_ns}" ss -H -u -n -p >"${rs_socket_start}"
+	socket_count=$(awk '$4 ~ /:4000$/ {count++} END {print count+0}' "${rs_socket_start}")
+	unique_count=$(awk '$4 ~ /:4000$/ {print $3}' "${rs_socket_start}" | sort -u | awk 'END {print NR}')
+	if [[ ${socket_count} != "${expected}" || ${unique_count} != "${expected}" ]]; then
+		mpudp_it_die "Alice Carrier sockets=${socket_count}, unique local identities=${unique_count}, want ${expected}/${expected}"
 		return 1
 	fi
-	if ! wait_ready "${ready_file}" "${rsprobe_pid}"; then
-		mpudp_it_die "${case_name} deterministic Session probe did not become ready; see ${log_file}"
+	for (( path=1; path<=expected; path++ )); do
+		address=$(mpudp_it_t_ingress_addr "${family}" "${path}")
+		if ! grep -F "${address}" "${rs_socket_start}" | grep ':4000' >/dev/null; then
+			mpudp_it_die "Alice has no connected Carrier socket for T${path} ${address}:4000"
+			return 1
+		fi
+	done
+}
+
+rs_record_fault() {
+	local event_name=$1 fault=$2 step=${3:-0}
+	printf '{"event":"%s","fault":"%s","step":%s,"run_id":"%s","scenario":"%s"}\n' \
+		"${event_name}" "${fault}" "${step}" "${MPUDP_IT_RUN_ID}" "${case_name}" >>"${rs_fault_events}"
+}
+
+start_rs_peer_pair() {
+	local carrier_count=$1 family=4 alice_ns bob_ns listen_address targets path attempt all_ready current
+	local -a control_before=() data_before=()
+	build_rspeerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	targets=$(mpudp_it_join_targets "${family}")
+	if (( carrier_count == 2 )); then
+		targets="$(mpudp_it_target "${family}" 1),$(mpudp_it_target "${family}" 2)"
+	fi
+	rs_sync_dir=${MPUDP_IT_STATE_DIR}/${case_name}-sync
+	rs_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-bob.ndjson
+	rs_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-alice.ndjson
+	rs_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-bob.log
+	rs_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-alice.log
+	rs_fault_events=${MPUDP_IT_STATE_DIR}/${case_name}-faults.ndjson
+	rs_network_mutation_file=${MPUDP_IT_STATE_DIR}/rs-network.mutations
+	install -d -m 0700 "${rs_sync_dir}"
+	: >"${rs_listener_log}"
+	: >"${rs_initiator_log}"
+	: >"${rs_fault_events}"
+	: >"${rs_network_mutation_file}"
+	snapshot_path_counters "${family}" mpudp-reverse-control
+	control_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-forward-data
+	data_before=("${path_counter_snapshot[@]}")
+
+	ip netns exec "${bob_ns}" "${rspeerprobe}" \
+		--role listener --scenario "${case_name}" --family "${family}" --listen "${listen_address}" \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${rs_listener_events}" --sync-dir "${rs_sync_dir}" >"${rs_listener_log}" 2>&1 &
+	rs_listener_pid=$!
+	mpudp_it_record_pid "${rs_listener_pid}"
+	if ! wait_ready "$(rs_marker listener-ready)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} Bob public Peer did not bind; see ${rs_listener_log}"
 		return 1
 	fi
-	printf 'continue\n' >"${continue_file}"
+	ip netns exec "${alice_ns}" "${rspeerprobe}" \
+		--role initiator --scenario "${case_name}" --family "${family}" --carriers "${targets}" \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${rs_initiator_events}" --sync-dir "${rs_sync_dir}" >"${rs_initiator_log}" 2>&1 &
+	rs_initiator_pid=$!
+	mpudp_it_record_pid "${rs_initiator_pid}"
+
+	all_ready=0
+	for attempt in $(seq 1 100); do
+		all_ready=1
+		for (( path=1; path<=carrier_count; path++ )); do
+			current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-reverse-control)
+			if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= control_before[$((path - 1))] )); then
+				all_ready=0
+			fi
+		done
+		if (( all_ready != 0 )); then break; fi
+		if ! kill -0 "${rs_initiator_pid}" 2>/dev/null || ! kill -0 "${rs_listener_pid}" 2>/dev/null; then break; fi
+		sleep 0.05
+	done
+	if (( all_ready == 0 )); then
+		mpudp_it_die "${case_name} did not authenticate all ${carrier_count} real Carriers"
+		return 1
+	fi
+	if ! wait_ready "$(rs_marker handshake-complete)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} public bootstrap failed; see ${rs_initiator_log}"
+		return 1
+	fi
+	printf 'warmup\n' >"$(rs_marker warmup-go)"
+	if ! wait_ready "$(rs_marker scenario-ready)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} public warmup failed; see ${rs_initiator_log}"
+		return 1
+	fi
+	assert_rs_carrier_sockets "${carrier_count}" "${family}"
+	for (( path=1; path<=carrier_count; path++ )); do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-forward-data)
+		if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= data_before[$((path - 1))] )); then
+			mpudp_it_die "${case_name} warmup did not traverse real Carrier T${path}"
+			return 1
+		fi
+	done
+	snapshot_path_counters "${family}" mpudp-forward-data
+	rs_data_start=("${path_counter_snapshot[@]}")
+	rs_expected_data=(0 0 0 0 0)
+	snapshot_path_counters "${family}" mpudp-reverse
+	rs_reverse_start=("${path_counter_snapshot[@]}")
+}
+
+rs_add_expected_data() {
+	local path
+	local -a increments=("$@")
+	if (( ${#increments[@]} != 5 )); then
+		mpudp_it_die "RS DATA expectation requires five path increments"
+		return 2
+	fi
+	for path in 1 2 3 4 5; do
+		rs_expected_data[$((path - 1))]=$((rs_expected_data[$((path - 1))] + increments[$((path - 1))]))
+	done
+}
+
+rs_wait_expected_data() {
+	local attempt path current expected all_exact
+	for attempt in $(seq 1 100); do
+		all_exact=1
+		for path in 1 2 3 4 5; do
+			current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-forward-data)
+			expected=$((rs_data_start[$((path - 1))] + rs_expected_data[$((path - 1))]))
+			if [[ ! ${current} =~ ^[0-9]+$ ]]; then
+				mpudp_it_die "${case_name} T${path} DATA counter is unavailable"
+				return 1
+		fi
+			if (( current > expected )); then
+				mpudp_it_die "${case_name} T${path} DATA counter=${current}, want ${expected}; duplicate or retransmit observed"
+				return 1
+		fi
+			if (( current != expected )); then all_exact=0; fi
+		done
+		if (( all_exact != 0 )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "${case_name} real Carrier DATA counters did not reach the expected totals"
+	return 1
+}
+
+rs_wait_drop_count() {
+	local path=$1 offset=$2 hex_value=$3 expected=$4 attempt current comment
+	comment=mpudp-drop-${offset}-${hex_value}
+	for attempt in $(seq 1 100); do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" "${comment}")
+		if [[ ! ${current} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "${case_name} T${path} ${comment} counter is unavailable"
+			return 1
+		fi
+		if (( current > expected )); then
+			mpudp_it_die "${case_name} T${path} ${comment} counter=${current}, want ${expected}; retransmit observed"
+			return 1
+		fi
+		if (( current == expected )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "${case_name} T${path} ${comment} counter=${current}, want ${expected}"
+	return 1
+}
+
+rs_release_step() {
+	local step=$1 outcome=$2 marker_file
+	printf 'send\n' >"$(rs_step_marker "${step}" go)"
+	if ! wait_ready "$(rs_step_marker "${step}" sent)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} initiator did not send step ${step}; see ${rs_initiator_log}"
+		return 1
+	fi
+	marker_file=$(rs_step_marker "${step}" "${outcome}")
+	if ! wait_ready "${marker_file}" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} listener did not report ${outcome} for step ${step}; see ${rs_listener_log}"
+		return 1
+	fi
+}
+
+rs_clear_drop_paths() {
+	local path t_ns
+	for path in "$@"; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path "${path}" --family 4
+		t_ns=$(mpudp_it_ns "t${path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "${case_name} failed to clear the T${path} shard drop"
+			return 1
+		fi
+	done
+}
+
+rs_assert_no_reverse_traffic() {
+	local path current
+	for path in 1 2 3 4 5; do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-reverse)
+		if [[ ${current:-missing} != "${rs_reverse_start[$((path - 1))]}" ]]; then
+			mpudp_it_die "${case_name} emitted reverse UDP on T${path}; DATA ACK/response behavior is forbidden"
+			return 1
+		fi
+	done
+}
+
+finish_rs_peer_pair() {
+	local initiator_status listener_status completion_count alice_ns socket_end socket_diff
+	if ! wait_ready "$(rs_marker initiator-complete)" "${rs_initiator_pid}" ||
+		! wait_ready "$(rs_marker listener-complete)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} helpers did not complete; see ${rs_listener_log} and ${rs_initiator_log}"
+		return 1
+	fi
+	rs_wait_expected_data
+	rs_assert_no_reverse_traffic
+	alice_ns=$(mpudp_it_ns alice)
+	socket_end=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets-end.log
+	socket_diff=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets.diff
+	ip netns exec "${alice_ns}" ss -H -u -n -p >"${socket_end}"
+	assert_socket_snapshots_equal "${rs_socket_start}" "${socket_end}" "${socket_diff}"
+	printf 'finish\n' >"$(rs_marker finish)"
 	set +e
-	wait "${rsprobe_pid}"
-	rsprobe_status=$?
+	wait "${rs_initiator_pid}"
+	initiator_status=$?
+	if (( initiator_status != 0 )) && kill -0 "${rs_listener_pid}" 2>/dev/null; then kill -TERM "${rs_listener_pid}" 2>/dev/null || true; fi
+	wait "${rs_listener_pid}"
+	listener_status=$?
 	set -e
-	if (( rsprobe_status != 0 )); then
-		mpudp_it_die "${case_name} deterministic Session probe failed; see ${log_file}"
+	if (( initiator_status != 0 || listener_status != 0 )); then
+		mpudp_it_die "${case_name} public helpers exited ${initiator_status}/${listener_status}; see ${rs_listener_log} and ${rs_initiator_log}"
 		return 1
 	fi
-	complete_count=$(grep -c '"event":"scenario_complete"' "${events_file}" || true)
-	if [[ ${complete_count} != 1 ]]; then
-		mpudp_it_die "${case_name} completion event count=${complete_count}, want 1"
-		return 1
-	fi
-	case ${case_name} in
-		rs53-five-carrier-loss)
-			primary_count=$(grep -c '"event":"two_loss_recovered"' "${events_file}" || true)
-			boundary_count=$(grep -c '"event":"three_loss_expired"' "${events_file}" || true)
-			if [[ ${primary_count} != 10 || ${boundary_count} != 1 ]]; then
-				mpudp_it_die "five-Carrier evidence counts=${primary_count}/${boundary_count}, want 10/1"
-				return 1
-			fi
-			;;
-		rs53-two-carrier-rotation)
-			primary_count=$(grep -c '"event":"rotation_observed"' "${events_file}" || true)
-			boundary_count=$(grep -Ec '"event":"(two_shard_carrier_lost_recovered|three_shard_carrier_lost_expired|post_loss_session_recovered)"' "${events_file}" || true)
-			if [[ ${primary_count} != 4 || ${boundary_count} != 3 ]]; then
-				mpudp_it_die "two-Carrier evidence counts=${primary_count}/${boundary_count}, want 4/3"
-				return 1
-			fi
-			;;
-		slow-path-early-recovery)
-			primary_count=$(grep -c '"event":"shard_arrived"' "${events_file}" || true)
-			boundary_count=$(grep -c '"event":"datagram_recovered"' "${events_file}" || true)
-			if [[ ${primary_count} != 4 || ${boundary_count} != 1 ]]; then
-				mpudp_it_die "slow-path evidence counts=${primary_count}/${boundary_count}, want 4/1"
-				return 1
-			fi
-			;;
-		*)
-			mpudp_it_die "unsupported deterministic RS scenario ${case_name}"
-			return 2
-			;;
-	esac
-	if grep -Eiq '"(payload|session_id|authentication_tag|psk)"' "${events_file}"; then
+	if grep -Fqi 'integration-test-key' "${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}" ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}"; then
 		mpudp_it_die "${case_name} event metadata contains a forbidden sensitive field"
 		return 1
 	fi
-	sed -n 'p' "${events_file}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
-	mpudp_it_log "case passed: ${case_name} (deterministic authenticated Session/FEC invariants)"
+	completion_count=$(grep -h -c '"event":"scenario_complete"' "${rs_listener_events}" "${rs_initiator_events}" |
+		awk '{total += $1} END {print total+0}')
+	if [[ ${completion_count} != 2 ]]; then
+		mpudp_it_die "${case_name} completion event count=${completion_count}, want 2"
+		return 1
+	fi
+	sed -n 'p' "${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+}
+
+run_rs_five_carrier_loss() {
+	local step=0 packet_id first_shard second_shard first_path second_path delayed_path shard_hex
+	local -a combinations=('0 1' '0 2' '0 3' '0 4' '1 2' '1 3' '1 4' '2 3' '2 4' '3 4')
+	start_rs_peer_pair 5
+	for combination in "${combinations[@]}"; do
+		step=$((step + 1))
+		packet_id=$((step + 1))
+		read -r first_shard second_shard <<<"${combination}"
+		first_path=$(( (packet_id + first_shard) % 5 + 1 ))
+		second_path=$(( (packet_id + second_shard) % 5 + 1 ))
+		printf -v shard_hex '%02x' "${first_shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${first_path}" --family 4 --offset 34 --hex "${shard_hex}"
+		printf -v shard_hex '%02x' "${second_shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${second_path}" --family 4 --offset 34 --hex "${shard_hex}"
+		rs_record_fault fault_applied "drop-shards-${first_shard}-${second_shard}" "${step}"
+		increments=(1 1 1 1 1)
+		increments[$((first_path - 1))]=0
+		increments[$((second_path - 1))]=0
+		rs_add_expected_data "${increments[@]}"
+		rs_release_step "${step}" received
+		rs_wait_expected_data
+		printf -v shard_hex '%02x' "${first_shard}"
+		rs_wait_drop_count "${first_path}" 34 "${shard_hex}" 1
+		printf -v shard_hex '%02x' "${second_shard}"
+		rs_wait_drop_count "${second_path}" 34 "${shard_hex}" 1
+		rs_record_fault fault_observed "three-real-shards-delivered-once" "${step}"
+		rs_clear_drop_paths "${first_path}" "${second_path}"
+		rs_record_fault fault_cleared "drop-shards-${first_shard}-${second_shard}" "${step}"
+	done
+
+	step=11
+	packet_id=$((step + 1))
+	three_loss_paths=()
+	for shard in 0 1 2; do
+		path=$(( (packet_id + shard) % 5 + 1 ))
+		three_loss_paths+=("${path}")
+		printf -v shard_hex '%02x' "${shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${path}" --family 4 --offset 34 --hex "${shard_hex}"
+	done
+	rs_record_fault fault_applied drop-shards-0-1-2 "${step}"
+	increments=(1 1 1 1 1)
+	for path in "${three_loss_paths[@]}"; do increments[$((path - 1))]=0; done
+	rs_add_expected_data "${increments[@]}"
+	rs_release_step "${step}" quiet
+	rs_wait_expected_data
+	for shard in 0 1 2; do
+		path=$(( (packet_id + shard) % 5 + 1 ))
+		printf -v shard_hex '%02x' "${shard}"
+		rs_wait_drop_count "${path}" 34 "${shard_hex}" 1
+	done
+	rs_record_fault fault_observed three-loss-expired-without-delivery "${step}"
+	rs_clear_drop_paths "${three_loss_paths[@]}"
+	rs_record_fault fault_cleared drop-shards-0-1-2 "${step}"
+
+	step=12
+	packet_id=$((step + 1))
+	first_shard=0
+	second_shard=1
+	first_path=$(( (packet_id + first_shard) % 5 + 1 ))
+	second_path=$(( (packet_id + second_shard) % 5 + 1 ))
+	delayed_path=$(( (packet_id + 2) % 5 + 1 ))
+	printf -v shard_hex '%02x' "${first_shard}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${first_path}" --family 4 --offset 34 --hex "${shard_hex}"
+	printf -v shard_hex '%02x' "${second_shard}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${second_path}" --family 4 --offset 34 --hex "${shard_hex}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path "${delayed_path}" --family 4 --direction forward --delay 600ms
+	assert_rs_netem "${delayed_path}" 'delay (600ms|600\.0ms)'
+	rs_record_fault fault_applied two-shards-dropped-third-arrives-after-decode-timeout "${step}"
+	increments=(1 1 1 1 1)
+	increments[$((first_path - 1))]=0
+	increments[$((second_path - 1))]=0
+	rs_add_expected_data "${increments[@]}"
+	rs_release_step "${step}" quiet
+	rs_wait_expected_data
+	printf -v shard_hex '%02x' "${first_shard}"
+	rs_wait_drop_count "${first_path}" 34 "${shard_hex}" 1
+	printf -v shard_hex '%02x' "${second_shard}"
+	rs_wait_drop_count "${second_path}" 34 "${shard_hex}" 1
+	rs_record_fault fault_observed late-third-shard-did-not-revive-expired-block "${step}"
+	rs_clear_drop_paths "${first_path}" "${second_path}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path "${delayed_path}" --family 4 --direction forward
+	rs_record_fault fault_cleared two-shards-dropped-third-arrives-after-decode-timeout "${step}"
+
+	rs_add_expected_data 1 1 1 1 1
+	rs_release_step 13 received
+	rs_wait_expected_data
+	rs_record_fault fault_observed same-session-recovered-after-expiry 13
+	cleanup_rs_network_mutations
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public Peer, five real Carriers, all ten two-shard losses, three-loss expiry, no DATA response/retry)"
+}
+
+run_rs_two_carrier_rotation() {
+	local step
+	start_rs_peer_pair 2
+	for step in 1 2 3 4; do
+		if (( step % 2 == 1 )); then
+			rs_add_expected_data 3 2 0 0 0
+		else
+			rs_add_expected_data 2 3 0 0 0
+		fi
+		rs_release_step "${step}" received
+		rs_wait_expected_data
+		rs_record_fault rotation_observed "real-carrier-3-2-step-${step}" "${step}"
+	done
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path 2 --family 4 --offset 5 --hex 03
+	rs_record_fault fault_applied drop-two-shard-carrier 5
+	rs_add_expected_data 3 0 0 0 0
+	rs_release_step 5 received
+	rs_wait_expected_data
+	rs_wait_drop_count 2 5 03 2
+	rs_record_fault fault_observed two-shard-carrier-loss-recovered 5
+	rs_clear_drop_paths 2
+	rs_record_fault fault_cleared drop-two-shard-carrier 5
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path 2 --family 4 --offset 5 --hex 03
+	rs_record_fault fault_applied drop-three-shard-carrier 6
+	rs_add_expected_data 2 0 0 0 0
+	rs_release_step 6 quiet
+	rs_wait_expected_data
+	rs_wait_drop_count 2 5 03 3
+	rs_record_fault fault_observed three-shard-carrier-loss-expired 6
+	rs_clear_drop_paths 2
+	rs_record_fault fault_cleared drop-three-shard-carrier 6
+
+	rs_add_expected_data 3 2 0 0 0
+	rs_release_step 7 received
+	rs_wait_expected_data
+	rs_record_fault fault_observed same-session-recovered-after-loss 7
+	cleanup_rs_network_mutations
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public Peer, two real Carriers, observed 3/2 rotation and both loss boundaries)"
+}
+
+assert_rs_netem() {
+	local path=$1 pattern=$2 namespace interface rendered
+	namespace=$(mpudp_it_ns alice)
+	interface=$(mpudp_it_alice_if 4 "${path}")
+	rendered=$(ip netns exec "${namespace}" tc qdisc show dev "${interface}")
+	if [[ ! ${rendered} =~ ${pattern} ]]; then
+		mpudp_it_die "${case_name} T${path} netem does not match ${pattern}: ${rendered}"
+		return 1
+	fi
+}
+
+rs_forward_drop_count() {
+	local path=$1 namespace interface
+	namespace=$(mpudp_it_ns alice)
+	interface=$(mpudp_it_alice_if 4 "${path}")
+	ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+		awk '/ Sent / {for (i=1; i<=NF; i++) if ($i == "(dropped") {value=$(i+1); sub(/,$/, "", value); print value; exit}}'
+}
+
+run_rs_slow_path() {
+	local wire_length=241 delivery_ns path1_ns path3_ns path4_ns path5_ns drop_count line_count
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	start_rs_peer_pair 5
+	start_udp_observers 4 forward rs-network
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 3 --family 4 --direction forward --delay 10ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 4 --family 4 --direction forward --delay 20ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 5 --family 4 --direction forward --delay 30ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 1 --family 4 --direction forward --delay 500ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 2 --family 4 --direction forward --loss 100%
+	assert_rs_netem 3 'delay (10ms|10\.0ms)'
+	assert_rs_netem 4 'delay (20ms|20\.0ms)'
+	assert_rs_netem 5 'delay (30ms|30\.0ms)'
+	assert_rs_netem 1 'delay (500ms|500\.0ms)'
+	assert_rs_netem 2 'loss 100%'
+	rs_record_fault fault_applied real-arrivals-10-20-30-500-drop 1
+	rs_add_expected_data 1 0 1 1 1
+	rs_release_step 1 received
+	if ! wait_ready "$(rs_marker listener-complete)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} listener did not finish its late-shard duplicate check"
+		return 1
+	fi
+	rs_wait_expected_data
+	drop_count=$(rs_forward_drop_count 2)
+	if [[ ! ${drop_count} =~ ^[0-9]+$ ]] || (( drop_count < 1 )); then
+		mpudp_it_die "${case_name} path 2 did not observe the configured dropped shard"
+		return 1
+	fi
+	stop_udp_observers || { mpudp_it_die "${case_name} UDP observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	for path in 1 3 4 5; do
+		line_count=$(grep -c "UDP, length ${wire_length}$" "${udp_event_files[$((path - 1))]}" || true)
+		if [[ ${line_count} != 1 ]]; then
+			mpudp_it_die "${case_name} T${path} scenario shard observations=${line_count}, want 1"
+			return 1
+		fi
+	done
+	if grep -q "UDP, length ${wire_length}$" "${udp_event_files[1]}"; then
+		mpudp_it_die "${case_name} observed the shard configured for 100% loss"
+		return 1
+	fi
+	path1_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[0]}")
+	path3_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[2]}")
+	path4_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[3]}")
+	path5_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[4]}")
+	delivery_ns=$(sed -n 's/.*"event":"datagram_received","step":1.*"observed_unix_nano":\([0-9][0-9]*\).*/\1/p' "${rs_listener_events}" | sed -n '1p')
+	for observed in "${path1_ns}" "${path3_ns}" "${path4_ns}" "${path5_ns}" "${delivery_ns}"; do
+		if [[ ! ${observed} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "${case_name} is missing a comparable wire/delivery timestamp: p1=${path1_ns:-missing} p3=${path3_ns:-missing} p4=${path4_ns:-missing} p5=${path5_ns:-missing} delivery=${delivery_ns:-missing}"
+			return 1
+		fi
+	done
+	if ! awk -v first="${path3_ns}" -v second="${path4_ns}" -v third="${path5_ns}" \
+		-v delivered="${delivery_ns}" -v late="${path1_ns}" \
+		'BEGIN {exit !(first < second && second < third && third <= delivered && delivered < late)}'; then
+		mpudp_it_die "${case_name} order=${path3_ns},${path4_ns},${path5_ns},delivery:${delivery_ns},late:${path1_ns}"
+		return 1
+	fi
+	rs_record_fault fault_observed third-shard-delivery-before-500ms-shard 1
+	cleanup_rs_network_mutations
+	rs_record_fault fault_cleared real-arrivals-10-20-30-500-drop 1
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public delivery followed real 10/20/30ms shards, preceded 500ms shard, ignored late/lost shards)"
+}
+
+run_rs_network_scenario() {
+	case ${case_name} in
+		rs53-five-carrier-loss) run_rs_five_carrier_loss ;;
+		rs53-two-carrier-rotation) run_rs_two_carrier_rotation ;;
+		slow-path-early-recovery) run_rs_slow_path ;;
+		*) mpudp_it_die "unsupported RS network scenario ${case_name}"; return 2 ;;
+	esac
 }
 
 assert_counter_delta_at_least() {
@@ -2484,7 +2920,7 @@ run_case_worker() {
 		transparent-nat-reverse-path) run_transparent_nat_reverse_path "${family}" ;;
 		endpoint-rebinding-and-expiry) run_endpoint_rebinding_and_expiry "${family}" ;;
 		mtu-budget-no-fragment) run_mtu_budget_no_fragment "${family}" ;;
-		rs-scenario) run_rs_scenario ;;
+		peer-rs-network) run_rs_network_scenario ;;
 		peer-smoke) run_peer_smoke "${family}" ;;
 		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
 		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;
