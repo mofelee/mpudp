@@ -62,7 +62,7 @@ func TestHarnessShellSyntaxAndPublicArguments(t *testing.T) {
 	for _, name := range []string{
 		"transparent-nat-v4", "transparent-nat-v6", "path-controls-v4", "peer-smoke-v4", "peer-smoke-v6",
 		"peer-payload-mtu-v4", "peer-payload-mtu-v6", "peer-nat-rebinding-v4", "peer-nat-rebinding-v6",
-		"peer-endpoint-expiry-v4", "peer-endpoint-expiry-v6",
+		"peer-endpoint-expiry-v4", "peer-endpoint-expiry-v6", "direct-single-carrier",
 	} {
 		if !strings.Contains(cases, name) {
 			t.Fatalf("case manifest output is missing %q:\n%s", name, cases)
@@ -87,6 +87,38 @@ func TestHarnessShellSyntaxAndPublicArguments(t *testing.T) {
 	invalidRunID := commandFailureOutput(t, repository, "scripts/integration/teardown", "--run-id", "../../outside")
 	if !strings.Contains(invalidRunID, "invalid run ID") {
 		t.Fatalf("teardown did not reject a path-like run ID before resolution:\n%s", invalidRunID)
+	}
+}
+
+func TestDirectSingleCarrierScenarioIsDistinctAndCleanupOwned(t *testing.T) {
+	repository, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(filepath.Join(repository, "integration", "scenarios", "cases.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const row = "direct-single-carrier\tdirect-single-carrier\t4\t30\tfalse"
+	if count := strings.Count(string(manifest), row); count != 1 {
+		t.Fatalf("direct scenario manifest row count = %d, want 1", count)
+	}
+	runner, err := os.ReadFile(filepath.Join(repository, "scripts", "integration", "run-case"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(runner)
+	for _, required := range []string{
+		`direct-single-carrier) run_direct_single_carrier "${family}"`,
+		`route add "${bob_address}/32"`,
+		`route add "${alice_address}/32"`,
+		`counter return comment mpudp-direct-no-snat`,
+		`cleanup_direct_single_carrier`,
+		`start_peer_exchange 4 direct-single-carrier`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("direct scenario runner is missing %q", required)
+		}
 	}
 }
 

@@ -53,7 +53,9 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	fi
 	if [[ ${runner} == raw-nat-smoke || ${runner} == peer-* ]]; then mpudp_it_require_commands tcpdump grep; fi
 	if [[ ${runner} == path-controls ]]; then mpudp_it_require_commands ping; fi
-	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding ]]; then mpudp_it_require_commands ss diff; fi
+	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding || ${runner} == direct-single-carrier ]]; then
+		mpudp_it_require_commands ss diff
+	fi
 	exec timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
 		bash -c 'source "$1"; trap cleanup_case_worker EXIT; run_case_worker "$2" "$3" "$4" "$5" "$6"' \
 		"${SCRIPT_DIR}/run-case-worker" "${0}" "${state_dir}" "${case_name}" "${case_timeout}" "${runner}" "${family}"
@@ -61,6 +63,7 @@ fi
 
 netprobe=''
 peerprobe=''
+direct_mutation_file=''
 build_netprobe() {
 	netprobe=${MPUDP_IT_STATE_DIR}/bin/netprobe
 	if [[ -x ${netprobe} ]]; then return 0; fi
@@ -132,6 +135,7 @@ cleanup_case_worker() {
 			fi
 		fi
 	done
+	if ! cleanup_direct_single_carrier; then cleanup_status=1; fi
 	if (( worker_status == 0 && cleanup_status != 0 )); then worker_status=1; fi
 	exit "${worker_status}"
 }
@@ -447,7 +451,7 @@ assert_five_carrier_sockets() {
 start_peer_exchange() {
 	local family=$1 flow=$2 listener_budget=$3 initiator_budget=$4 body_bytes=$5 reply_bytes=$6
 	local oversize_bytes=$7 expect_partial_mtu=$8 reject_second_session=$9
-	local alice_ns bob_ns listen_address targets peer_start_marker peer_start_phase
+	local targets_override=${10:-} alice_ns bob_ns listen_address targets peer_start_marker peer_start_phase
 	local -a listener_arguments initiator_arguments
 	build_peerprobe
 	alice_ns=$(mpudp_it_ns alice)
@@ -455,6 +459,7 @@ start_peer_exchange() {
 	listen_address=0.0.0.0:9000
 	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
 	targets=$(mpudp_it_join_targets "${family}")
+	if [[ -n ${targets_override} ]]; then targets=${targets_override}; fi
 	peer_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-bob.ndjson
 	peer_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-alice.ndjson
 	peer_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-bob.log
@@ -590,6 +595,249 @@ finish_peer_exchange() {
 		return 1
 	fi
 	record_peer_events
+}
+
+remove_nft_rules_with_comment() {
+	local namespace=$1 nft_family=$2 table=$3 chain=$4 comment=$5 handle status=0
+	local -a handles=()
+	mapfile -t handles < <(
+		ip netns exec "${namespace}" nft -a list chain "${nft_family}" "${table}" "${chain}" 2>/dev/null |
+			awk -v marker="comment \"${comment}\"" 'index($0, marker) {for (i=1; i<=NF; i++) if ($i == "handle") print $(i+1)}'
+	)
+	for handle in "${handles[@]}"; do
+		if ! ip netns exec "${namespace}" nft delete rule "${nft_family}" "${table}" "${chain}" handle "${handle}"; then
+			status=1
+		fi
+	done
+	return "${status}"
+}
+
+cleanup_direct_single_carrier() {
+	local marker=${direct_mutation_file:-${MPUDP_IT_STATE_DIR:-}/direct-single-carrier.direct-mutations}
+	local alice_ns bob_ns t_ns alice_address bob_address alice_gateway bob_gateway direct_comment status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	alice_gateway=$(mpudp_it_t_ingress_addr 4 1)
+	bob_gateway=$(mpudp_it_t_egress_addr 4 1)
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" forward mpudp-direct-forward || status=1
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" forward mpudp-direct-reverse || status=1
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting mpudp-direct-no-snat || status=1
+	ip -n "${alice_ns}" -4 route del "${bob_address}/32" via "${alice_gateway}" dev a4p1 2>/dev/null || true
+	ip -n "${bob_ns}" -4 route del "${alice_address}/32" via "${bob_gateway}" dev b4p1 2>/dev/null || true
+	if [[ -n $(ip -n "${alice_ns}" -4 route show exact "${bob_address}/32") ||
+		-n $(ip -n "${bob_ns}" -4 route show exact "${alice_address}/32") ]]; then
+		mpudp_it_die "direct single-Carrier host routes remain after cleanup"
+		status=1
+	fi
+	for direct_comment in mpudp-direct-forward mpudp-direct-reverse mpudp-direct-no-snat; do
+		if ip netns exec "${t_ns}" nft -a list table ip "${MPUDP_IT_TABLE4}" |
+			awk -v marker="comment \"${direct_comment}\"" 'index($0, marker) {found=1} END {exit !found}'; then
+			mpudp_it_die "direct single-Carrier nft rule remains after cleanup: ${direct_comment}"
+			status=1
+		fi
+	done
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+configure_direct_single_carrier() {
+	local alice_ns bob_ns t_ns alice_address bob_address alice_gateway bob_gateway
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	alice_gateway=$(mpudp_it_t_ingress_addr 4 1)
+	bob_gateway=$(mpudp_it_t_egress_addr 4 1)
+	if [[ -n $(ip -n "${alice_ns}" -4 route show exact "${bob_address}/32") ||
+		-n $(ip -n "${bob_ns}" -4 route show exact "${alice_address}/32") ]]; then
+		mpudp_it_die "direct single-Carrier route already exists outside case ownership"
+		return 1
+	fi
+	direct_mutation_file=${MPUDP_IT_STATE_DIR}/direct-single-carrier.direct-mutations
+	: >"${direct_mutation_file}"
+	ip -n "${alice_ns}" -4 route add "${bob_address}/32" via "${alice_gateway}" dev a4p1
+	ip -n "${bob_ns}" -4 route add "${alice_address}/32" via "${bob_gateway}" dev b4p1
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" postrouting \
+		ip saddr "${alice_address}" ip daddr "${bob_address}" udp dport 9000 \
+		counter return comment mpudp-direct-no-snat
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname in4 oifname out4 ip saddr "${alice_address}" ip daddr "${bob_address}" udp dport 9000 \
+		counter accept comment mpudp-direct-forward
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname out4 oifname in4 ip saddr "${bob_address}" ip daddr "${alice_address}" udp sport 9000 \
+		counter accept comment mpudp-direct-reverse
+}
+
+counter_for_rule_fragments() {
+	local namespace=$1 nft_family=$2 table=$3 chain=$4 first=$5 second=$6
+	ip netns exec "${namespace}" nft list chain "${nft_family}" "${table}" "${chain}" |
+		awk -v first="${first}" -v second="${second}" '
+			index($0, first) && index($0, second) {
+				for (i=1; i<=NF; i++) if ($i == "packets") {print $(i+1); exit}
+			}
+		'
+}
+
+capture_single_direct_carrier() {
+	local label=$1 alice_ns target snapshot tuple local_endpoint local_address local_port minimum maximum
+	alice_ns=$(mpudp_it_ns alice)
+	target=$(mpudp_it_bob_addr 4 1):9000
+	snapshot=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-alice-sockets.log
+	tuple=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-alice-carrier-tuple.log
+	ip netns exec "${alice_ns}" ss -H -u -n >"${snapshot}"
+	if [[ $(awk 'NF {count++} END {print count+0}' "${snapshot}") != 1 ||
+		$(awk -v target="${target}" '$4 == target {count++} END {print count+0}' "${snapshot}") != 1 ]]; then
+		mpudp_it_die "Alice does not have exactly one connected UDP Carrier to ${target}"
+		return 1
+	fi
+	awk -v target="${target}" '$4 == target {print $3, $4}' "${snapshot}" >"${tuple}"
+	read -r local_endpoint _ <"${tuple}"
+	local_address=${local_endpoint%:*}
+	local_port=${local_endpoint##*:}
+	read -r minimum maximum < <(ip netns exec "${alice_ns}" cat /proc/sys/net/ipv4/ip_local_port_range)
+	if [[ ${local_address} != "$(mpudp_it_alice_addr 4 1)" || ! ${local_port} =~ ^[0-9]+$ ||
+		! ${minimum} =~ ^[0-9]+$ || ! ${maximum} =~ ^[0-9]+$ ]] ||
+		(( local_port < minimum || local_port > maximum )); then
+		mpudp_it_die "Alice Carrier source is not an OS-assigned path-1 tuple"
+		return 1
+	fi
+	direct_tuple_file=${tuple}
+	direct_source_port=${local_port}
+}
+
+assert_direct_wire_metadata() {
+	local source_port=$1 alice_address bob_address source_endpoint reverse_endpoint offending line_count index
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	source_endpoint=${alice_address}.${source_port}
+	reverse_endpoint=${bob_address}.9000
+	line_count=$(awk 'NF {count++} END {print count+0}' "${udp_event_files[0]}")
+	if (( line_count == 0 || line_count > 256 )); then
+		mpudp_it_die "T1 direct UDP metadata row count=${line_count}, want 1..256"
+		return 1
+	fi
+	offending=$(awk -v source="${source_endpoint}" -v reverse="${reverse_endpoint}" '
+		NF && !(($2 == "IP" && $3 == source && $4 == ">" && $5 == reverse ":") ||
+			($2 == "IP" && $3 == reverse && $4 == ">" && $5 == source ":")) {print; exit}
+	' "${udp_event_files[0]}")
+	if [[ -n ${offending} ]]; then
+		mpudp_it_die "T1 observed a non-direct or unstable UDP tuple: ${offending}"
+		return 1
+	fi
+	for index in 1 2 3 4; do
+		if grep -q '[^[:space:]]' "${udp_event_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) unexpectedly observed direct single-Carrier traffic"
+			return 1
+		fi
+	done
+}
+
+assert_peer_event_once() {
+	local file=$1 event_name=$2 phase=$3 bytes=$4 expected_digest=$5 description=$6 marker count
+	marker="\"event\":\"${event_name}\",\"phase\":\"${phase}\",\"bytes\":${bytes},\"sha256_prefix\":\"${expected_digest}\""
+	count=$(awk -v marker="${marker}" 'index($0, marker) {count++} END {print count+0}' "${file}")
+	if [[ ${count} != 1 ]]; then
+		mpudp_it_die "${description} metadata count=${count}, want 1"
+		return 1
+	fi
+}
+
+assert_peer_event_order() {
+	local file=$1 previous=0 marker line
+	shift
+	for marker in "$@"; do
+		line=$(awk -v marker="${marker}" 'index($0, marker) {count++; found=NR} END {if (count == 1) print found; else print 0}' "${file}")
+		if (( line <= previous )); then
+			mpudp_it_die "public Peer event order is invalid around ${marker}"
+			return 1
+		fi
+		previous=${line}
+	done
+}
+
+run_direct_single_carrier() {
+	local family=$1 t_ns alice_address bob_address target dnat_before dnat_after snat_before snat_after
+	local before_tuple after_tuple socket_difference direct_source
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "direct-single-carrier currently has an explicit IPv4 contract"
+		return 2
+	fi
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	target=${bob_address}:9000
+	dnat_before=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" prerouting \
+		"ip daddr $(mpudp_it_t_ingress_addr 4 1) udp dport 4000" "dnat to ${bob_address}:9000")
+	snat_before=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting \
+		"ip daddr ${bob_address} udp dport 9000" masquerade)
+	if [[ ! ${dnat_before} =~ ^[0-9]+$ || ! ${snat_before} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "T1 baseline NAT counters are unavailable"
+		return 1
+	fi
+	trap cleanup_direct_single_carrier RETURN
+	configure_direct_single_carrier
+	start_udp_observers 4 both direct
+	start_peer_exchange 4 direct-single-carrier 1200 1200 321 257 0 false false "${target}"
+	capture_single_direct_carrier before
+	before_tuple=${direct_tuple_file}
+	direct_source=${direct_source_port}
+	release_peer_exchange
+	capture_single_direct_carrier after
+	after_tuple=${direct_tuple_file}
+	socket_difference=${MPUDP_IT_STATE_DIR}/${case_name}-socket-difference.log
+	if ! diff -u "${before_tuple}" "${after_tuple}" >"${socket_difference}"; then
+		mpudp_it_die "Alice's OS-assigned direct Carrier tuple changed during the exchange"
+		return 1
+	fi
+	if [[ ${direct_source_port} != "${direct_source}" ]]; then
+		mpudp_it_die "Alice's direct Carrier source port changed during the exchange"
+		return 1
+	fi
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more direct UDP metadata observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_direct_wire_metadata "${direct_source}"
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-no-snat 1
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-forward 1
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-reverse 1
+	dnat_after=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" prerouting \
+		"ip daddr $(mpudp_it_t_ingress_addr 4 1) udp dport 4000" "dnat to ${bob_address}:9000")
+	snat_after=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting \
+		"ip daddr ${bob_address} udp dport 9000" masquerade)
+	if [[ ${dnat_after} != "${dnat_before}" || ${snat_after} != "${snat_before}" ]]; then
+		mpudp_it_die "direct traffic changed baseline DNAT/SNAT counters"
+		return 1
+	fi
+	assert_peer_event_once "${peer_initiator_events}" datagram_sent main 321 e91ff40e5f79 "Alice main send"
+	assert_peer_event_once "${peer_listener_events}" datagram_received main 321 e91ff40e5f79 "Bob main delivery"
+	assert_peer_event_once "${peer_initiator_events}" datagram_sent empty 0 e3b0c44298fc "Alice empty send"
+	assert_peer_event_once "${peer_listener_events}" datagram_received empty 0 e3b0c44298fc "Bob empty delivery"
+	assert_peer_event_once "${peer_listener_events}" datagram_sent main 257 83c99b15dfcd "Bob main send"
+	assert_peer_event_once "${peer_initiator_events}" datagram_received main 257 83c99b15dfcd "Alice main delivery"
+	assert_peer_event_once "${peer_listener_events}" datagram_sent empty 0 e3b0c44298fc "Bob empty send"
+	assert_peer_event_once "${peer_initiator_events}" datagram_received empty 0 e3b0c44298fc "Alice empty delivery"
+	assert_peer_event_order "${peer_initiator_events}" \
+		'"event":"datagram_sent","phase":"main"' '"event":"datagram_sent","phase":"empty"' \
+		'"event":"datagram_received","phase":"main"' '"event":"datagram_received","phase":"empty"' \
+		'"event":"session_closed"' '"event":"flow_complete"' '"event":"peer_closed"'
+	assert_peer_event_order "${peer_listener_events}" \
+		'"event":"datagram_received","phase":"main"' '"event":"datagram_received","phase":"empty"' \
+		'"event":"datagram_sent","phase":"main"' '"event":"datagram_sent","phase":"empty"' \
+		'"event":"session_closed"' '"event":"flow_complete"' '"event":"peer_closed"'
+	if [[ $(awk 'END {print NR+0}' "${peer_listener_events}") -gt 32 ||
+		$(awk 'END {print NR+0}' "${peer_initiator_events}") -gt 32 ]]; then
+		mpudp_it_die "direct public Peer diagnostic event count exceeded 32"
+		return 1
+	fi
+	cleanup_direct_single_carrier
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (direct IPv4, one stable OS-assigned Carrier, exact non-empty/empty Datagram boundaries)"
 }
 
 run_peer_smoke() {
@@ -1214,6 +1462,7 @@ run_case_worker() {
 		raw-nat-smoke) run_raw_nat_smoke "${family}" ;;
 		path-controls) run_path_controls "${family}" ;;
 		nat-rebinding-trigger) run_nat_rebinding_trigger "${family}" ;;
+		direct-single-carrier) run_direct_single_carrier "${family}" ;;
 		peer-smoke) run_peer_smoke "${family}" ;;
 		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
 		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;

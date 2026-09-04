@@ -60,6 +60,7 @@ The public Datagram runtime cases can likewise share one setup:
 
 ```bash
 sudo scripts/integration/run \
+  --case direct-single-carrier \
   --case peer-smoke-v4 --case peer-smoke-v6 \
   --case peer-payload-mtu-v4 --case peer-payload-mtu-v6 \
   --case peer-nat-rebinding-v4 --case peer-nat-rebinding-v6 \
@@ -173,6 +174,17 @@ final shutdown. Receiving the first three recoverable shards therefore cannot
 race the listener's remaining parity sends or turn an orderly close into a
 spurious partial-send result.
 
+- `direct-single-carrier` has an explicit IPv4 contract. For the duration of
+  the case it adds host routes between Alice and Bob through T1 plus a
+  countered no-SNAT rule ahead of the baseline masquerade rule. Alice targets
+  Bob's address and port directly, with exactly one connected Carrier whose
+  kernel-assigned source tuple remains stable. Distinct 321-byte and 257-byte
+  Datagrams plus an empty Datagram cross in each direction exactly once, with
+  boundary and digest assertions. A blocked third read is released only after
+  the reply-complete/final barriers by public `Session.Close`; both Peer
+  processes must then close cleanly. Direct wire metadata, unchanged baseline
+  DNAT/SNAT counters, and the removal of every temporary route/rule prove this
+  is not the five-path NAT smoke under another name;
 - `peer-smoke-v4` and `peer-smoke-v6` require five connected Carrier sockets,
   stable local/remote socket tuples across the exchange, one 754-byte shard on
   each path for a 2048-byte Datagram, per-path forward/reverse control and DATA

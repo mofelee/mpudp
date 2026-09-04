@@ -13,3 +13,4 @@ peer-nat-rebinding-v4	peer-nat-rebinding	4	35	false
 peer-nat-rebinding-v6	peer-nat-rebinding	6	35	false
 peer-endpoint-expiry-v4	peer-endpoint-expiry	4	25	false
 peer-endpoint-expiry-v6	peer-endpoint-expiry	6	25	false
+direct-single-carrier	direct-single-carrier	4	30	false

@@ -29,6 +29,8 @@ const (
 	bootstrapBytes        = 96
 	markerPollInterval    = 10 * time.Millisecond
 	carrierSettleDuration = 500 * time.Millisecond
+	duplicateQuietPeriod  = 100 * time.Millisecond
+	directFlow            = "direct-single-carrier"
 )
 
 var (
@@ -72,7 +74,7 @@ type event struct {
 	Flow       string   `json:"flow"`
 	Event      string   `json:"event"`
 	Phase      string   `json:"phase,omitempty"`
-	Bytes      int      `json:"bytes,omitempty"`
+	Bytes      *int     `json:"bytes,omitempty"`
 	Digest     string   `json:"sha256_prefix,omitempty"`
 	ErrorKinds []string `json:"error_kinds,omitempty"`
 	ElapsedMS  int64    `json:"elapsed_ms"`
@@ -164,6 +166,17 @@ func validateOptions(opts options) error {
 	} else if opts.bodyBytes == 0 || opts.replyBytes == 0 {
 		return errors.New("non-expiry flows require positive body-bytes and reply-bytes")
 	}
+	if opts.flow == directFlow {
+		if opts.bodyBytes == opts.replyBytes {
+			return errors.New("direct flow requires distinct non-empty Datagram sizes")
+		}
+		if opts.finalPath == "" {
+			return errors.New("direct flow requires final-file for ordered shutdown")
+		}
+		if opts.role == "initiator" && strings.Contains(opts.carriers, ",") {
+			return errors.New("direct flow requires exactly one Carrier")
+		}
+	}
 	if opts.role == "listener" {
 		if opts.listen == "" || opts.carriers != "" || opts.readyPath == "" ||
 			opts.oversizeReadyPath != "" || opts.oversizeContinuePath != "" || opts.oversizeDonePath != "" ||
@@ -246,7 +259,11 @@ func run(ctx context.Context, opts options) (returnErr error) {
 		return fmt.Errorf("create public Peer: %w", err)
 	}
 	defer func() {
-		if closeErr := peer.Close(); returnErr == nil && closeErr != nil {
+		closeErr := peer.Close()
+		if closeErr == nil && opts.flow == directFlow {
+			closeErr = log.write("peer_closed", "", nil, nil)
+		}
+		if returnErr == nil && closeErr != nil {
 			returnErr = fmt.Errorf("close public Peer: %w", closeErr)
 		}
 	}()
@@ -304,12 +321,29 @@ func runListener(ctx context.Context, opts options, log *eventLog, peer *mpudp.P
 		if err := readExpected(ctx, log, accepted, "main", body); err != nil {
 			return err
 		}
+		if opts.flow == directFlow {
+			if err := readExpected(ctx, log, accepted, "empty", makeDatagram(0, 0)); err != nil {
+				return err
+			}
+		}
 		reply := makeDatagram(opts.replyBytes, 0x4d)
 		if err := writeExpected(log, accepted, "main", reply, false); err != nil {
 			return err
 		}
+		if opts.flow == directFlow {
+			if err := writeExpected(log, accepted, "empty", makeDatagram(0, 0), false); err != nil {
+				return err
+			}
+		}
 		if err := createMarker(opts.replyCompletePath); err != nil {
 			return fmt.Errorf("write reply completion marker: %w", err)
+		}
+		var duplicateRead <-chan packetResult
+		if opts.flow == directFlow {
+			duplicateRead, err = beginNoDuplicateRead(ctx, accepted)
+			if err != nil {
+				return fmt.Errorf("listener duplicate delivery check: %w", err)
+			}
 		}
 		if err := waitForMarker(ctx, opts.exitPath); err != nil {
 			return fmt.Errorf("wait for initiator completion: %w", err)
@@ -328,6 +362,11 @@ func runListener(ctx context.Context, opts options, log *eventLog, peer *mpudp.P
 		if opts.finalPath != "" {
 			if err := waitForMarker(ctx, opts.finalPath); err != nil {
 				return fmt.Errorf("wait for final shutdown release: %w", err)
+			}
+		}
+		if opts.flow == directFlow {
+			if err := closeWithoutDuplicate(ctx, log, accepted, duplicateRead); err != nil {
+				return fmt.Errorf("listener ordered close: %w", err)
 			}
 		}
 	}
@@ -412,12 +451,29 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 			return err
 		}
 	}
+	if opts.flow == directFlow {
+		if err := writeExpected(log, current, "empty", makeDatagram(0, 0), false); err != nil {
+			return err
+		}
+	}
 	reply := makeDatagram(opts.replyBytes, 0x4d)
 	if err := readExpected(ctx, log, current, "main", reply); err != nil {
 		return err
 	}
+	if opts.flow == directFlow {
+		if err := readExpected(ctx, log, current, "empty", makeDatagram(0, 0)); err != nil {
+			return err
+		}
+	}
 	if err := waitForMarker(ctx, opts.replyCompletePath); err != nil {
 		return fmt.Errorf("wait for listener reply completion: %w", err)
+	}
+	var duplicateRead <-chan packetResult
+	if opts.flow == directFlow {
+		duplicateRead, err = beginNoDuplicateRead(ctx, current)
+		if err != nil {
+			return fmt.Errorf("initiator duplicate delivery check: %w", err)
+		}
 	}
 	if err := createMarker(opts.exitPath); err != nil {
 		return fmt.Errorf("write initiator completion marker: %w", err)
@@ -427,7 +483,64 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 			return fmt.Errorf("wait for final shutdown release: %w", err)
 		}
 	}
+	if opts.flow == directFlow {
+		if err := closeWithoutDuplicate(ctx, log, current, duplicateRead); err != nil {
+			return fmt.Errorf("initiator ordered close: %w", err)
+		}
+	}
 	return log.write("flow_complete", "", nil, nil)
+}
+
+type packetResult struct {
+	body []byte
+	err  error
+}
+
+func readPacketAsync(current mpudp.Session) <-chan packetResult {
+	resultChannel := make(chan packetResult, 1)
+	go func() {
+		body, err := current.ReadPacket()
+		resultChannel <- packetResult{body: body, err: err}
+	}()
+	return resultChannel
+}
+
+func beginNoDuplicateRead(ctx context.Context, current mpudp.Session) (<-chan packetResult, error) {
+	resultChannel := readPacketAsync(current)
+	timer := time.NewTimer(duplicateQuietPeriod)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case got := <-resultChannel:
+		if got.err != nil {
+			return nil, fmt.Errorf("Session closed before final barrier: %w", got.err)
+		}
+		return nil, fmt.Errorf("unexpected extra Datagram: bytes=%d digest=%s", len(got.body), digest(got.body))
+	case <-timer.C:
+		return resultChannel, nil
+	}
+}
+
+func closeWithoutDuplicate(ctx context.Context, log *eventLog, current mpudp.Session, resultChannel <-chan packetResult) error {
+	if resultChannel == nil {
+		return errors.New("missing duplicate-delivery read")
+	}
+	if err := current.Close(); err != nil {
+		return fmt.Errorf("close public Session: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case got := <-resultChannel:
+		if !errors.Is(got.err, mpudp.ErrClosed) {
+			if got.err != nil {
+				return fmt.Errorf("blocked read after Close: %w", got.err)
+			}
+			return fmt.Errorf("unexpected extra Datagram during Close: bytes=%d digest=%s", len(got.body), digest(got.body))
+		}
+	}
+	return log.write("session_closed", "", nil, nil)
 }
 
 func writeEventually(ctx context.Context, log *eventLog, current mpudp.Session, phase string, body []byte) error {
@@ -454,15 +567,7 @@ func writeExpected(log *eventLog, current mpudp.Session, phase string, body []by
 }
 
 func readExpected(ctx context.Context, log *eventLog, current mpudp.Session, phase string, want []byte) error {
-	type result struct {
-		body []byte
-		err  error
-	}
-	resultChannel := make(chan result, 1)
-	go func() {
-		body, err := current.ReadPacket()
-		resultChannel <- result{body: body, err: err}
-	}()
+	resultChannel := readPacketAsync(current)
 	select {
 	case <-ctx.Done():
 		_ = current.Close()
@@ -471,7 +576,7 @@ func readExpected(ctx context.Context, log *eventLog, current mpudp.Session, pha
 		if got.err != nil {
 			return fmt.Errorf("read %s Datagram: %w", phase, got.err)
 		}
-		if !bytes.Equal(got.body, want) {
+		if !bytes.Equal(got.body, want) || (want != nil && got.body == nil) {
 			return fmt.Errorf("read %s Datagram metadata mismatch: bytes=%d digest=%s", phase, len(got.body), digest(got.body))
 		}
 		return log.write("datagram_received", phase, got.body, nil)
@@ -537,7 +642,8 @@ func (l *eventLog) write(name, phase string, body []byte, errorKinds []string) e
 	current.ElapsedMS = time.Since(l.start).Milliseconds()
 	current.ErrorKinds = errorKinds
 	if body != nil {
-		current.Bytes = len(body)
+		bodyBytes := len(body)
+		current.Bytes = &bodyBytes
 		current.Digest = digest(body)
 	}
 	l.mu.Lock()
