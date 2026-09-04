@@ -222,6 +222,18 @@ spurious partial-send result.
   budget. Header-only capture proves every safe packet stays within budget and
   produces zero fragments; the bad path reports `ErrPartialSend` plus
   `ErrPathMTUExceeded` while four surviving paths recover the Datagram;
+- `auth-and-state-pollution` sends wrong-PSK, bit-tampered, forged-SessionID,
+  malformed, oversized, and 128-source unauthenticated traffic. A final
+  authenticated barrier proves the listener drained the attack stream before
+  it checks zero retained Session state, bounded diagnostics, memory, and
+  goroutines; exactly one barrier response is permitted before a legitimate
+  five-Carrier exchange proves continued liveness;
+- `shutdown-cleanup` reaches handshake, active-transfer, incomplete-decode, and
+  total-network-fault phases before exercising both `SIGTERM` and public
+  `Close`. Kernel qdisc backlog/drop counters prove that each injected network
+  condition actually affected traffic before shutdown. Marker-owned EXIT
+  cleanup removes every qdisc and shard-drop rule even when the case itself is
+  interrupted;
 - `peer-smoke-v4` and `peer-smoke-v6` require five connected Carrier sockets,
   stable local/remote socket tuples across the exchange, one 754-byte shard on
   each path for a 2048-byte Datagram, per-path forward/reverse control and DATA

@@ -133,7 +133,7 @@ func validateOptions(opts options) error {
 	if opts.action == "signal" && opts.closePath != "" {
 		return errors.New("signal action must not use close-file")
 	}
-	needsSend := opts.phase == "active-transfer" || opts.phase == "decode-incomplete"
+	needsSend := opts.phase == "active-transfer" || opts.phase == "decode-incomplete" || opts.phase == "network-fault"
 	if opts.role == "listener" {
 		if opts.listen == "" || opts.carriers != "" || opts.readyPath == "" || opts.bootstrapPath != "" || opts.sendPath != "" || opts.sentPath != "" {
 			return errors.New("listener requires listen and ready-file without carriers or send markers")
@@ -275,7 +275,7 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 	if err := reachPhase(log, opts.phaseReadyPath); err != nil {
 		return err
 	}
-	if opts.phase == "active-transfer" || opts.phase == "decode-incomplete" {
+	if opts.phase == "active-transfer" || opts.phase == "decode-incomplete" || opts.phase == "network-fault" {
 		if err := waitForMarker(ctx, opts.sendPath); err != nil {
 			return fmt.Errorf("wait for send release: %w", err)
 		}

@@ -2044,16 +2044,27 @@ run_peer_auth_pollution() {
 		mpudp_it_die "pollution attack probe failed; see ${attacker_log}"
 		return 1
 	fi
+	assert_counter_delta_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-forward "${forward_before[0]}" 134
+	assert_counter_equal "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-reverse "$((reverse_before[0] + 1))"
+	for path in 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+	done
+	grep -q '"event":"processing_barrier_complete".*"responses":1' "${attacker_events}" || {
+		mpudp_it_die "authenticated processing barrier response is missing"
+		return 1
+	}
 	printf 'done\n' >"${attack_done_file}"
 	if ! wait_ready "${checked_file}" "${listener_pid}"; then
 		mpudp_it_die "listener did not prove clean state after attacks; see ${listener_log}"
 		return 1
 	fi
-	assert_counter_delta_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-forward "${forward_before[0]}" 133
-	for path in 1 2 3 4 5; do
-		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
-			mpudp-reverse "${reverse_before[$((path - 1))]}"
-	done
+	grep -q '"event":"processing_barrier_drained".*"sessions":0' "${listener_events}" || {
+		mpudp_it_die "listener did not drain the authenticated processing barrier"
+		return 1
+	}
 	for kind in wrong-psk single-bit-tamper forged-session-id malformed oversized; do
 		grep -q "\"event\":\"attack_class_complete\".*\"packets\":1.*\"phase\":\"${kind}\".*\"responses\":0" \
 			"${attacker_events}" || { mpudp_it_die "missing zero-response evidence for ${kind}"; return 1; }
@@ -2168,6 +2179,42 @@ clear_shutdown_netem() {
 	assert_no_netem "${family}"
 }
 
+shutdown_forward_netem_total() {
+	local family=$1 metric=$2 path namespace interface value total=0
+	namespace=$(mpudp_it_ns alice)
+	for path in 1 2 3 4 5; do
+		interface=$(mpudp_it_alice_if "${family}" "${path}")
+		case ${metric} in
+			backlog)
+				value=$(ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+					awk '$1 == "backlog" {value=$3; sub(/p$/, "", value); print value; exit}')
+				;;
+			dropped)
+				value=$(ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+					awk '/ Sent / {for (i=1; i<=NF; i++) if ($i == "(dropped") {value=$(i+1); sub(/,$/, "", value); print value; exit}}')
+				;;
+			*) mpudp_it_die "unknown shutdown netem metric ${metric}"; return 2 ;;
+		esac
+		if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "path ${path} shutdown netem ${metric} is unavailable"
+			return 1
+		fi
+		total=$((total + value))
+	done
+	printf '%s\n' "${total}"
+}
+
+wait_shutdown_netem_total() {
+	local family=$1 metric=$2 minimum=$3 attempt total
+	for attempt in $(seq 1 100); do
+		total=$(shutdown_forward_netem_total "${family}" "${metric}") || return 1
+		if (( total >= minimum )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "shutdown forward netem ${metric}=${total}, want >=${minimum}"
+	return 1
+}
+
 record_shutdown_fault() {
 	local event_name=$1 phase=$2 fault=$3
 	printf '{"event":"%s","fault":"%s","phase":"%s","run_id":"%s"}\n' \
@@ -2218,7 +2265,7 @@ start_shutdown_pair() {
 		listener_args+=(--close-file "${shutdown_close_file}")
 		initiator_args+=(--close-file "${shutdown_close_file}")
 	fi
-	if [[ ${phase} == active-transfer || ${phase} == decode-incomplete ]]; then
+	if [[ ${phase} == active-transfer || ${phase} == decode-incomplete || ${phase} == network-fault ]]; then
 		initiator_args+=(--send-file "${shutdown_send_file}" --sent-file "${shutdown_sent_file}")
 	fi
 	if [[ ${phase} != handshake ]]; then
@@ -2326,16 +2373,18 @@ run_peer_shutdown_cleanup() {
 
 	start_shutdown_pair active-transfer close "${family}"
 	: >"${shutdown_mutation_file}"
-	apply_shutdown_netem "${family}" forward delay 500ms
-	record_shutdown_fault fault_applied active-transfer 'forward-delay-500ms-all-paths'
+	apply_shutdown_netem "${family}" forward delay 2s
+	record_shutdown_fault fault_applied active-transfer 'forward-delay-2s-all-paths'
 	printf 'send\n' >"${shutdown_send_file}"
 	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
 		mpudp_it_die "active-transfer initiator did not place the in-flight Datagram"
 		return 1
 	fi
+	wait_shutdown_netem_total "${family}" backlog 5
+	record_shutdown_fault fault_observed active-transfer 'forward-backlog-at-least-5-packets'
 	finish_shutdown_pair active-transfer close
 	clear_shutdown_netem "${family}" forward
-	record_shutdown_fault fault_cleared active-transfer 'forward-delay-500ms-all-paths'
+	record_shutdown_fault fault_cleared active-transfer 'forward-delay-2s-all-paths'
 
 	start_shutdown_pair decode-incomplete signal "${family}"
 	baseline=$(sum_path_counters "${family}" mpudp-forward-data)
@@ -2381,6 +2430,13 @@ run_peer_shutdown_cleanup() {
 	start_shutdown_pair network-fault close "${family}"
 	apply_shutdown_netem "${family}" both loss 100%
 	record_shutdown_fault fault_applied network-fault 'bidirectional-loss-100-percent-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "network-fault initiator did not place its Datagram"
+		return 1
+	fi
+	wait_shutdown_netem_total "${family}" dropped 5
+	record_shutdown_fault fault_observed network-fault 'forward-drops-at-least-5-packets'
 	finish_shutdown_pair network-fault close
 	clear_shutdown_netem "${family}" both
 	record_shutdown_fault fault_cleared network-fault 'bidirectional-loss-100-percent-all-paths'
@@ -2388,6 +2444,8 @@ run_peer_shutdown_cleanup() {
 	# Run the abandoned handshake last so its live UDP conntrack tuples cannot
 	# alias a later fresh process that happens to reuse the same source ports.
 	start_shutdown_pair handshake signal "${family}"
+	wait_shutdown_netem_total "${family}" dropped 5
+	record_shutdown_fault fault_observed handshake 'forward-handshake-drops-at-least-5-packets'
 	finish_shutdown_pair handshake signal
 	clear_shutdown_netem "${family}" forward
 	record_shutdown_fault fault_cleared handshake 'forward-loss-100-percent-all-paths'

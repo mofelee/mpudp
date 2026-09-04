@@ -29,8 +29,8 @@ const (
 	integrationKey       = "integration-test-key"
 	wrongIntegrationKey  = "definitely-not-the-integration-key"
 	markerPollInterval   = 10 * time.Millisecond
-	pollutionSettleTime  = 300 * time.Millisecond
 	responseWait         = 300 * time.Millisecond
+	barrierResponseWait  = 2 * time.Second
 	maxRetainedHeapBytes = 8 << 20
 	maxGoroutineGrowth   = 8
 	bootstrapBytes       = 96
@@ -218,7 +218,20 @@ func runListener(ctx context.Context, opts options, log *eventLog) (returnErr er
 	if err := waitForMarker(ctx, opts.attackDonePath); err != nil {
 		return fmt.Errorf("wait for attack completion: %w", err)
 	}
-	if err := waitDuration(ctx, pollutionSettleTime); err != nil {
+	if rendered := peer.String(); rendered != "Peer{mode:listener sessions:1 closed:false}" {
+		return fmt.Errorf("processing barrier did not isolate exactly one Session: %s", rendered)
+	}
+	barrier, err := listener.Accept(ctx)
+	if err != nil {
+		return fmt.Errorf("accept processing barrier Session: %w", err)
+	}
+	if err := barrier.Close(); err != nil {
+		return fmt.Errorf("close processing barrier Session: %w", err)
+	}
+	if rendered := peer.String(); rendered != "Peer{mode:listener sessions:0 closed:false}" {
+		return fmt.Errorf("processing barrier retained state after close: %s", rendered)
+	}
+	if err := log.write("processing_barrier_drained", "attack", map[string]int64{"sessions": 0}); err != nil {
 		return err
 	}
 
@@ -387,7 +400,46 @@ func runAttacker(ctx context.Context, opts options, log *eventLog) error {
 			return err
 		}
 	}
-	return log.write("attack_batch_complete", "attack", map[string]int64{"packets": int64(len(sent)), "unique_sources": int64(len(uniqueSources)), "responses": 0})
+	if err := log.write("attack_batch_complete", "attack", map[string]int64{"packets": int64(len(sent)), "unique_sources": int64(len(uniqueSources)), "responses": 0}); err != nil {
+		return err
+	}
+	return runProcessingBarrier(ctx, opts, target, log)
+}
+
+func runProcessingBarrier(ctx context.Context, opts options, target *net.UDPAddr, log *eventLog) error {
+	connection, err := net.DialUDP(fmt.Sprintf("udp%d", opts.family), nil, target)
+	if err != nil {
+		return fmt.Errorf("open processing barrier socket: %w", err)
+	}
+	defer connection.Close()
+	barrierID := sessionID(opts.highSources + 1000)
+	packet, err := encodeHello(barrierID, []byte(integrationKey), opts.maxUDPPayload)
+	if err != nil {
+		return fmt.Errorf("encode processing barrier: %w", err)
+	}
+	deadline := time.Now().Add(barrierResponseWait)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set processing barrier deadline: %w", err)
+	}
+	if _, err := connection.Write(packet); err != nil {
+		return fmt.Errorf("send processing barrier: %w", err)
+	}
+	response := make([]byte, opts.maxUDPPayload+1)
+	length, err := connection.Read(response)
+	if err != nil {
+		return fmt.Errorf("read processing barrier response: %w", err)
+	}
+	message, err := wire.DecodeAuthenticated(response[:length], []byte(integrationKey), opts.maxUDPPayload)
+	if err != nil {
+		return fmt.Errorf("authenticate processing barrier response: %w", err)
+	}
+	if message.Header.Type != wire.TypeHelloAck || message.Header.SessionID != barrierID {
+		return errors.New("processing barrier returned an unexpected packet")
+	}
+	return log.write("processing_barrier_complete", "attack", map[string]int64{"responses": 1})
 }
 
 func buildAttackPackets(maxUDPPayload, highSources int) ([]packetSpec, error) {

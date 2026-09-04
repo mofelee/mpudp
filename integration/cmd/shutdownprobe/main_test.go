@@ -72,6 +72,11 @@ func TestValidateOptionsPinsShutdownMechanismByPhase(t *testing.T) {
 	if err := validateOptions(base); err == nil {
 		t.Error("active-transfer without complete send markers accepted")
 	}
+	base.phase = "network-fault"
+	base.sendPath = "send"
+	if err := validateOptions(base); err != nil {
+		t.Fatalf("valid network-fault transfer options rejected: %v", err)
+	}
 }
 
 func reserveUDPAddress(t *testing.T) string {

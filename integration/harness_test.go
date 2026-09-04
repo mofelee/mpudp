@@ -534,7 +534,9 @@ if mpudp_it_process_matches_run "$4"; then exit 10; fi
 MPUDP_IT_RUN_ID=$3
 mpudp_it_process_matches_run "$4"
 `
-	for _, helper := range []string{"netprobe", "peerprobe", "rsprobe", "capture-fragments", "capture-udp"} {
+	for _, helper := range []string{
+		"netprobe", "peerprobe", "rsprobe", "pollutionprobe", "shutdownprobe", "capture-fragments", "capture-udp",
+	} {
 		t.Run(helper, func(t *testing.T) {
 			const exactRunID = "argv-exact-long"
 			decoy := exec.Command("bash", "-c", `trap 'exit 0' TERM; while :; do sleep 1 & wait $!; done`,
