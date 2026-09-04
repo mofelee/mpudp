@@ -25,7 +25,7 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 		{
 			name: "initiator",
 			configure: func(cfg *config.Config) {
-				cfg.Carriers = []string{"example.com:4000"}
+				cfg.Carriers = []string{"127.0.0.1:9"}
 			},
 			mode:        ModeInitiator,
 			wantSession: true,
@@ -33,7 +33,7 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 		{
 			name: "listener",
 			configure: func(cfg *config.Config) {
-				cfg.Listen = ":9000"
+				cfg.Listen = "127.0.0.1:9000"
 			},
 			mode:         ModeListener,
 			wantListener: true,
@@ -41,8 +41,8 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 		{
 			name: "dual",
 			configure: func(cfg *config.Config) {
-				cfg.Carriers = []string{"example.com:4000"}
-				cfg.Listen = ":9000"
+				cfg.Carriers = []string{"127.0.0.1:9"}
+				cfg.Listen = "127.0.0.1:9000"
 			},
 			mode:         ModeDual,
 			wantSession:  true,
@@ -54,6 +54,9 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 			t.Parallel()
 			cfg := baseConfig()
 			test.configure(&cfg)
+			if cfg.ListenerEnabled() {
+				cfg.Listen = reserveUDPAddress(t)
+			}
 			peer, err := NewPeer(cfg)
 			if err != nil {
 				t.Fatalf("NewPeer() error = %v", err)
@@ -68,7 +71,7 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 				if sessionErr != nil {
 					t.Fatalf("NewSession() error = %v", sessionErr)
 				}
-				assertInertSession(t, session, cfg.Limits.MaxDatagramSize)
+				assertRunningSession(t, session, cfg.Limits.MaxDatagramSize)
 			} else if !errors.Is(sessionErr, ErrModeUnavailable) || session != nil {
 				t.Fatalf("NewSession() = (%v, %v), want ErrModeUnavailable", session, sessionErr)
 			}
@@ -78,7 +81,7 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 				if listenerErr != nil {
 					t.Fatalf("Listener() error = %v", listenerErr)
 				}
-				assertInertListener(t, listener)
+				assertRunningListener(t, listener)
 			} else if !errors.Is(listenerErr, ErrModeUnavailable) || listener != nil {
 				t.Fatalf("Listener() = (%v, %v), want ErrModeUnavailable", listener, listenerErr)
 			}
@@ -89,7 +92,7 @@ func TestPeerModesExposeOnlyConfiguredLifecycle(t *testing.T) {
 func TestPeerCopiesConfig(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
-	cfg.Carriers = []string{"example.com:4000"}
+	cfg.Carriers = []string{"127.0.0.1:9"}
 	peer, err := NewPeer(cfg)
 	if err != nil {
 		t.Fatalf("NewPeer() error = %v", err)
@@ -97,11 +100,11 @@ func TestPeerCopiesConfig(t *testing.T) {
 	defer peer.Close()
 	cfg.Carriers[0] = "changed.example:4000"
 	got := peer.Config()
-	if got.Carriers[0] != "example.com:4000" {
+	if got.Carriers[0] != "127.0.0.1:9" {
 		t.Fatalf("retained configuration changed to %q", got.Carriers[0])
 	}
 	got.Carriers[0] = "changed-again.example:4000"
-	if peer.Config().Carriers[0] != "example.com:4000" {
+	if peer.Config().Carriers[0] != "127.0.0.1:9" {
 		t.Fatal("Config() returned aliased storage")
 	}
 }
@@ -109,8 +112,8 @@ func TestPeerCopiesConfig(t *testing.T) {
 func TestPeerCloseClosesChildrenAndIsIdempotent(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
-	cfg.Carriers = []string{"example.com:4000"}
-	cfg.Listen = ":9000"
+	cfg.Carriers = []string{"127.0.0.1:9"}
+	cfg.Listen = reserveUDPAddress(t)
 	peer, err := NewPeer(cfg)
 	if err != nil {
 		t.Fatalf("NewPeer() error = %v", err)
@@ -146,7 +149,7 @@ func TestPeerCloseClosesChildrenAndIsIdempotent(t *testing.T) {
 func TestNewSessionHonorsConfiguredSessionLimit(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
-	cfg.Carriers = []string{"example.com:4000"}
+	cfg.Carriers = []string{"127.0.0.1:9"}
 	cfg.Limits.MaxSessions = 1
 	peer, err := NewPeer(cfg)
 	if err != nil {
@@ -211,7 +214,7 @@ func TestNewPeerValidatesBeforeReadingRandomOrBinding(t *testing.T) {
 func TestInjectedReaderDrivesOnlyPackagePrivateConstructor(t *testing.T) {
 	t.Parallel()
 	cfg := baseConfig()
-	cfg.Carriers = []string{"example.com:4000"}
+	cfg.Carriers = []string{"127.0.0.1:9"}
 	want := SessionID{0: 1, 15: 2}
 	peer, err := newPeer(cfg, bytes.NewReader(want[:]))
 	if err != nil {
@@ -233,8 +236,8 @@ func TestInjectedReaderDrivesOnlyPackagePrivateConstructor(t *testing.T) {
 
 func TestLifecycleMethodsAreConcurrentSafe(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Carriers = []string{"example.com:4000"}
-	cfg.Listen = ":9000"
+	cfg.Carriers = []string{"127.0.0.1:9"}
+	cfg.Listen = reserveUDPAddress(t)
 	peer, err := NewPeer(cfg)
 	if err != nil {
 		t.Fatalf("NewPeer() error = %v", err)
@@ -294,14 +297,8 @@ func TestStableSentinelErrorsAreDistinct(t *testing.T) {
 	}
 }
 
-func assertInertSession(t *testing.T, session Session, maxDatagramSize int) {
+func assertRunningSession(t *testing.T, session Session, maxDatagramSize int) {
 	t.Helper()
-	if err := session.WritePacket([]byte("complete Datagram")); !errors.Is(err, ErrNotReady) {
-		t.Errorf("WritePacket() error = %v, want ErrNotReady", err)
-	}
-	if _, err := session.ReadPacket(); !errors.Is(err, ErrNotReady) {
-		t.Errorf("ReadPacket() error = %v, want ErrNotReady", err)
-	}
 	if err := session.WritePacket(make([]byte, maxDatagramSize+1)); !errors.Is(err, ErrMessageTooLarge) {
 		t.Errorf("oversize WritePacket() error = %v, want ErrMessageTooLarge", err)
 	}
@@ -313,11 +310,8 @@ func assertInertSession(t *testing.T, session Session, maxDatagramSize int) {
 	}
 }
 
-func assertInertListener(t *testing.T, listener Listener) {
+func assertRunningListener(t *testing.T, listener Listener) {
 	t.Helper()
-	if _, err := listener.Accept(context.Background()); !errors.Is(err, ErrNotReady) {
-		t.Errorf("Accept() error = %v, want ErrNotReady", err)
-	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := listener.Accept(canceled); !errors.Is(err, context.Canceled) {
