@@ -50,6 +50,10 @@ fec:
   parity_shards: 2
 
 psk: "secret"
+
+transport:
+  # 完整 MPUDP UDP payload 上限，不是 IP MTU 或纯 shard payload。
+  max_udp_payload: 1200
 ```
 
 ### Alice 的运行时行为
@@ -91,6 +95,10 @@ fec:
   parity_shards: 2
 
 psk: "secret"
+
+transport:
+  # 完整 MPUDP UDP payload 上限，不是 IP MTU 或纯 shard payload。
+  max_udp_payload: 1200
 ```
 
 Bob 只监听 UDP `9000`，不预先配置 Alice 或 T1–T5 的地址。
