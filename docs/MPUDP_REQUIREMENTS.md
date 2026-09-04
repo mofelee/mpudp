@@ -1,5 +1,8 @@
 # MPUDP v0.1 简化需求文档
 
+本文件的每个编号章节都在 [需求追踪矩阵](TRACEABILITY.md) 中映射到实现、自动化验证、
+tracking issue 和当前状态。字节级互操作细节以 [Wire Protocol](WIRE_PROTOCOL.md) 为准。
+
 ## 1. 目标
 
 使用 Go 实现一个用户态 **Multipath UDP Tunnel**。
@@ -61,7 +64,10 @@ fec:
   data_shards: 3
   parity_shards: 2
 
-psk: "secret"
+psk: "development-only-example-key"
+
+transport:
+  max_udp_payload: 1200
 ```
 
 监听侧：
@@ -73,7 +79,10 @@ fec:
   data_shards: 3
   parity_shards: 2
 
-psk: "secret"
+psk: "development-only-example-key"
+
+transport:
+  max_udp_payload: 1200
 ```
 
 规则：
@@ -83,8 +92,16 @@ psk: "secret"
 - 配置 `carriers` 表示可以主动建立 Session；
 - 配置 `listen` 表示可以接受 Session；
 - 双方的 FEC 参数和 PSK 必须一致；
+- `transport.max_udp_payload` 是完整 MPUDP UDP payload 的本地能力，合法范围为
+  72..65507 bytes，默认 1200；握手后使用双方声明值的较小值；
 - v0.1 不需要 `peer.id`；
 - Session ID 由程序自动随机生成。
+
+示例中的 `development-only-example-key` 仅供开发测试，生产不得复用。YAML 解析器只接受
+scalar `psk`，不支持 `psk_file` 或环境变量展开。生产部署必须生成独立高熵密钥，并通过
+secret manager、mode 0600 的受保护模板文件，或嵌入程序的 `config.Secret` 注入；不得把
+PSK 写入日志、错误、命令行或诊断 artifact。完整边界见
+[PSK 管理](CONFIGURATION.md#psk-管理)。
 
 ## 4. Carrier
 
@@ -392,26 +409,31 @@ Original Datagram Length
 Shard Payload
 ```
 
-Wire Header 不包含 `PathID`、接口名称、ISP 或本地 Carrier 名称。所有多字节整数使用 Network Byte Order。
+Wire Header 不包含 `PathID`、接口名称、ISP 或本地 Carrier 名称。所有多字节整数使用
+Network Byte Order。v0.1 的 prefix、type body、长度和 full tag 是固定格式，不是可选
+最低集合；精确 offset、范围和拒绝规则见 [Wire Protocol](WIRE_PROTOCOL.md)。
 
 ## 18. PSK 认证
 
 双方配置同一个 PSK：
 
 ```yaml
-psk: "secret"
+psk: "development-only-example-key"
 ```
 
 要求：
 
 - 所有控制包和数据包都必须认证；
-- v0.1 可使用 HMAC-SHA-256；
-- 认证覆盖除认证标签外的 Header 和完整 Payload；
+- v0.1 固定使用完整 32-byte HMAC-SHA-256 tag；
+- 认证覆盖除认证标签自身外的 24-byte prefix 和完整 type-specific body；
 - 认证失败的数据包静默丢弃；
 - 认证失败的数据包不能创建 Session 或学习 Endpoint；
 - 透明 UDP 转发节点不需要 PSK。
 
-v0.1 不要求加密 Payload。PSK/HMAC 只提供认证和完整性，不提供保密性。
+v0.1 不要求加密 Payload。PSK/HMAC 只提供认证和完整性，不提供保密性。精确算法、覆盖
+字节和 constant-time comparison 要求见 [Wire Protocol](WIRE_PROTOCOL.md#authentication)；
+生产密钥处理遵循 [PSK 管理](CONFIGURATION.md#psk-管理)。上面的固定字符串仍只用于开发
+测试。
 
 ## 19. Session Bootstrap
 
@@ -432,7 +454,13 @@ Listener：
 5. 使用监听 socket 向同一 Endpoint 返回 `HELLO_ACK`；
 6. 同一 Session ID 从其他合法 Endpoint 到达时，加入原 Session，而不是创建新 Session。
 
-控制包可以简单超时重试，但 DATA 不做 ACK 和重传。
+HELLO 按每个 Carrier 独立执行有界 timeout retry；PING 是周期性新 probe，CLOSE 不重试，
+DATA 不做 ACK 或重传。
+
+HELLO 和 HELLO_ACK 必须在 HMAC 保护的 body 中声明发送方本地 `max_udp_payload`
+capability。例如双方声明 1200/1000 时，建立后的 send/receive budget 均冻结为 1000。
+HELLO packet 使用发送方本地 budget，HELLO_ACK 使用双方最小值；建立后的 PING、PONG、
+DATA_SHARD 和 CLOSE 均使用冻结值。重复 HELLO/ACK 不能静默重协商 live Session。
 
 ## 20. Decode Timeout 和资源限制
 
@@ -447,7 +475,22 @@ Listener：
 
 超时或超限时直接丢弃该 Datagram，不请求重传。
 
-编码后的单个 UDP Packet 必须避免依赖 IP Fragmentation。上层 Datagram 过大时，`WritePacket` 返回 `ErrMessageTooLarge`。
+大小术语和公式固定为：
+
+```text
+Path MTU                  = 完整 IP packet 上限
+UDP payload               = UDP header 后的完整 MPUDP packet
+DATA_SHARD wire overhead  = 71 bytes
+shard_capacity            = negotiated_max_udp_payload - 71
+effective_datagram_limit  = min(data_shards * shard_capacity,
+                                limits.max_datagram_size)
+```
+
+Datagram 可以恰好等于 effective limit；多 1 byte 必须在 FEC allocation、PacketID 消耗和
+任何发送前返回 `ErrMessageTooLarge`。Linux socket 使用 DF/PMTU discovery 防止本地 IP
+fragmentation，已知过大路径错误分类为 `ErrPathMTUExceeded`，但这不是 PLPMTUD：ICMP
+Packet Too Big 被过滤仍可能形成静默黑洞。部署值必须不高于所有 Carrier 的已知安全
+UDP payload。
 
 ## 21. 并发和关闭
 
@@ -474,6 +517,13 @@ Listener：
 9. **透明转发**：T 节点不理解 MPUDP；Alice 不知道 Bob 的真实地址；Bob 可以沿 NAT/conntrack 返回 Alice。
 10. **重复 shard**：同一 Datagram 只向上层交付一次。
 
+当前 hosted gate 的九个 canonical workflow row 及其完整场景契约见
+[集成测试](INTEGRATION.md#scenario-contract)。它们在保留上述基础测试的同时覆盖 public
+Peer 双向 API、RS loss/rotation/slow-path、NAT reverse/rebinding/expiry、错误 PSK 与
+state-pollution、1200/1000 MTU exact-limit/+1 与零分片证据，以及 SIGTERM/public Close
+后的资源清理。Workflow、manifest 和文档中的 canonical 名称必须由自动化合同测试保持
+一致。
+
 ## 23. v0.1 非目标
 
 第一版不实现：
@@ -495,11 +545,18 @@ STUN / ICE / TURN
 自有 Relay 协议
 Mesh
 Payload 加密
+PLPMTUD / Session 内自适应 payload budget
+per-Carrier payload budget / 不等长 shard
 内核模块
 eBPF / XDP / DPDK
 ```
 
 T1–T5 使用 nftables 完成的透明 UDP 转发属于部署环境，不属于 MPUDP 协议。
+
+PLPMTUD 和已建立 Session 的自适应 budget 由
+[#13](https://github.com/mofelee/mpudp/issues/13) 跟踪；per-Carrier budget 及其所需的
+不等长 shard/wire 设计由 [#14](https://github.com/mofelee/mpudp/issues/14) 跟踪。两者均为
+明确的 post-v0.1 工作，不得作为 version 1 的静默行为变化。
 
 ## 24. 完成标准
 
@@ -527,7 +584,18 @@ T1–T5 使用 nftables 完成的透明 UDP 转发属于部署环境，不属于
 ✓ 不保证有序交付
 ✓ 不理解具体上层协议
 ✓ 所有 Packet 使用 PSK 认证
+✓ UDP payload budget 经过认证协商并冻结，exact-limit/+1 行为有单元与集成覆盖
+✓ Linux canonical MTU 场景提供 DF/PMTU、EMSGSIZE/ErrPathMTUExceeded 和零 fragment 证据
+✓ 错误认证输入不创建 Session、Endpoint 或 FEC state，诊断不泄漏敏感内容
+✓ CI 发布稳定 build、race 和九个 canonical integration check 名称
+✓ 每个集成 case 都执行 exact teardown 和 clean-resource audit
 ```
+
+交付完成还要求：格式、module verify、vet、build、unit、race 和全部 hosted checks 在
+候选 commit 上通过；变更进入 `main` 后必须在 exact promoted SHA 上重新执行并成功，而
+不是沿用 feature branch 结果。最终证据记录 hosted run/SHA、所有 canonical case、清理
+结果和敏感信息审计。仓库内的 [追踪矩阵](TRACEABILITY.md) 记录可复用机制与测试映射；
+会随 commit 变化的 exact-main run 证据记录在对应 GitHub issue，而不硬编码进本文。
 
 ## 25. 核心模型
 

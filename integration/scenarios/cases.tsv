@@ -1,0 +1,24 @@
+# case	runner	family	timeout_seconds	requires_peer_runtime
+transparent-nat-v4	raw-nat-smoke	4	20	false
+transparent-nat-v6	raw-nat-smoke	6	20	false
+path-controls-v4	path-controls	4	20	false
+path-controls-v6	path-controls	6	20	false
+nat-rebinding-trigger-v4	nat-rebinding-trigger	4	20	false
+nat-rebinding-trigger-v6	nat-rebinding-trigger	6	20	false
+peer-smoke-v4	peer-smoke	4	30	false
+peer-smoke-v6	peer-smoke	6	30	false
+peer-payload-mtu-v4	peer-payload-mtu	4	45	false
+peer-payload-mtu-v6	peer-payload-mtu	6	45	false
+peer-nat-rebinding-v4	peer-nat-rebinding	4	35	false
+peer-nat-rebinding-v6	peer-nat-rebinding	6	35	false
+peer-endpoint-expiry-v4	peer-endpoint-expiry	4	25	false
+peer-endpoint-expiry-v6	peer-endpoint-expiry	6	25	false
+direct-single-carrier	direct-single-carrier	4	30	false
+transparent-nat-reverse-path	transparent-nat-reverse-path	4	35	false
+endpoint-rebinding-and-expiry	endpoint-rebinding-and-expiry	4	40	false
+mtu-budget-no-fragment	mtu-budget-no-fragment	dual	70	false
+rs53-five-carrier-loss	peer-rs-network	4	40	false
+rs53-two-carrier-rotation	peer-rs-network	4	30	false
+slow-path-early-recovery	peer-rs-network	4	25	false
+auth-and-state-pollution	peer-auth-pollution	4	45	false
+shutdown-cleanup	peer-shutdown-cleanup	4	90	false

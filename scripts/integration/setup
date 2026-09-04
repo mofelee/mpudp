@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/integration/setup [--run-id ID] [--state DIR]
+
+Creates the isolated Alice/T1-T5/Bob IPv4+IPv6 namespace topology and prints
+the state directory on stdout. Diagnostics are written to stderr.
+EOF
+}
+
+run_id=''
+state_dir=''
+owner_token=''
+while (( $# > 0 )); do
+	case $1 in
+		--run-id) run_id=${2:?missing value for --run-id}; shift 2 ;;
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--owner-token) owner_token=${2:?missing value for --owner-token}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown setup argument: $1"; exit 2 ;;
+	esac
+done
+
+mpudp_it_require_root
+mpudp_it_require_commands ip nft tc sysctl sha256sum stat find
+if [[ -z ${run_id} ]]; then run_id=$(mpudp_it_new_run_id); fi
+mpudp_it_validate_run_id "${run_id}"
+mpudp_it_validate_seed "${MPUDP_IT_SEED:-${run_id}}"
+if [[ -z ${state_dir} ]]; then state_dir=$(mpudp_it_default_state_dir "${run_id}"); fi
+if [[ -z ${owner_token} ]]; then owner_token=$(mpudp_it_new_owner_token); fi
+mpudp_it_validate_owner_token "${owner_token}"
+
+MPUDP_IT_RUN_ID=${run_id}
+MPUDP_IT_STATE_DIR=${state_dir}
+MPUDP_IT_STATE_CREATED=0
+state_initialized=0
+setup_complete=0
+setup_mutation=0
+setup_pending_status=0
+cleanup_setup() {
+	local status=$? owner_uid cleanup_status=0
+	trap - EXIT
+	trap '' HUP INT TERM
+	if (( setup_complete == 0 && MPUDP_IT_STATE_CREATED != 0 )); then
+		mpudp_it_log "setup failed; tearing down run ${MPUDP_IT_RUN_ID}"
+		if (( state_initialized != 0 )); then
+			"${SCRIPT_DIR}/teardown" --state "${MPUDP_IT_STATE_DIR}" >/dev/null 2>&1 || cleanup_status=1
+		elif [[ -d ${MPUDP_IT_STATE_DIR} && ! -L ${MPUDP_IT_STATE_DIR} ]]; then
+			owner_uid=$(stat -c '%u' -- "${MPUDP_IT_STATE_DIR}" 2>/dev/null || true)
+			if [[ ${owner_uid} == "${EUID}" ]]; then
+				find "${MPUDP_IT_STATE_DIR}" -xdev -depth -delete || cleanup_status=1
+			else
+				mpudp_it_log "refusing partial-state cleanup with owner ${owner_uid:-unknown}"
+				cleanup_status=1
+			fi
+		fi
+	fi
+	if (( status == 0 && cleanup_status != 0 )); then status=1; fi
+	exit "${status}"
+}
+handle_setup_signal() {
+	local status=$1
+	if (( setup_mutation != 0 )); then
+		if (( setup_pending_status == 0 )); then setup_pending_status=${status}; fi
+		return 0
+	fi
+	exit "${status}"
+}
+finish_setup_mutation() {
+	local status
+	setup_mutation=0
+	if (( setup_pending_status != 0 )); then
+		status=${setup_pending_status}
+		setup_pending_status=0
+		exit "${status}"
+	fi
+}
+trap cleanup_setup EXIT
+trap 'handle_setup_signal 129' HUP
+trap 'handle_setup_signal 130' INT
+trap 'handle_setup_signal 143' TERM
+
+setup_mutation=1
+init_status=0
+mpudp_it_init_state "${run_id}" "${state_dir}" "${owner_token}" || init_status=$?
+if (( init_status == 0 )); then state_initialized=1; fi
+finish_setup_mutation
+if (( init_status != 0 )); then exit "${init_status}"; fi
+mpudp_it_load_state "${state_dir}"
+
+if command -v conntrack >/dev/null 2>&1; then
+	printf 'available\n' >"${MPUDP_IT_STATE_DIR}/conntrack-capability"
+else
+	printf 'missing\n' >"${MPUDP_IT_STATE_DIR}/conntrack-capability"
+	if [[ ${MPUDP_IT_REQUIRE_CONNTRACK:-0} == 1 ]]; then
+		mpudp_it_die "conntrack CLI is required by MPUDP_IT_REQUIRE_CONNTRACK=1"
+		exit 1
+	fi
+	mpudp_it_log "conntrack CLI unavailable; collect will retain nft NAT counters but omit tuple dumps"
+fi
+
+create_namespace() {
+	local role=$1 namespace create_status
+	namespace=$(mpudp_it_ns "${role}")
+	if [[ -e /run/netns/${namespace} ]]; then
+		mpudp_it_die "namespace collision: ${namespace}"
+		return 1
+	fi
+	setup_mutation=1
+	create_status=0
+	if mpudp_it_run_signal_shielded ip netns add "${namespace}"; then
+		if ! mpudp_it_record_namespace "${namespace}"; then
+			mpudp_it_log "namespace ledger append failed; rolling back ${namespace}"
+			mpudp_it_run_signal_shielded ip netns del "${namespace}" || mpudp_it_log "failed to roll back namespace ${namespace}"
+			create_status=1
+		fi
+	else
+		create_status=$?
+	fi
+	finish_setup_mutation
+	if (( create_status != 0 )); then return "${create_status}"; fi
+	ip -n "${namespace}" link set lo up
+	# veth devices can inherit a disabled IPv6 default from a host. Enable it
+	# only inside this disposable namespace and disable DAD for deterministic setup.
+	ip netns exec "${namespace}" sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
+	ip netns exec "${namespace}" sysctl -q -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
+	ip netns exec "${namespace}" sysctl -q -w net.ipv6.conf.all.accept_dad=0 >/dev/null
+	ip netns exec "${namespace}" sysctl -q -w net.ipv6.conf.default.accept_dad=0 >/dev/null
+}
+
+create_veth_pair() {
+	local suffix=$1 left_ns=$2 left_if=$3 right_ns=$4 right_if=$5
+	local host_left host_right create_status
+	host_left=$(mpudp_it_host_link_name "${suffix}a")
+	host_right=$(mpudp_it_host_link_name "${suffix}b")
+	if ip link show dev "${host_left}" >/dev/null 2>&1 || ip link show dev "${host_right}" >/dev/null 2>&1; then
+		mpudp_it_die "host-link collision: ${host_left} or ${host_right}"
+		return 1
+	fi
+	setup_mutation=1
+	create_status=0
+	if mpudp_it_run_signal_shielded ip link add "${host_left}" type veth peer name "${host_right}"; then
+		if ! mpudp_it_record_host_link "${host_left}" || ! mpudp_it_record_host_link "${host_right}"; then
+			mpudp_it_log "host-link ledger append failed; rolling back ${host_left}/${host_right}"
+			mpudp_it_run_signal_shielded ip link del dev "${host_left}" || mpudp_it_log "failed to roll back host link ${host_left}"
+			create_status=1
+		fi
+	else
+		create_status=$?
+	fi
+	finish_setup_mutation
+	if (( create_status != 0 )); then return "${create_status}"; fi
+	ip link set "${host_left}" netns "${left_ns}"
+	ip link set "${host_right}" netns "${right_ns}"
+	ip -n "${left_ns}" link set "${host_left}" name "${left_if}"
+	ip -n "${right_ns}" link set "${host_right}" name "${right_if}"
+}
+
+configure_link() {
+	local namespace=$1 interface=$2 family=$3 address=$4 prefix=$5
+	ip -n "${namespace}" link set dev "${interface}" mtu 1500
+	ip -n "${namespace}" link set dev "${interface}" up
+	if [[ ${family} == 6 ]]; then
+		ip -n "${namespace}" -6 addr add "${address}/${prefix}" dev "${interface}" nodad
+	else
+		ip -n "${namespace}" -4 addr add "${address}/${prefix}" dev "${interface}"
+	fi
+}
+
+configure_nat() {
+	local path=$1 t_ns=$2 bob4 bob6 ingress4 ingress6
+	bob4=$(mpudp_it_bob_addr 4 "${path}")
+	bob6=$(mpudp_it_bob_addr 6 "${path}")
+	ingress4=$(mpudp_it_t_ingress_addr 4 "${path}")
+	ingress6=$(mpudp_it_t_ingress_addr 6 "${path}")
+
+	ip netns exec "${t_ns}" nft -f - <<EOF
+table ip ${MPUDP_IT_TABLE4} {
+  chain raw_prerouting {
+    type filter hook prerouting priority raw; policy accept;
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "in4" ip daddr ${ingress4} udp dport 4000 counter dnat to ${bob4}:9000
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "out4" ip daddr ${bob4} udp dport 9000 counter masquerade
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ip frag-off & 0x3fff != 0 counter drop comment "mpudp-fragment"
+    iifname "in4" oifname "out4" meta l4proto udp udp dport 9000 @th,64,32 0x4d505544 @th,104,8 3 counter comment "mpudp-forward-data"
+    iifname "in4" oifname "out4" meta l4proto udp udp dport 9000 @th,64,32 0x4d505544 @th,104,8 { 1, 2, 4, 5, 6 } counter comment "mpudp-forward-control"
+    iifname "out4" oifname "in4" meta l4proto udp udp sport 9000 ct state established,related @th,64,32 0x4d505544 @th,104,8 3 counter comment "mpudp-reverse-data"
+    iifname "out4" oifname "in4" meta l4proto udp udp sport 9000 ct state established,related @th,64,32 0x4d505544 @th,104,8 { 1, 2, 4, 5, 6 } counter comment "mpudp-reverse-control"
+    iifname "in4" oifname "out4" meta l4proto udp udp dport 9000 counter accept comment "mpudp-forward"
+    iifname "out4" oifname "in4" meta l4proto udp udp sport 9000 ct state established,related counter accept comment "mpudp-reverse"
+  }
+}
+table ip6 ${MPUDP_IT_TABLE6} {
+  chain raw_prerouting {
+    type filter hook prerouting priority raw; policy accept;
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "in6" ip6 daddr ${ingress6} udp dport 4000 counter dnat to [${bob6}]:9000
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    oifname "out6" ip6 daddr ${bob6} udp dport 9000 counter masquerade
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    exthdr frag exists counter drop comment "mpudp-fragment"
+    iifname "in6" oifname "out6" meta l4proto udp udp dport 9000 @th,64,32 0x4d505544 @th,104,8 3 counter comment "mpudp-forward-data"
+    iifname "in6" oifname "out6" meta l4proto udp udp dport 9000 @th,64,32 0x4d505544 @th,104,8 { 1, 2, 4, 5, 6 } counter comment "mpudp-forward-control"
+    iifname "out6" oifname "in6" meta l4proto udp udp sport 9000 ct state established,related @th,64,32 0x4d505544 @th,104,8 3 counter comment "mpudp-reverse-data"
+    iifname "out6" oifname "in6" meta l4proto udp udp sport 9000 ct state established,related @th,64,32 0x4d505544 @th,104,8 { 1, 2, 4, 5, 6 } counter comment "mpudp-reverse-control"
+    iifname "in6" oifname "out6" meta l4proto udp udp dport 9000 counter accept comment "mpudp-forward"
+    iifname "out6" oifname "in6" meta l4proto udp udp sport 9000 ct state established,related counter accept comment "mpudp-reverse"
+  }
+}
+EOF
+}
+
+for role in alice t1 t2 t3 t4 t5 bob; do
+	create_namespace "${role}"
+done
+
+alice_ns=$(mpudp_it_ns alice)
+bob_ns=$(mpudp_it_ns bob)
+for path in 1 2 3 4 5; do
+	t_ns=$(mpudp_it_ns "t${path}")
+	for family in 4 6; do
+		prefix=$(mpudp_it_prefix_length "${family}")
+		alice_if=$(mpudp_it_alice_if "${family}" "${path}")
+		bob_if=$(mpudp_it_bob_if "${family}" "${path}")
+		t_in_if=$(mpudp_it_t_in_if "${family}")
+		t_out_if=$(mpudp_it_t_out_if "${family}")
+
+		create_veth_pair "${family}${path}i" "${alice_ns}" "${alice_if}" "${t_ns}" "${t_in_if}"
+		create_veth_pair "${family}${path}o" "${t_ns}" "${t_out_if}" "${bob_ns}" "${bob_if}"
+
+		configure_link "${alice_ns}" "${alice_if}" "${family}" "$(mpudp_it_alice_addr "${family}" "${path}")" "${prefix}"
+		configure_link "${t_ns}" "${t_in_if}" "${family}" "$(mpudp_it_t_ingress_addr "${family}" "${path}")" "${prefix}"
+		configure_link "${t_ns}" "${t_out_if}" "${family}" "$(mpudp_it_t_egress_addr "${family}" "${path}")" "${prefix}"
+		configure_link "${bob_ns}" "${bob_if}" "${family}" "$(mpudp_it_bob_addr "${family}" "${path}")" "${prefix}"
+	done
+	ip netns exec "${t_ns}" sysctl -q -w net.ipv4.ip_forward=1 >/dev/null
+	ip netns exec "${t_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1 >/dev/null
+	configure_nat "${path}" "${t_ns}"
+done
+
+printf 'ready\n' >"${MPUDP_IT_STATE_DIR}/ready"
+setup_complete=1
+trap - EXIT HUP INT TERM
+mpudp_it_log "topology ready: run=${MPUDP_IT_RUN_ID} state=${MPUDP_IT_STATE_DIR}"
+printf '%s\n' "${MPUDP_IT_STATE_DIR}"

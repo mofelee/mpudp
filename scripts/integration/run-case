@@ -1,0 +1,2932 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+manifest=${MPUDP_IT_REPO_ROOT}/integration/scenarios/cases.tsv
+state_dir=''
+case_name=''
+timeout_override=''
+
+usage() {
+	printf '%s\n' 'Usage: scripts/integration/run-case --state DIR CASE [--timeout SECONDS]'
+	printf '%s\n' '       scripts/integration/run-case --list'
+}
+
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+	if [[ ${1:-} == --list ]]; then
+		awk -F '\t' '!/^#/ && NF {printf "%-34s family=%-4s runtime=%s\n", $1, $3, $5}' "${manifest}"
+		exit 0
+	fi
+
+	while (( $# > 0 )); do
+		case $1 in
+			--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+			--timeout) timeout_override=${2:?missing value for --timeout}; shift 2 ;;
+			-h | --help) usage; exit 0 ;;
+			-*) mpudp_it_die "unknown run-case argument: $1"; exit 2 ;;
+			*) if [[ -n ${case_name} ]]; then mpudp_it_die "multiple case names"; exit 2; fi; case_name=$1; shift ;;
+		esac
+	done
+
+	if [[ -z ${state_dir} || -z ${case_name} ]]; then usage >&2; exit 2; fi
+	mpudp_it_require_root
+	mpudp_it_require_commands bash ip nft tc timeout go awk sed sha256sum stat
+	mpudp_it_load_state "${state_dir}"
+	if [[ ! -f ${MPUDP_IT_STATE_DIR}/ready ]]; then mpudp_it_die "topology is not ready"; exit 1; fi
+
+	case_row=$(awk -F '\t' -v name="${case_name}" '$1 == name {print; found=1} END {if (!found) exit 1}' "${manifest}") || {
+		mpudp_it_die "unknown integration case: ${case_name}"
+		exit 2
+	}
+	IFS=$'\t' read -r _ runner family case_timeout requires_runtime <<<"${case_row}"
+	if [[ ${requires_runtime} == true ]]; then
+		mpudp_it_log "SKIP: ${case_name} requires the runnable Peer from issue #7"
+		exit 77
+	fi
+	if [[ -n ${timeout_override} ]]; then case_timeout=${timeout_override}; fi
+	if [[ ! ${case_timeout} =~ ^[1-9][0-9]*$ ]] || (( case_timeout > 120 )); then
+		mpudp_it_die "case timeout must be 1..120 seconds"
+		exit 2
+	fi
+	if [[ ${runner} == raw-nat-smoke || ${runner} == peer-* ]]; then mpudp_it_require_commands tcpdump grep; fi
+	if [[ ${runner} == path-controls ]]; then mpudp_it_require_commands ping; fi
+	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding || ${runner} == direct-single-carrier || ${runner} == peer-rs-network ]]; then
+		mpudp_it_require_commands ss diff
+	fi
+	exec timeout --signal=TERM --kill-after=10s "${case_timeout}s" \
+		bash -c 'source "$1"; trap cleanup_case_worker EXIT; trap "exit 129" HUP; trap "exit 130" INT; trap "exit 143" TERM; run_case_worker "$2" "$3" "$4" "$5" "$6"' \
+		"${SCRIPT_DIR}/run-case-worker" "${0}" "${state_dir}" "${case_name}" "${case_timeout}" "${runner}" "${family}"
+fi
+
+netprobe=''
+peerprobe=''
+direct_mutation_file=''
+canonical_rebinding_mutation_file=''
+canonical_mtu_mutation_file=''
+shutdown_mutation_file=''
+rs_network_mutation_file=''
+rspeerprobe=''
+rs_socket_start=''
+pollutionprobe=''
+shutdownprobe=''
+build_netprobe() {
+	netprobe=${MPUDP_IT_STATE_DIR}/bin/netprobe
+	if [[ -x ${netprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${netprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/netprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${netprobe}"
+	trap - RETURN
+}
+
+build_peerprobe() {
+	peerprobe=${MPUDP_IT_STATE_DIR}/bin/peerprobe
+	if [[ -x ${peerprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${peerprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/peerprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${peerprobe}"
+	trap - RETURN
+}
+
+build_rspeerprobe() {
+	rspeerprobe=${MPUDP_IT_STATE_DIR}/bin/rspeerprobe
+	if [[ -x ${rspeerprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${rspeerprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/rspeerprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${rspeerprobe}"
+	trap - RETURN
+}
+
+build_pollutionprobe() {
+	pollutionprobe=${MPUDP_IT_STATE_DIR}/bin/pollutionprobe
+	if [[ -x ${pollutionprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${pollutionprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/pollutionprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${pollutionprobe}"
+	trap - RETURN
+}
+
+build_shutdownprobe() {
+	shutdownprobe=${MPUDP_IT_STATE_DIR}/bin/shutdownprobe
+	if [[ -x ${shutdownprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${shutdownprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/shutdownprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${shutdownprobe}"
+	trap - RETURN
+}
+
+counter_for_comment() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4
+	ip netns exec "${namespace}" nft list table "${nft_family}" "${table}" |
+		awk -v marker="comment \"${comment}\"" 'index($0, marker) {for (i=1; i<=NF; i++) if ($i == "packets") {print $(i+1); exit}}'
+}
+
+cleanup_case_worker() {
+	local worker_status=$? pid start_time attempt remaining index cleanup_status=0
+	local -a owned_pids=() owned_starts=()
+	trap - EXIT
+	trap '' HUP INT TERM
+	if [[ -f ${MPUDP_IT_STATE_DIR}/pids ]]; then
+		while read -r pid start_time; do
+			if [[ ${pid:-} =~ ^[1-9][0-9]*$ && ${start_time:-} =~ ^[0-9]+$ ]] &&
+				mpudp_it_process_is_owned "${pid}" "${start_time}"; then
+				owned_pids+=("${pid}")
+				owned_starts+=("${start_time}")
+				kill -TERM "${pid}" 2>/dev/null || true
+			fi
+		done <"${MPUDP_IT_STATE_DIR}/pids"
+	fi
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		remaining=0
+		for index in "${!owned_pids[@]}"; do
+			if mpudp_it_process_is_owned "${owned_pids[${index}]}" "${owned_starts[${index}]}"; then
+				remaining=1
+			fi
+		done
+		if (( remaining == 0 )); then break; fi
+		sleep 0.1
+	done
+	for index in "${!owned_pids[@]}"; do
+		if mpudp_it_process_is_owned "${owned_pids[${index}]}" "${owned_starts[${index}]}"; then
+			kill -KILL "${owned_pids[${index}]}" 2>/dev/null || true
+			sleep 0.05
+			if mpudp_it_process_is_owned "${owned_pids[${index}]}" "${owned_starts[${index}]}"; then
+				mpudp_it_log "failed to stop case helper pid ${owned_pids[${index}]}"
+				cleanup_status=1
+			fi
+		fi
+	done
+	if ! cleanup_direct_single_carrier; then cleanup_status=1; fi
+	if ! cleanup_canonical_rebinding; then cleanup_status=1; fi
+	if ! cleanup_canonical_mtu; then cleanup_status=1; fi
+	if ! cleanup_shutdown_mutations; then cleanup_status=1; fi
+	if ! cleanup_rs_network_mutations; then cleanup_status=1; fi
+	if (( worker_status == 0 && cleanup_status != 0 )); then worker_status=1; fi
+	exit "${worker_status}"
+}
+
+assert_counter_at_least() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4 minimum=$5 value
+	value=$(counter_for_comment "${namespace}" "${nft_family}" "${table}" "${comment}")
+	if [[ ! ${value} =~ ^[0-9]+$ ]] || (( value < minimum )); then
+		mpudp_it_die "${namespace} ${comment} counter=${value:-missing}, want >=${minimum}"
+		return 1
+	fi
+}
+
+assert_counter_equal() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4 expected=$5 value
+	value=$(counter_for_comment "${namespace}" "${nft_family}" "${table}" "${comment}")
+	if [[ ${value:-missing} != "${expected}" ]]; then
+		mpudp_it_die "${namespace} ${comment} counter=${value:-missing}, want ${expected}"
+		return 1
+	fi
+}
+
+assert_counter_greater_than() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4 baseline=$5 value
+	value=$(counter_for_comment "${namespace}" "${nft_family}" "${table}" "${comment}")
+	if [[ ! ${value} =~ ^[0-9]+$ ]] || (( value <= baseline )); then
+		mpudp_it_die "${namespace} ${comment} counter=${value:-missing}, want >${baseline}"
+		return 1
+	fi
+}
+
+snapshot_path_counters() {
+	local family=$1 comment=$2 path table nft_family value
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	path_counter_snapshot=()
+	for path in 1 2 3 4 5; do
+		value=$(counter_for_comment "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" "${comment}")
+		if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "T${path} ${comment} counter is missing"
+			return 1
+		fi
+		path_counter_snapshot+=("${value}")
+	done
+}
+
+wait_ready() {
+	local ready_file=$1 pid=$2 attempt
+	for attempt in $(seq 1 100); do
+		if [[ -s ${ready_file} ]]; then return 0; fi
+		if ! kill -0 "${pid}" 2>/dev/null; then return 1; fi
+		sleep 0.05
+	done
+	return 1
+}
+
+start_fragment_observers() {
+	local family=$1 label=${2:-} path observer_pid events_file log_file ready_file file_prefix
+	fragment_pids=()
+	fragment_event_files=()
+	fragment_log_files=()
+	file_prefix=${case_name}${label:+-${label}}
+	for path in 1 2 3 4 5; do
+		events_file=${MPUDP_IT_STATE_DIR}/${file_prefix}-t${path}-wire-fragments.log
+		log_file=${MPUDP_IT_STATE_DIR}/${file_prefix}-t${path}-tcpdump.log
+		ready_file=${MPUDP_IT_STATE_DIR}/${file_prefix}-t${path}-tcpdump.ready
+		rm -f -- "${ready_file}"
+		"${SCRIPT_DIR}/capture-fragments" --state "${MPUDP_IT_STATE_DIR}" --run-id "${MPUDP_IT_RUN_ID}" \
+			--path "${path}" --family "${family}" --events "${events_file}" --log "${log_file}" --ready "${ready_file}" &
+		observer_pid=$!
+		fragment_pids+=("${observer_pid}")
+		fragment_event_files+=("${events_file}")
+		fragment_log_files+=("${log_file}")
+		if ! mpudp_it_record_pid "${observer_pid}"; then
+			kill -TERM "${observer_pid}" 2>/dev/null || true
+			wait "${observer_pid}" 2>/dev/null || true
+			return 1
+		fi
+		if ! wait_ready "${ready_file}" "${observer_pid}"; then
+			mpudp_it_die "wire-fragment observer did not become ready on T${path}; see ${log_file}"
+			return 1
+		fi
+	done
+}
+
+stop_fragment_observers() {
+	local observer_pid observer_status stop_status=0
+	for observer_pid in "${fragment_pids[@]}"; do
+		if kill -0 "${observer_pid}" 2>/dev/null; then kill -TERM "${observer_pid}" 2>/dev/null || true; fi
+	done
+	for observer_pid in "${fragment_pids[@]}"; do
+		set +e
+		wait "${observer_pid}" 2>/dev/null
+		observer_status=$?
+		set -e
+		if (( observer_status != 0 && observer_status != 143 )); then stop_status=1; fi
+	done
+	return "${stop_status}"
+}
+
+assert_no_wire_fragments() {
+	local index first_fragment
+	for index in "${!fragment_event_files[@]}"; do
+		if grep -q '[^[:space:]]' "${fragment_event_files[${index}]}"; then
+			first_fragment=$(sed -n '/[^[:space:]]/ {p;q;}' "${fragment_event_files[${index}]}")
+			mpudp_it_die "T$((index + 1)) observed an on-wire IP fragment: ${first_fragment}"
+			return 1
+		fi
+		if ! grep -q '^0 packets dropped by kernel$' "${fragment_log_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) fragment capture did not report a lossless observation; see ${fragment_log_files[${index}]}"
+			return 1
+		fi
+	done
+}
+
+start_udp_observers() {
+	local family=$1 direction=$2 label=$3 path observer_pid events_file log_file ready_file
+	udp_pids=()
+	udp_event_files=()
+	udp_log_files=()
+	for path in 1 2 3 4 5; do
+		events_file=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-t${path}-udp.log
+		log_file=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-t${path}-udp-capture.log
+		ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-t${path}-udp.ready
+		rm -f -- "${ready_file}"
+		"${SCRIPT_DIR}/capture-udp" --state "${MPUDP_IT_STATE_DIR}" --run-id "${MPUDP_IT_RUN_ID}" \
+			--path "${path}" --family "${family}" --direction "${direction}" \
+			--events "${events_file}" --log "${log_file}" --ready "${ready_file}" &
+		observer_pid=$!
+		udp_pids+=("${observer_pid}")
+		udp_event_files+=("${events_file}")
+		udp_log_files+=("${log_file}")
+		if ! mpudp_it_record_pid "${observer_pid}"; then
+			kill -TERM "${observer_pid}" 2>/dev/null || true
+			wait "${observer_pid}" 2>/dev/null || true
+			return 1
+		fi
+		if ! wait_ready "${ready_file}" "${observer_pid}"; then
+			mpudp_it_die "UDP metadata observer did not become ready on T${path}; see ${log_file}"
+			return 1
+		fi
+	done
+}
+
+stop_udp_observers() {
+	local observer_pid observer_status stop_status=0
+	for observer_pid in "${udp_pids[@]}"; do
+		if kill -0 "${observer_pid}" 2>/dev/null; then kill -TERM "${observer_pid}" 2>/dev/null || true; fi
+	done
+	for observer_pid in "${udp_pids[@]}"; do
+		set +e
+		wait "${observer_pid}" 2>/dev/null
+		observer_status=$?
+		set -e
+		if (( observer_status != 0 && observer_status != 143 )); then stop_status=1; fi
+	done
+	return "${stop_status}"
+}
+
+assert_udp_observation_lossless() {
+	local index
+	for index in "${!udp_log_files[@]}"; do
+		if ! grep -q '^0 packets dropped by kernel$' "${udp_log_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) UDP capture did not report a lossless observation; see ${udp_log_files[${index}]}"
+			return 1
+		fi
+	done
+}
+
+assert_udp_length_all_paths() {
+	local expected=$1 index
+	for index in "${!udp_event_files[@]}"; do
+		if ! grep -q "UDP, length ${expected}$" "${udp_event_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) did not observe UDP payload length ${expected}"
+			return 1
+		fi
+	done
+}
+
+assert_udp_length_paths() {
+	local expected=$1 path
+	shift
+	for path in "$@"; do
+		if ! grep -q "UDP, length ${expected}$" "${udp_event_files[$((path - 1))]}"; then
+			mpudp_it_die "T${path} did not observe UDP payload length ${expected}"
+			return 1
+		fi
+	done
+}
+
+assert_udp_length_absent() {
+	local expected=$1 path=$2
+	if grep -q "UDP, length ${expected}$" "${udp_event_files[$((path - 1))]}"; then
+		mpudp_it_die "T${path} unexpectedly observed UDP payload length ${expected}"
+		return 1
+	fi
+}
+
+udp_direction_pattern() {
+	local direction=$1 expected=$2
+	case ${direction} in
+		forward) printf '> [^ ]+\\.9000: UDP, length %s$\n' "${expected}" ;;
+		reverse) printf '\\.9000 > [^ ]+: UDP, length %s$\n' "${expected}" ;;
+		*) mpudp_it_die "invalid UDP assertion direction: ${direction}"; return 1 ;;
+	esac
+}
+
+assert_udp_length_all_paths_direction() {
+	local expected=$1 direction=$2 pattern index
+	pattern=$(udp_direction_pattern "${direction}" "${expected}")
+	for index in "${!udp_event_files[@]}"; do
+		if ! grep -Eq "${pattern}" "${udp_event_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) did not observe ${direction} UDP payload length ${expected}"
+			return 1
+		fi
+	done
+}
+
+assert_udp_length_paths_direction() {
+	local expected=$1 direction=$2 pattern path
+	shift 2
+	pattern=$(udp_direction_pattern "${direction}" "${expected}")
+	for path in "$@"; do
+		if ! grep -Eq "${pattern}" "${udp_event_files[$((path - 1))]}"; then
+			mpudp_it_die "T${path} did not observe ${direction} UDP payload length ${expected}"
+			return 1
+		fi
+	done
+}
+
+assert_udp_length_absent_direction() {
+	local expected=$1 direction=$2 path=$3 pattern
+	pattern=$(udp_direction_pattern "${direction}" "${expected}")
+	if grep -Eq "${pattern}" "${udp_event_files[$((path - 1))]}"; then
+		mpudp_it_die "T${path} unexpectedly observed ${direction} UDP payload length ${expected}"
+		return 1
+	fi
+}
+
+assert_udp_lengths_at_most() {
+	local maximum=$1 index offending
+	for index in "${!udp_event_files[@]}"; do
+		offending=$(awk -v maximum="${maximum}" '
+			NF && ($(NF-1) != "length" || $NF !~ /^[0-9]+$/ || $NF > maximum) {print; exit}
+		' "${udp_event_files[${index}]}")
+		if [[ -n ${offending} ]]; then
+			mpudp_it_die "T$((index + 1)) observed malformed or over-budget UDP metadata: ${offending}"
+			return 1
+		fi
+	done
+}
+
+snapshot_udp_event_counts() {
+	local index
+	udp_event_counts=()
+	for index in "${!udp_event_files[@]}"; do
+		udp_event_counts+=("$(awk 'END {print NR+0}' "${udp_event_files[${index}]}")")
+	done
+}
+
+assert_udp_event_counts_unchanged() {
+	local index current
+	for index in "${!udp_event_files[@]}"; do
+		current=$(awk 'END {print NR+0}' "${udp_event_files[${index}]}")
+		if [[ ${current} != "${udp_event_counts[${index}]}" ]]; then
+			mpudp_it_die "T$((index + 1)) emitted UDP traffic during the rejected oversize write"
+			return 1
+		fi
+	done
+}
+
+wait_for_udp_source_port() {
+	local path=$1 port=$2 attempt file
+	file=${udp_event_files[$((path - 1))]}
+	for attempt in $(seq 1 100); do
+		if grep -Eq "\.${port} > .*\.9000:" "${file}"; then return 0; fi
+		sleep 0.05
+	done
+	mpudp_it_die "T${path} did not observe Bob-facing NAT source port ${port}"
+	return 1
+}
+
+assert_socket_snapshots_equal() {
+	local before=$1 after=$2 difference=$3
+	if ! diff -u \
+		<(awk '$4 ~ /:4000$/ {print $3, $4}' "${before}" | sort) \
+		<(awk '$4 ~ /:4000$/ {print $3, $4}' "${after}" | sort) >"${difference}"; then
+		mpudp_it_die "Alice Carrier socket identities changed during the controlled phase"
+		return 1
+	fi
+}
+
+assert_five_carrier_sockets() {
+	local family=$1 label=${2:-} alice_ns snapshot path socket_count unique_count address
+	alice_ns=$(mpudp_it_ns alice)
+	snapshot=${MPUDP_IT_STATE_DIR}/${case_name}${label:+-${label}}-alice-sockets.log
+	ip netns exec "${alice_ns}" ss -H -u -n -p >"${snapshot}"
+	socket_count=$(awk '$4 ~ /:4000$/ {count++} END {print count+0}' "${snapshot}")
+	unique_count=$(awk '$4 ~ /:4000$/ {print $3}' "${snapshot}" | sort -u | awk 'END {print NR}')
+	if [[ ${socket_count} != 5 || ${unique_count} != 5 ]]; then
+		mpudp_it_die "Alice Carrier sockets=${socket_count}, unique local identities=${unique_count}, want 5/5"
+		return 1
+	fi
+	for path in 1 2 3 4 5; do
+		address=$(mpudp_it_t_ingress_addr "${family}" "${path}")
+		if ! grep -F "${address}" "${snapshot}" | grep ':4000' >/dev/null; then
+			mpudp_it_die "Alice has no connected Carrier socket for T${path} ${address}:4000"
+			return 1
+		fi
+	done
+}
+
+start_peer_exchange() {
+	local family=$1 flow=$2 listener_budget=$3 initiator_budget=$4 body_bytes=$5 reply_bytes=$6
+	local oversize_bytes=$7 expect_partial_mtu=$8 reject_second_session=$9
+	local targets_override=${10:-} endpoint_ttl=${11:-} keepalive=${12:-} expiry_wait=${13:-}
+	local alice_ns bob_ns listen_address targets peer_start_marker peer_start_phase
+	local -a listener_arguments initiator_arguments
+	build_peerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	targets=$(mpudp_it_join_targets "${family}")
+	if [[ -n ${targets_override} ]]; then targets=${targets_override}; fi
+	peer_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-bob.ndjson
+	peer_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-alice.ndjson
+	peer_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-bob.log
+	peer_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}-alice.log
+	peer_ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.ready
+	peer_oversize_ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.oversize-ready
+	peer_oversize_continue_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.oversize-continue
+	peer_oversize_done_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.oversize-done
+	peer_phase_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.phase
+	peer_continue_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.continue
+	peer_reply_complete_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.reply-complete
+	peer_exit_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.exit
+	peer_final_file=${MPUDP_IT_STATE_DIR}/${case_name}-${flow}.final
+	peer_exchange_released=0
+	peer_oversize_released=0
+	peer_has_oversize=0
+	rm -f -- "${peer_ready_file}" "${peer_oversize_ready_file}" "${peer_oversize_continue_file}" \
+		"${peer_oversize_done_file}" "${peer_phase_file}" "${peer_continue_file}" "${peer_reply_complete_file}" \
+		"${peer_exit_file}" "${peer_final_file}" "${peer_final_file}.post-expiry-done"
+	: >"${peer_listener_log}"
+	: >"${peer_initiator_log}"
+	listener_arguments=(
+		--role listener --flow "${flow}" --family "${family}" --listen "${listen_address}"
+		--max-udp-payload "${listener_budget}" --body-bytes "${body_bytes}" --reply-bytes "${reply_bytes}"
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${peer_listener_events}"
+		--ready-file "${peer_ready_file}" --reply-complete-file "${peer_reply_complete_file}"
+		--exit-file "${peer_exit_file}" --final-file "${peer_final_file}"
+	)
+	if [[ ${reject_second_session} == true ]]; then listener_arguments+=(--reject-second-session); fi
+	if [[ -n ${endpoint_ttl} ]]; then listener_arguments+=(--endpoint-ttl "${endpoint_ttl}"); fi
+	if [[ -n ${keepalive} ]]; then listener_arguments+=(--keepalive "${keepalive}"); fi
+	if [[ -n ${expiry_wait} ]]; then listener_arguments+=(--expiry-wait "${expiry_wait}"); fi
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${bob_ns}" "${peerprobe}" "${listener_arguments[@]}" >"${peer_listener_log}" 2>&1 &
+	peer_listener_pid=$!
+	mpudp_it_record_pid "${peer_listener_pid}"
+	if ! wait_ready "${peer_ready_file}" "${peer_listener_pid}"; then
+		mpudp_it_die "Bob public Peer did not become ready; see ${peer_listener_log}"
+		return 1
+	fi
+
+	initiator_arguments=(
+		--role initiator --flow "${flow}" --family "${family}" --carriers "${targets}"
+		--max-udp-payload "${initiator_budget}" --body-bytes "${body_bytes}" --reply-bytes "${reply_bytes}"
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${peer_initiator_events}"
+		--phase-file "${peer_phase_file}" --continue-file "${peer_continue_file}"
+		--reply-complete-file "${peer_reply_complete_file}" --exit-file "${peer_exit_file}"
+		--final-file "${peer_final_file}"
+	)
+	if [[ -n ${endpoint_ttl} ]]; then initiator_arguments+=(--endpoint-ttl "${endpoint_ttl}"); fi
+	if [[ -n ${keepalive} ]]; then initiator_arguments+=(--keepalive "${keepalive}"); fi
+	if [[ -n ${expiry_wait} ]]; then initiator_arguments+=(--expiry-wait "${expiry_wait}"); fi
+	if (( oversize_bytes != 0 )); then
+		peer_has_oversize=1
+		initiator_arguments+=(
+			--oversize-bytes "${oversize_bytes}"
+			--oversize-ready-file "${peer_oversize_ready_file}"
+			--oversize-continue-file "${peer_oversize_continue_file}"
+			--oversize-done-file "${peer_oversize_done_file}"
+		)
+	fi
+	if [[ ${expect_partial_mtu} == true ]]; then initiator_arguments+=(--expect-partial-mtu); fi
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${alice_ns}" "${peerprobe}" "${initiator_arguments[@]}" >"${peer_initiator_log}" 2>&1 &
+	peer_initiator_pid=$!
+	mpudp_it_record_pid "${peer_initiator_pid}"
+	peer_start_marker=${peer_phase_file}
+	peer_start_phase=main
+	if (( peer_has_oversize != 0 )); then
+		peer_start_marker=${peer_oversize_ready_file}
+		peer_start_phase=oversize
+	fi
+	if ! wait_ready "${peer_start_marker}" "${peer_initiator_pid}"; then
+		mpudp_it_die "Alice public Peer did not reach the ${peer_start_phase} phase; see ${peer_initiator_log}"
+		return 1
+	fi
+}
+
+release_peer_oversize() {
+	if (( peer_has_oversize == 0 )); then
+		mpudp_it_die "public Peer exchange has no oversize phase"
+		return 1
+	fi
+	if (( peer_oversize_released != 0 )); then return 0; fi
+	printf 'continue\n' >"${peer_oversize_continue_file}"
+	if ! wait_ready "${peer_oversize_done_file}" "${peer_initiator_pid}"; then
+		mpudp_it_die "Alice public Peer did not finish the rejected oversize write; see ${peer_initiator_log}"
+		return 1
+	fi
+	if ! wait_ready "${peer_phase_file}" "${peer_initiator_pid}"; then
+		mpudp_it_die "Alice public Peer did not reach the main phase; see ${peer_initiator_log}"
+		return 1
+	fi
+	peer_oversize_released=1
+}
+
+release_peer_exchange() {
+	if (( peer_exchange_released != 0 )); then return 0; fi
+	if (( peer_has_oversize != 0 && peer_oversize_released == 0 )); then
+		mpudp_it_die "oversize evidence must complete before the main exchange is released"
+		return 1
+	fi
+	printf 'continue\n' >"${peer_continue_file}"
+	if ! wait_ready "${peer_exit_file}" "${peer_initiator_pid}"; then
+		mpudp_it_die "Alice public Peer did not finish the main exchange; see ${peer_initiator_log}"
+		return 1
+	fi
+	peer_exchange_released=1
+}
+
+record_peer_events() {
+	if grep -Fqi 'integration-test-key' "${peer_listener_events}" "${peer_initiator_events}" ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${peer_listener_events}" "${peer_initiator_events}"; then
+		mpudp_it_die "public Peer event metadata contains a forbidden sensitive field"
+		return 1
+	fi
+	sed -n 'p' "${peer_listener_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	sed -n 'p' "${peer_initiator_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+}
+
+finish_peer_exchange() {
+	local initiator_status listener_status
+	release_peer_exchange
+	printf 'finish\n' >"${peer_final_file}"
+	set +e
+	wait "${peer_initiator_pid}"
+	initiator_status=$?
+	if (( initiator_status != 0 )) && kill -0 "${peer_listener_pid}" 2>/dev/null; then kill -TERM "${peer_listener_pid}" 2>/dev/null || true; fi
+	wait "${peer_listener_pid}"
+	listener_status=$?
+	set -e
+	if (( initiator_status != 0 )); then
+		mpudp_it_die "Alice public Peer exited ${initiator_status}; see ${peer_initiator_log}"
+		return 1
+	fi
+	if (( listener_status != 0 )); then
+		mpudp_it_die "Bob public Peer exited ${listener_status}; see ${peer_listener_log}"
+		return 1
+	fi
+	record_peer_events
+}
+
+remove_nft_rules_with_comment() {
+	local namespace=$1 nft_family=$2 table=$3 chain=$4 comment=$5 handle status=0
+	local -a handles=()
+	mapfile -t handles < <(
+		ip netns exec "${namespace}" nft -a list chain "${nft_family}" "${table}" "${chain}" 2>/dev/null |
+			awk -v marker="comment \"${comment}\"" 'index($0, marker) {for (i=1; i<=NF; i++) if ($i == "handle") print $(i+1)}'
+	)
+	for handle in "${handles[@]}"; do
+		if ! ip netns exec "${namespace}" nft delete rule "${nft_family}" "${table}" "${chain}" handle "${handle}"; then
+			status=1
+		fi
+	done
+	return "${status}"
+}
+
+cleanup_direct_single_carrier() {
+	local marker=${direct_mutation_file:-${MPUDP_IT_STATE_DIR:-}/direct-single-carrier.direct-mutations}
+	local alice_ns bob_ns t_ns alice_address bob_address alice_gateway bob_gateway direct_comment status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	alice_gateway=$(mpudp_it_t_ingress_addr 4 1)
+	bob_gateway=$(mpudp_it_t_egress_addr 4 1)
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" forward mpudp-direct-forward || status=1
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" forward mpudp-direct-reverse || status=1
+	remove_nft_rules_with_comment "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting mpudp-direct-no-snat || status=1
+	ip -n "${alice_ns}" -4 route del "${bob_address}/32" via "${alice_gateway}" dev a4p1 2>/dev/null || true
+	ip -n "${bob_ns}" -4 route del "${alice_address}/32" via "${bob_gateway}" dev b4p1 2>/dev/null || true
+	if [[ -n $(ip -n "${alice_ns}" -4 route show exact "${bob_address}/32") ||
+		-n $(ip -n "${bob_ns}" -4 route show exact "${alice_address}/32") ]]; then
+		mpudp_it_die "direct single-Carrier host routes remain after cleanup"
+		status=1
+	fi
+	for direct_comment in mpudp-direct-forward mpudp-direct-reverse mpudp-direct-no-snat; do
+		if ip netns exec "${t_ns}" nft -a list table ip "${MPUDP_IT_TABLE4}" |
+			awk -v marker="comment \"${direct_comment}\"" 'index($0, marker) {found=1} END {exit !found}'; then
+			mpudp_it_die "direct single-Carrier nft rule remains after cleanup: ${direct_comment}"
+			status=1
+		fi
+	done
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_canonical_rebinding() {
+	local marker=${canonical_rebinding_mutation_file:-${MPUDP_IT_STATE_DIR:-}/endpoint-rebinding-and-expiry.mutations}
+	local t1_ns cleanup_path status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	t1_ns=$(mpudp_it_ns t1)
+	for cleanup_path in 2 3; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1; then
+			status=1
+		fi
+	done
+	if ! remove_nft_rules_with_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" forward \
+		mpudp-expired-endpoint-drop >/dev/null 2>&1; then
+		status=1
+	fi
+	if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-rebind \
+		--path 1 --family 4 >/dev/null 2>&1; then
+		status=1
+	fi
+	for cleanup_path in 2 3; do
+		if ip netns exec "$(mpudp_it_ns alice)" tc qdisc show dev "a4p${cleanup_path}" |
+			awk '$2 == "netem" {found=1} END {exit !found}'; then
+			mpudp_it_die "canonical rebinding netem remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ip netns exec "${t1_ns}" nft -a list table ip "${MPUDP_IT_TABLE4}" |
+		awk '/comment "mpudp-(rebind-|expired-endpoint-drop)/ {found=1} END {exit !found}'; then
+		mpudp_it_die "canonical rebinding nft rule remains after cleanup"
+		status=1
+	fi
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_canonical_mtu() {
+	local marker=${canonical_mtu_mutation_file:-${MPUDP_IT_STATE_DIR:-}/mtu-budget-no-fragment.mutations}
+	local family namespace interface current status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for family in 4 6; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+			--path 1 --family "${family}" --value 1500 >/dev/null 2>&1; then
+			status=1
+		fi
+		while read -r namespace interface; do
+			current=$(ip -n "${namespace}" -o link show dev "${interface}" |
+				awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')
+			if [[ ${current} != 1500 ]]; then
+				mpudp_it_die "canonical MTU cleanup left ${namespace}/${interface} at ${current:-unknown}"
+				status=1
+			fi
+		done < <(printf '%s %s\n' \
+			"$(mpudp_it_ns alice)" "a${family}p1" \
+			"$(mpudp_it_ns t1)" "in${family}" \
+			"$(mpudp_it_ns t1)" "out${family}" \
+			"$(mpudp_it_ns bob)" "b${family}p1")
+	done
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_shutdown_mutations() {
+	local marker=${shutdown_mutation_file:-${MPUDP_IT_STATE_DIR:-}/shutdown-cleanup.mutations}
+	local cleanup_path t_ns status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for cleanup_path in 1 2 3 4 5; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction both >/dev/null 2>&1; then
+			status=1
+		fi
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop \
+			--path "${cleanup_path}" --family 4 >/dev/null 2>&1; then
+			status=1
+		fi
+		t_ns=$(mpudp_it_ns "t${cleanup_path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "shutdown shard-drop rule remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ! assert_no_netem 4; then status=1; fi
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_rs_network_mutations() {
+	local marker=${rs_network_mutation_file:-${MPUDP_IT_STATE_DIR:-}/rs-network.mutations}
+	local cleanup_path t_ns status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for cleanup_path in 1 2 3 4 5; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1; then
+			status=1
+		fi
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop \
+			--path "${cleanup_path}" --family 4 >/dev/null 2>&1; then
+			status=1
+		fi
+		t_ns=$(mpudp_it_ns "t${cleanup_path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "RS network drop rule remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ! assert_no_netem 4; then status=1; fi
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+configure_direct_single_carrier() {
+	local alice_ns bob_ns t_ns alice_address bob_address alice_gateway bob_gateway
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	alice_gateway=$(mpudp_it_t_ingress_addr 4 1)
+	bob_gateway=$(mpudp_it_t_egress_addr 4 1)
+	if [[ -n $(ip -n "${alice_ns}" -4 route show exact "${bob_address}/32") ||
+		-n $(ip -n "${bob_ns}" -4 route show exact "${alice_address}/32") ]]; then
+		mpudp_it_die "direct single-Carrier route already exists outside case ownership"
+		return 1
+	fi
+	direct_mutation_file=${MPUDP_IT_STATE_DIR}/direct-single-carrier.direct-mutations
+	: >"${direct_mutation_file}"
+	ip -n "${alice_ns}" -4 route add "${bob_address}/32" via "${alice_gateway}" dev a4p1
+	ip -n "${bob_ns}" -4 route add "${alice_address}/32" via "${bob_gateway}" dev b4p1
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" postrouting \
+		ip saddr "${alice_address}" ip daddr "${bob_address}" udp dport 9000 \
+		counter return comment mpudp-direct-no-snat
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname in4 oifname out4 ip saddr "${alice_address}" ip daddr "${bob_address}" udp dport 9000 \
+		counter accept comment mpudp-direct-forward
+	ip netns exec "${t_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname out4 oifname in4 ip saddr "${bob_address}" ip daddr "${alice_address}" udp sport 9000 \
+		counter accept comment mpudp-direct-reverse
+}
+
+counter_for_rule_fragments() {
+	local namespace=$1 nft_family=$2 table=$3 chain=$4 first=$5 second=$6
+	ip netns exec "${namespace}" nft list chain "${nft_family}" "${table}" "${chain}" |
+		awk -v first="${first}" -v second="${second}" '
+			index($0, first) && index($0, second) {
+				for (i=1; i<=NF; i++) if ($i == "packets") {print $(i+1); exit}
+			}
+		'
+}
+
+capture_single_direct_carrier() {
+	local label=$1 alice_ns target snapshot tuple local_endpoint local_address local_port minimum maximum
+	alice_ns=$(mpudp_it_ns alice)
+	target=$(mpudp_it_bob_addr 4 1):9000
+	snapshot=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-alice-sockets.log
+	tuple=${MPUDP_IT_STATE_DIR}/${case_name}-${label}-alice-carrier-tuple.log
+	ip netns exec "${alice_ns}" ss -H -u -n >"${snapshot}"
+	if [[ $(awk 'NF {count++} END {print count+0}' "${snapshot}") != 1 ||
+		$(awk -v target="${target}" '$4 == target {count++} END {print count+0}' "${snapshot}") != 1 ]]; then
+		mpudp_it_die "Alice does not have exactly one connected UDP Carrier to ${target}"
+		return 1
+	fi
+	awk -v target="${target}" '$4 == target {print $3, $4}' "${snapshot}" >"${tuple}"
+	read -r local_endpoint _ <"${tuple}"
+	local_address=${local_endpoint%:*}
+	local_port=${local_endpoint##*:}
+	read -r minimum maximum < <(ip netns exec "${alice_ns}" cat /proc/sys/net/ipv4/ip_local_port_range)
+	if [[ ${local_address} != "$(mpudp_it_alice_addr 4 1)" || ! ${local_port} =~ ^[0-9]+$ ||
+		! ${minimum} =~ ^[0-9]+$ || ! ${maximum} =~ ^[0-9]+$ ]] ||
+		(( local_port < minimum || local_port > maximum )); then
+		mpudp_it_die "Alice Carrier source is not an OS-assigned path-1 tuple"
+		return 1
+	fi
+	direct_tuple_file=${tuple}
+	direct_source_port=${local_port}
+}
+
+assert_direct_wire_metadata() {
+	local source_port=$1 alice_address bob_address source_endpoint reverse_endpoint offending line_count index
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	source_endpoint=${alice_address}.${source_port}
+	reverse_endpoint=${bob_address}.9000
+	line_count=$(awk 'NF {count++} END {print count+0}' "${udp_event_files[0]}")
+	if (( line_count == 0 || line_count > 256 )); then
+		mpudp_it_die "T1 direct UDP metadata row count=${line_count}, want 1..256"
+		return 1
+	fi
+	offending=$(awk -v source="${source_endpoint}" -v reverse="${reverse_endpoint}" '
+		NF && !(($2 == "IP" && $3 == source && $4 == ">" && $5 == reverse ":") ||
+			($2 == "IP" && $3 == reverse && $4 == ">" && $5 == source ":")) {print; exit}
+	' "${udp_event_files[0]}")
+	if [[ -n ${offending} ]]; then
+		mpudp_it_die "T1 observed a non-direct or unstable UDP tuple: ${offending}"
+		return 1
+	fi
+	for index in 1 2 3 4; do
+		if grep -q '[^[:space:]]' "${udp_event_files[${index}]}"; then
+			mpudp_it_die "T$((index + 1)) unexpectedly observed direct single-Carrier traffic"
+			return 1
+		fi
+	done
+}
+
+assert_peer_event_once() {
+	local file=$1 event_name=$2 phase=$3 bytes=$4 expected_digest=$5 description=$6 marker count
+	marker="\"event\":\"${event_name}\",\"phase\":\"${phase}\",\"bytes\":${bytes},\"sha256_prefix\":\"${expected_digest}\""
+	count=$(awk -v marker="${marker}" 'index($0, marker) {count++} END {print count+0}' "${file}")
+	if [[ ${count} != 1 ]]; then
+		mpudp_it_die "${description} metadata count=${count}, want 1"
+		return 1
+	fi
+}
+
+assert_peer_event_order() {
+	local file=$1 previous=0 marker line
+	shift
+	for marker in "$@"; do
+		line=$(awk -v marker="${marker}" 'index($0, marker) {count++; found=NR} END {if (count == 1) print found; else print 0}' "${file}")
+		if (( line <= previous )); then
+			mpudp_it_die "public Peer event order is invalid around ${marker}"
+			return 1
+		fi
+		previous=${line}
+	done
+}
+
+run_direct_single_carrier() {
+	local family=$1 t_ns alice_address bob_address target dnat_before dnat_after snat_before snat_after
+	local before_tuple after_tuple socket_difference direct_source
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "direct-single-carrier currently has an explicit IPv4 contract"
+		return 2
+	fi
+	t_ns=$(mpudp_it_ns t1)
+	alice_address=$(mpudp_it_alice_addr 4 1)
+	bob_address=$(mpudp_it_bob_addr 4 1)
+	target=${bob_address}:9000
+	dnat_before=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" prerouting \
+		"ip daddr $(mpudp_it_t_ingress_addr 4 1) udp dport 4000" "dnat to ${bob_address}:9000")
+	snat_before=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting \
+		"ip daddr ${bob_address} udp dport 9000" masquerade)
+	if [[ ! ${dnat_before} =~ ^[0-9]+$ || ! ${snat_before} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "T1 baseline NAT counters are unavailable"
+		return 1
+	fi
+	trap cleanup_direct_single_carrier RETURN
+	configure_direct_single_carrier
+	start_udp_observers 4 both direct
+	start_peer_exchange 4 direct-single-carrier 1200 1200 321 257 0 false false "${target}"
+	capture_single_direct_carrier before
+	before_tuple=${direct_tuple_file}
+	direct_source=${direct_source_port}
+	release_peer_exchange
+	capture_single_direct_carrier after
+	after_tuple=${direct_tuple_file}
+	socket_difference=${MPUDP_IT_STATE_DIR}/${case_name}-socket-difference.log
+	if ! diff -u "${before_tuple}" "${after_tuple}" >"${socket_difference}"; then
+		mpudp_it_die "Alice's OS-assigned direct Carrier tuple changed during the exchange"
+		return 1
+	fi
+	if [[ ${direct_source_port} != "${direct_source}" ]]; then
+		mpudp_it_die "Alice's direct Carrier source port changed during the exchange"
+		return 1
+	fi
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more direct UDP metadata observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_direct_wire_metadata "${direct_source}"
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-no-snat 1
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-forward 1
+	assert_counter_at_least "${t_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-direct-reverse 1
+	dnat_after=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" prerouting \
+		"ip daddr $(mpudp_it_t_ingress_addr 4 1) udp dport 4000" "dnat to ${bob_address}:9000")
+	snat_after=$(counter_for_rule_fragments "${t_ns}" ip "${MPUDP_IT_TABLE4}" postrouting \
+		"ip daddr ${bob_address} udp dport 9000" masquerade)
+	if [[ ${dnat_after} != "${dnat_before}" || ${snat_after} != "${snat_before}" ]]; then
+		mpudp_it_die "direct traffic changed baseline DNAT/SNAT counters"
+		return 1
+	fi
+	assert_peer_event_once "${peer_initiator_events}" datagram_sent main 321 e91ff40e5f79 "Alice main send"
+	assert_peer_event_once "${peer_listener_events}" datagram_received main 321 e91ff40e5f79 "Bob main delivery"
+	assert_peer_event_once "${peer_initiator_events}" datagram_sent empty 0 e3b0c44298fc "Alice empty send"
+	assert_peer_event_once "${peer_listener_events}" datagram_received empty 0 e3b0c44298fc "Bob empty delivery"
+	assert_peer_event_once "${peer_listener_events}" datagram_sent main 257 83c99b15dfcd "Bob main send"
+	assert_peer_event_once "${peer_initiator_events}" datagram_received main 257 83c99b15dfcd "Alice main delivery"
+	assert_peer_event_once "${peer_listener_events}" datagram_sent empty 0 e3b0c44298fc "Bob empty send"
+	assert_peer_event_once "${peer_initiator_events}" datagram_received empty 0 e3b0c44298fc "Alice empty delivery"
+	assert_peer_event_order "${peer_initiator_events}" \
+		'"event":"datagram_sent","phase":"main"' '"event":"datagram_sent","phase":"empty"' \
+		'"event":"datagram_received","phase":"main"' '"event":"datagram_received","phase":"empty"' \
+		'"event":"session_closed"' '"event":"flow_complete"' '"event":"peer_closed"'
+	assert_peer_event_order "${peer_listener_events}" \
+		'"event":"datagram_received","phase":"main"' '"event":"datagram_received","phase":"empty"' \
+		'"event":"datagram_sent","phase":"main"' '"event":"datagram_sent","phase":"empty"' \
+		'"event":"session_closed"' '"event":"flow_complete"' '"event":"peer_closed"'
+	if [[ $(awk 'END {print NR+0}' "${peer_listener_events}") -gt 32 ||
+		$(awk 'END {print NR+0}' "${peer_initiator_events}") -gt 32 ]]; then
+		mpudp_it_die "direct public Peer diagnostic event count exceeded 32"
+		return 1
+	fi
+	cleanup_direct_single_carrier
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (direct IPv4, one stable OS-assigned Carrier, exact non-empty/empty Datagram boundaries)"
+}
+
+assert_transit_namespaces_idle() {
+	local path namespace
+	for path in 1 2 3 4 5; do
+		namespace=$(mpudp_it_ns "t${path}")
+		if [[ -n $(ip netns pids "${namespace}") ]]; then
+			mpudp_it_die "T${path} runs a process; transparent forwarding must use only kernel nftables/conntrack"
+			return 1
+		fi
+	done
+}
+
+assert_event_count() {
+	local file=$1 event_name=$2 phase=$3 bytes=$4 expected=$5 description=$6 marker count
+	marker="\"event\":\"${event_name}\",\"phase\":\"${phase}\",\"bytes\":${bytes}"
+	count=$(awk -v marker="${marker}" 'index($0, marker) {count++} END {print count+0}' "${file}")
+	if [[ ${count} != "${expected}" ]]; then
+		mpudp_it_die "${description} event count=${count}, want ${expected}"
+		return 1
+	fi
+}
+
+run_transparent_nat_reverse_path() {
+	local family=$1 path alice_ns bob_ns bob_address alice_address table nft_family
+	local forward_bytes=1541 reply_bytes=887 forward_wire=585 reverse_wire=367
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	local -a path_counter_snapshot=() forward_before=() reverse_before=()
+	local -a forward_data_before=() reverse_data_before=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "transparent-nat-reverse-path currently has an explicit IPv4 contract"
+		return 2
+	fi
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	table=${MPUDP_IT_TABLE4}
+	nft_family=ip
+	assert_transit_namespaces_idle
+	for path in 1 2 3 4 5; do
+		bob_address=$(mpudp_it_bob_addr 4 "${path}")
+		alice_address=$(mpudp_it_alice_addr 4 "${path}")
+		if ip -n "${alice_ns}" -4 route get "${bob_address}" >/dev/null 2>&1; then
+			mpudp_it_die "Alice unexpectedly has a route to Bob path ${path}; the Carrier must target T${path}"
+			return 1
+		fi
+		if ip -n "${bob_ns}" -4 route get "${alice_address}" >/dev/null 2>&1; then
+			mpudp_it_die "Bob unexpectedly has a route to Alice path ${path}; reverse traffic must use conntrack"
+			return 1
+		fi
+	done
+
+	start_fragment_observers 4 canonical-nat
+	start_udp_observers 4 both canonical-nat
+	snapshot_path_counters 4 mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-forward-data
+	forward_data_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters 4 mpudp-reverse-data
+	reverse_data_before=("${path_counter_snapshot[@]}")
+
+	start_peer_exchange 4 transparent-nat-reverse-path 1200 1200 \
+		"${forward_bytes}" "${reply_bytes}" 0 false false
+	assert_five_carrier_sockets 4 canonical-nat
+	release_peer_exchange
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more canonical NAT UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more canonical NAT fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_length_all_paths_direction "${forward_wire}" forward
+	assert_udp_length_all_paths_direction "${reverse_wire}" reverse
+	assert_no_wire_fragments
+	assert_transit_namespaces_idle
+
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-data "${forward_data_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-data "${reverse_data_before[$((path - 1))]}"
+	done
+	assert_event_count "${peer_listener_events}" datagram_received main "${forward_bytes}" 1 \
+		"Bob canonical NAT delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received main "${reply_bytes}" 1 \
+		"Alice canonical NAT reverse delivery"
+	mpudp_it_log "case passed: ${case_name} (five kernel-only DNAT/SNAT paths and listener-port conntrack replies)"
+}
+
+assert_reverse_endpoint_length() {
+	local expected=$1 port=$2 mode=$3 pattern
+	pattern="\\.9000 > [^ ]+\\.${port}: UDP, length ${expected}$"
+	if [[ ${mode} == present ]]; then
+		if ! grep -Eq "${pattern}" "${udp_event_files[0]}"; then
+			mpudp_it_die "T1 did not observe reverse UDP length ${expected} to NAT port ${port}"
+			return 1
+		fi
+	elif grep -Eq "${pattern}" "${udp_event_files[0]}"; then
+		mpudp_it_die "T1 observed post-expiry UDP length ${expected} to expired NAT port ${port}"
+		return 1
+	fi
+}
+
+run_endpoint_rebinding_and_expiry() {
+	local family=$1 path t1_ns old_drop_before old_drop_after wait_started expired elapsed accepted_count
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	if [[ ${family} != 4 ]]; then
+		mpudp_it_die "endpoint-rebinding-and-expiry currently has an explicit IPv4 contract"
+		return 2
+	fi
+	t1_ns=$(mpudp_it_ns t1)
+	canonical_rebinding_mutation_file=${MPUDP_IT_STATE_DIR}/endpoint-rebinding-and-expiry.mutations
+	: >"${canonical_rebinding_mutation_file}"
+	trap cleanup_canonical_rebinding RETURN
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family 4 --zone 101 --source-port 41001
+	start_fragment_observers 4 canonical-rebinding
+	start_udp_observers 4 both canonical-rebinding
+	start_peer_exchange 4 endpoint-rebinding-and-expiry 1200 1200 2049 1027 0 false true "" 5s 1s 6s
+	wait_for_udp_source_port 1 41001
+	assert_five_carrier_sockets 4 before-canonical-rebind
+
+	ip netns exec "${t1_ns}" nft insert rule ip "${MPUDP_IT_TABLE4}" forward \
+		iifname out4 ct zone 101 udp sport 9000 counter drop comment mpudp-expired-endpoint-drop
+	old_drop_before=$(counter_for_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-expired-endpoint-drop)
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family 4 --zone 102 --source-port 41002
+	for path in 2 3; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem \
+			--path "${path}" --family 4 --direction forward --loss 100%
+	done
+
+	release_peer_exchange
+	wait_for_udp_source_port 1 41002
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more canonical rebinding UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more canonical rebinding fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_no_wire_fragments
+	assert_udp_lengths_at_most 1200
+	assert_udp_length_paths_direction 754 forward 1 4 5
+	assert_udp_length_absent_direction 754 forward 2
+	assert_udp_length_absent_direction 754 forward 3
+	assert_udp_length_paths_direction 182 reverse 1 4 5
+	assert_udp_length_absent_direction 182 reverse 2
+	assert_udp_length_absent_direction 182 reverse 3
+	assert_reverse_endpoint_length 182 41002 present
+	assert_reverse_endpoint_length 182 41001 absent
+
+	old_drop_after=$(counter_for_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-expired-endpoint-drop)
+	if [[ ! ${old_drop_before} =~ ^[0-9]+$ || ! ${old_drop_after} =~ ^[0-9]+$ ]] ||
+		(( old_drop_after <= old_drop_before )); then
+		mpudp_it_die "the old Endpoint did not fail on the isolated zone-101 reverse path"
+		return 1
+	fi
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-snat-101-41001 1
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-snat-102-41002 1
+	assert_counter_at_least "${t1_ns}" ip "${MPUDP_IT_TABLE4}" mpudp-rebind-reverse-102-41002 1
+	accepted_count=$(grep -c '"event":"session_accepted"' "${peer_listener_events}" || true)
+	if [[ ${accepted_count} != 1 ]] ||
+		! grep -q '"event":"single_session_retained","phase":"main"' "${peer_listener_events}"; then
+		mpudp_it_die "rebinding did not retain exactly one accepted Session"
+		return 1
+	fi
+	wait_started=$(sed -n 's/.*"event":"expiry_wait_started".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' \
+		"${peer_listener_events}" | sed -n '1p')
+	expired=$(sed -n 's/.*"event":"endpoint_expiry_verified".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' \
+		"${peer_listener_events}" | sed -n '1p')
+	if [[ ! ${wait_started} =~ ^[0-9]+$ || ! ${expired} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "rebinding expiry timing metadata is missing"
+		return 1
+	fi
+	elapsed=$((expired - wait_started))
+	if (( elapsed < 5000 )); then
+		mpudp_it_die "old Endpoint expiry proof completed after only ${elapsed}ms"
+		return 1
+	fi
+	assert_event_count "${peer_listener_events}" datagram_received main 2049 1 \
+		"Bob rebound-path delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received post-expiry 333 1 \
+		"Alice post-expiry delivery"
+
+	cleanup_canonical_rebinding
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (41001 failed, 41002 joined, old Endpoint expired after ${elapsed}ms, same Session survived)"
+}
+
+run_peer_smoke() {
+	local family=$1 path table nft_family before_sockets after_sockets socket_difference
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	local -a path_counter_snapshot=() forward_control_before=() reverse_control_before=()
+	local -a forward_data_before=() reverse_data_before=() forward_before=() reverse_before=()
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	snapshot_path_counters "${family}" mpudp-forward-control
+	forward_control_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse-control
+	reverse_control_before=("${path_counter_snapshot[@]}")
+	start_peer_exchange "${family}" smoke 1200 1200 2048 1025 0 false false
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-control "${forward_control_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-control "${reverse_control_before[$((path - 1))]}"
+	done
+	assert_five_carrier_sockets "${family}" before
+	before_sockets=${MPUDP_IT_STATE_DIR}/${case_name}-before-alice-sockets.log
+	after_sockets=${MPUDP_IT_STATE_DIR}/${case_name}-after-alice-sockets.log
+	socket_difference=${MPUDP_IT_STATE_DIR}/${case_name}-socket-difference.log
+	start_fragment_observers "${family}"
+	start_udp_observers "${family}" forward smoke
+	snapshot_path_counters "${family}" mpudp-forward-data
+	forward_data_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse-data
+	reverse_data_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	release_peer_exchange
+	assert_five_carrier_sockets "${family}" after
+	assert_socket_snapshots_equal "${before_sockets}" "${after_sockets}" "${socket_difference}"
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more UDP metadata observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more wire-fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_length_all_paths 754
+	assert_no_wire_fragments
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-data "${forward_data_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-data "${reverse_data_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" mpudp-fragment 0
+	done
+	grep -q '"event":"datagram_received","phase":"main","bytes":2048' "${peer_listener_events}" || { mpudp_it_die "Bob did not record the 2048-byte public Datagram"; return 1; }
+	grep -q '"event":"datagram_received","phase":"main","bytes":1025' "${peer_initiator_events}" || { mpudp_it_die "Alice did not record the 1025-byte public reply"; return 1; }
+	mpudp_it_log "case passed: ${case_name} (public Peer 3+2 Datagram crossed five stable Carrier sockets)"
+}
+
+run_canonical_mtu_safe_phase() {
+	local family=$1 flow=$2 path_mtu=$3 listener_budget=$4 initiator_budget=$5
+	local exact_bytes=$6 wire_budget=$7 oversize_bytes path table nft_family
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=() udp_event_counts=()
+	local -a path_counter_snapshot=() forward_before=() reverse_before=()
+	oversize_bytes=$((exact_bytes + 1))
+	table=${MPUDP_IT_TABLE4}
+	nft_family=ip
+	if [[ ${family} == 6 ]]; then
+		table=${MPUDP_IT_TABLE6}
+		nft_family=ip6
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+		--path 1 --family "${family}" --value "${path_mtu}"
+	start_fragment_observers "${family}" "${flow}"
+	start_udp_observers "${family}" both "${flow}"
+	start_peer_exchange "${family}" "${flow}" "${listener_budget}" "${initiator_budget}" \
+		"${exact_bytes}" "${exact_bytes}" "${oversize_bytes}" false false
+	assert_five_carrier_sockets "${family}" "${flow}"
+	# The probe is blocked before either tested WritePacket, so this snapshot
+	# distinguishes local exact-limit+1 rejection from any emitted shard.
+	sleep 0.2
+	snapshot_udp_event_counts
+	snapshot_path_counters "${family}" mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	release_peer_oversize
+	sleep 0.1
+	assert_udp_event_counts_unchanged
+	for path in 1 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+	done
+	release_peer_exchange
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "${flow} UDP observer exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "${flow} fragment observer exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most "${wire_budget}"
+	assert_udp_length_all_paths_direction "${wire_budget}" forward
+	assert_udp_length_all_paths_direction "${wire_budget}" reverse
+	assert_no_wire_fragments
+	assert_event_count "${peer_listener_events}" datagram_received main "${exact_bytes}" 1 \
+		"${flow} exact-limit forward delivery"
+	assert_event_count "${peer_initiator_events}" datagram_received main "${exact_bytes}" 1 \
+		"${flow} exact-limit reverse delivery"
+	if ! grep -q "\"event\":\"oversize_rejected\",\"phase\":\"oversize\",\"bytes\":${oversize_bytes}.*\"error_kinds\":\\[\"message_too_large\"\\]" \
+		"${peer_initiator_events}"; then
+		mpudp_it_die "${flow} exact-limit+1 rejection metadata is missing"
+		return 1
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+		--path 1 --family "${family}" --value 1500
+}
+
+run_mtu_budget_no_fragment() {
+	local _manifest_family=$1 path
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	local -a path_counter_snapshot=() failure_forward_before=()
+	mpudp_it_require_commands tcpdump grep
+	canonical_mtu_mutation_file=${MPUDP_IT_STATE_DIR}/mtu-budget-no-fragment.mutations
+	: >"${canonical_mtu_mutation_file}"
+	trap cleanup_canonical_mtu RETURN
+
+	# The first exchange freezes min(1200,1000) in both directions.
+	run_canonical_mtu_safe_phase 4 mtu-negotiate 1500 1000 1200 2787 1000
+	# The second runs at IPv6's minimum link MTU with the default safe budget.
+	run_canonical_mtu_safe_phase 6 mtu-ipv6-minimum 1280 1200 1200 3387 1200
+	# The third proves an explicitly lowered global tunnel budget over IPv4.
+	run_canonical_mtu_safe_phase 4 mtu-small-tunnel 576 520 1200 1347 520
+
+	# Finally, deliberately overstate path 1's budget. Linux DF/PMTU must
+	# reject its full-size shard while the remaining paths recover the block.
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 1 --family 4 --value 576
+	start_fragment_observers 4 mtu-pmtu-failure
+	start_udp_observers 4 both mtu-pmtu-failure
+	start_peer_exchange 4 mtu-pmtu-failure 1200 1200 3387 257 0 true false
+	snapshot_path_counters 4 mpudp-forward
+	failure_forward_before=("${path_counter_snapshot[@]}")
+	release_peer_exchange
+	assert_counter_equal "$(mpudp_it_ns t1)" ip "${MPUDP_IT_TABLE4}" \
+		mpudp-forward "${failure_forward_before[0]}"
+	for path in 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" \
+			mpudp-forward "${failure_forward_before[$((path - 1))]}"
+	done
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "PMTU failure UDP observer exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "PMTU failure fragment observer exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most 1200
+	assert_udp_length_absent_direction 1200 forward 1
+	assert_udp_length_paths_direction 1200 forward 2 3 4 5
+	assert_no_wire_fragments
+	if ! grep -q '"event":"datagram_partially_sent","phase":"main","bytes":3387.*"error_kinds":\["partial_send","path_mtu_exceeded"\]' \
+		"${peer_initiator_events}"; then
+		mpudp_it_die "PMTU failure did not expose partial_send plus path_mtu_exceeded"
+		return 1
+	fi
+	assert_event_count "${peer_listener_events}" datagram_received main 3387 1 \
+		"PMTU surviving-path recovery"
+
+	cleanup_canonical_mtu
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (1200/1000 negotiation, IPv6 1280, 520 tunnel budget, exact/+1, PMTU, zero fragments)"
+}
+
+run_peer_payload_mtu() {
+	local family=$1 safe_mtu safe_budget listener_budget initiator_budget exact_bytes oversize_bytes
+	local failure_budget failure_bytes path table nft_family
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=() udp_event_counts=()
+	local -a path_counter_snapshot=() oversize_forward_before=() oversize_reverse_before=() failure_forward_before=()
+	if [[ ${family} == 4 ]]; then
+		safe_mtu=576
+		safe_budget=520
+		listener_budget=520
+		initiator_budget=1200
+		exact_bytes=1347
+		oversize_bytes=1348
+		failure_budget=1200
+		failure_bytes=3387
+		table=${MPUDP_IT_TABLE4}
+		nft_family=ip
+	else
+		safe_mtu=1280
+		safe_budget=1200
+		listener_budget=1450
+		initiator_budget=1200
+		exact_bytes=3387
+		oversize_bytes=3388
+		failure_budget=1400
+		failure_bytes=3987
+		table=${MPUDP_IT_TABLE6}
+		nft_family=ip6
+	fi
+
+	restore_peer_payload_mtu() {
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 1 --family "${family}" --value 1500 >/dev/null 2>&1 || true
+	}
+	trap restore_peer_payload_mtu RETURN
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 1 --family "${family}" --value "${safe_mtu}"
+
+	start_fragment_observers "${family}" safe
+	start_udp_observers "${family}" both safe
+	start_peer_exchange "${family}" mtu-safe "${listener_budget}" "${initiator_budget}" \
+		"${exact_bytes}" "${exact_bytes}" "${oversize_bytes}" false false
+	assert_five_carrier_sockets "${family}" safe
+	# The helper has settled every Carrier and is blocked before WritePacket.
+	sleep 0.2
+	snapshot_udp_event_counts
+	snapshot_path_counters "${family}" mpudp-forward
+	oversize_forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	oversize_reverse_before=("${path_counter_snapshot[@]}")
+	release_peer_oversize
+	sleep 0.1
+	assert_udp_event_counts_unchanged
+	for path in 1 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${oversize_forward_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${oversize_reverse_before[$((path - 1))]}"
+	done
+	release_peer_exchange
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more safe-budget UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more safe-budget fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most "${safe_budget}"
+	assert_udp_length_all_paths_direction "${safe_budget}" forward
+	assert_udp_length_all_paths_direction "${safe_budget}" reverse
+	assert_no_wire_fragments
+	grep -q "\"event\":\"oversize_rejected\",\"phase\":\"oversize\",\"bytes\":${oversize_bytes}.*\"error_kinds\":\[\"message_too_large\"\]" \
+		"${peer_initiator_events}" || { mpudp_it_die "exact-limit+1 rejection metadata is missing"; return 1; }
+	grep -q "\"event\":\"datagram_received\",\"phase\":\"main\",\"bytes\":${exact_bytes}" \
+		"${peer_listener_events}" || { mpudp_it_die "Bob did not receive the exact-limit Datagram"; return 1; }
+	grep -q "\"event\":\"datagram_received\",\"phase\":\"main\",\"bytes\":${exact_bytes}" \
+		"${peer_initiator_events}" || { mpudp_it_die "Alice did not receive the exact-limit reply"; return 1; }
+
+	start_fragment_observers "${family}" pmtu
+	start_udp_observers "${family}" both pmtu
+	start_peer_exchange "${family}" mtu-failure "${failure_budget}" "${failure_budget}" \
+		"${failure_bytes}" 257 0 true false
+	snapshot_path_counters "${family}" mpudp-forward
+	failure_forward_before=("${path_counter_snapshot[@]}")
+	release_peer_exchange
+	assert_counter_equal "$(mpudp_it_ns t1)" "${nft_family}" "${table}" \
+		mpudp-forward "${failure_forward_before[0]}"
+	for path in 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${failure_forward_before[$((path - 1))]}"
+	done
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more PMTU UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more PMTU fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most "${failure_budget}"
+	assert_udp_length_absent_direction "${failure_budget}" forward 1
+	assert_udp_length_paths_direction "${failure_budget}" forward 2 3 4 5
+	assert_no_wire_fragments
+	grep -q "\"event\":\"datagram_partially_sent\",\"phase\":\"main\",\"bytes\":${failure_bytes}.*\"error_kinds\":\[\"partial_send\",\"path_mtu_exceeded\"\]" \
+		"${peer_initiator_events}" || { mpudp_it_die "PMTU partial-send classification metadata is missing"; return 1; }
+	grep -q "\"event\":\"datagram_received\",\"phase\":\"main\",\"bytes\":${failure_bytes}" \
+		"${peer_listener_events}" || { mpudp_it_die "Bob did not recover the PMTU Datagram from surviving paths"; return 1; }
+
+	restore_peer_payload_mtu
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (exact/+1 budget, bidirectional sizing, PMTU partial send, zero fragments)"
+}
+
+run_peer_nat_rebinding() {
+	local family=$1 path table nft_family before_sockets after_sockets socket_difference accepted_count
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	table=${MPUDP_IT_TABLE4}
+	nft_family=ip
+	if [[ ${family} == 6 ]]; then
+		table=${MPUDP_IT_TABLE6}
+		nft_family=ip6
+	fi
+
+	cleanup_peer_rebinding() {
+		for cleanup_path in 2 3; do
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+				--path "${cleanup_path}" --family "${family}" --direction forward >/dev/null 2>&1 || true
+		done
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-rebind \
+			--path 1 --family "${family}" >/dev/null 2>&1 || true
+	}
+	trap cleanup_peer_rebinding RETURN
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family "${family}" --zone 101 --source-port 41001
+	start_fragment_observers "${family}" rebinding
+	start_udp_observers "${family}" both rebinding
+	start_peer_exchange "${family}" rebinding 1200 1200 2048 1025 0 false true
+	wait_for_udp_source_port 1 41001
+	assert_five_carrier_sockets "${family}" before
+	before_sockets=${MPUDP_IT_STATE_DIR}/${case_name}-before-alice-sockets.log
+	after_sockets=${MPUDP_IT_STATE_DIR}/${case_name}-after-alice-sockets.log
+	socket_difference=${MPUDP_IT_STATE_DIR}/${case_name}-socket-difference.log
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-snat-101-41001 1
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-reverse-101-41001 1
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
+		--path 1 --family "${family}" --zone 102 --source-port 41002
+	for path in 2 3; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem \
+			--path "${path}" --family "${family}" --direction forward --loss 100%
+	done
+	release_peer_exchange
+	wait_for_udp_source_port 1 41002
+	assert_five_carrier_sockets "${family}" after
+	assert_socket_snapshots_equal "${before_sockets}" "${after_sockets}" "${socket_difference}"
+	finish_peer_exchange
+	stop_udp_observers || { mpudp_it_die "one or more rebinding UDP observers exited unexpectedly"; return 1; }
+	stop_fragment_observers || { mpudp_it_die "one or more rebinding fragment observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	assert_udp_lengths_at_most 1200
+	assert_udp_length_paths_direction 754 forward 1 4 5
+	assert_udp_length_absent_direction 754 forward 2
+	assert_udp_length_absent_direction 754 forward 3
+	assert_no_wire_fragments
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-forward 1
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-snat-101-41001 1
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-reverse-101-41001 1
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-snat-102-41002 1
+	assert_counter_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-rebind-reverse-102-41002 1
+	grep -q '"event":"datagram_received","phase":"main","bytes":2048' "${peer_listener_events}" || {
+		mpudp_it_die "Bob did not receive the rebound-path public Datagram"
+		return 1
+	}
+	grep -q '"event":"datagram_received","phase":"main","bytes":1025' "${peer_initiator_events}" || {
+		mpudp_it_die "Alice did not receive Bob's main reply after rebinding"
+		return 1
+	}
+	grep -q '"event":"single_session_retained","phase":"main"' "${peer_listener_events}" || {
+		mpudp_it_die "Bob did not retain the original accepted Session across rebinding"
+		return 1
+	}
+	accepted_count=$(grep -c '"event":"session_accepted"' "${peer_listener_events}" || true)
+	if [[ ${accepted_count} != 1 ]]; then
+		mpudp_it_die "Bob accepted ${accepted_count} Sessions across one authenticated rebinding, want 1"
+		return 1
+	fi
+
+	cleanup_peer_rebinding
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (41001 -> 41002 retained one Session and five Carrier sockets)"
+}
+
+run_peer_endpoint_expiry() {
+	local family=$1 alice_ns bob_ns listen_address targets ready_file done_file
+	local listener_status initiator_status wait_started expired elapsed accepted_count
+	local -a listener_arguments initiator_arguments
+	build_peerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	targets=$(mpudp_it_join_targets "${family}")
+	peer_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-bob.ndjson
+	peer_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-alice.ndjson
+	peer_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-bob.log
+	peer_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-alice.log
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	done_file=${MPUDP_IT_STATE_DIR}/${case_name}.done
+	rm -f -- "${ready_file}" "${done_file}"
+	: >"${peer_listener_log}"
+	: >"${peer_initiator_log}"
+	listener_arguments=(
+		--role listener --flow expiry --family "${family}" --listen "${listen_address}"
+		--max-udp-payload 1200 --endpoint-ttl 5s --keepalive 30s --expiry-wait 6s
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${peer_listener_events}"
+		--ready-file "${ready_file}" --done-file "${done_file}"
+	)
+	initiator_arguments=(
+		--role initiator --flow expiry --family "${family}" --carriers "${targets}"
+		--max-udp-payload 1200 --endpoint-ttl 5s --keepalive 30s --expiry-wait 6s
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${peer_initiator_events}"
+		--continue-file "${done_file}"
+	)
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${bob_ns}" "${peerprobe}" "${listener_arguments[@]}" >"${peer_listener_log}" 2>&1 &
+	peer_listener_pid=$!
+	mpudp_it_record_pid "${peer_listener_pid}"
+	if ! wait_ready "${ready_file}" "${peer_listener_pid}"; then
+		mpudp_it_die "Bob expiry Peer did not become ready; see ${peer_listener_log}"
+		return 1
+	fi
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${alice_ns}" "${peerprobe}" "${initiator_arguments[@]}" >"${peer_initiator_log}" 2>&1 &
+	peer_initiator_pid=$!
+	mpudp_it_record_pid "${peer_initiator_pid}"
+	set +e
+	wait "${peer_listener_pid}"
+	listener_status=$?
+	if (( listener_status != 0 )) && kill -0 "${peer_initiator_pid}" 2>/dev/null; then kill -TERM "${peer_initiator_pid}" 2>/dev/null || true; fi
+	wait "${peer_initiator_pid}"
+	initiator_status=$?
+	set -e
+	if (( listener_status != 0 )); then
+		mpudp_it_die "Bob expiry Peer exited ${listener_status}; see ${peer_listener_log}"
+		return 1
+	fi
+	if (( initiator_status != 0 )); then
+		mpudp_it_die "Alice expiry Peer exited ${initiator_status}; see ${peer_initiator_log}"
+		return 1
+	fi
+	record_peer_events
+	grep -q '"event":"endpoint_expired","phase":"expiry".*"error_kinds":\["no_available_paths"\]' \
+		"${peer_listener_events}" || { mpudp_it_die "Endpoint expiry did not classify ErrNoAvailablePaths"; return 1; }
+	wait_started=$(sed -n 's/.*"event":"expiry_wait_started".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' "${peer_listener_events}" | sed -n '1p')
+	expired=$(sed -n 's/.*"event":"endpoint_expired".*"elapsed_ms":\([0-9][0-9]*\).*/\1/p' "${peer_listener_events}" | sed -n '1p')
+	if [[ ! ${wait_started} =~ ^[0-9]+$ || ! ${expired} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "Endpoint expiry timing metadata is missing"
+		return 1
+	fi
+	elapsed=$((expired - wait_started))
+	if (( elapsed < 5000 )); then
+		mpudp_it_die "Endpoint expiry fired after ${elapsed}ms of quiet time, want at least 5000ms"
+		return 1
+	fi
+	accepted_count=$(grep -c '"event":"session_accepted"' "${peer_listener_events}" || true)
+	if [[ ${accepted_count} != 1 ]]; then
+		mpudp_it_die "Bob expiry flow accepted ${accepted_count} Sessions, want 1"
+		return 1
+	fi
+	grep -q '"event":"datagram_received","phase":"bootstrap","bytes":96' "${peer_listener_events}" || {
+		mpudp_it_die "Bob expiry Session did not receive bootstrap traffic"
+		return 1
+	}
+	mpudp_it_log "case passed: ${case_name} (same accepted Session returned ErrNoAvailablePaths after ${elapsed}ms quiet)"
+}
+
+run_raw_nat_smoke() {
+	local family=$1 network listen_address nft_family table alice_ns bob_ns targets
+	local server_events client_events ready_file server_log client_log server_pid server_status
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	build_netprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	if [[ ${family} == 4 ]]; then
+		network=udp4; listen_address=0.0.0.0:9000; nft_family=ip; table=${MPUDP_IT_TABLE4}
+	else
+		network=udp6; listen_address='[::]:9000'; nft_family=ip6; table=${MPUDP_IT_TABLE6}
+	fi
+	targets=$(mpudp_it_join_targets "${family}")
+	server_events=${MPUDP_IT_STATE_DIR}/${case_name}-server.ndjson
+	client_events=${MPUDP_IT_STATE_DIR}/${case_name}-client.ndjson
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	server_log=${MPUDP_IT_STATE_DIR}/${case_name}-server.log
+	client_log=${MPUDP_IT_STATE_DIR}/${case_name}-client.log
+	: >"${server_events}"
+	: >"${client_events}"
+	: >"${server_log}"
+	: >"${client_log}"
+	rm -f -- "${ready_file}"
+
+	for path in 1 2 3 4 5; do
+		if [[ -n $(ip netns pids "$(mpudp_it_ns "t${path}")") ]]; then
+			mpudp_it_die "T${path} unexpectedly runs a process"
+			return 1
+		fi
+		bob_address=$(mpudp_it_bob_addr "${family}" "${path}")
+		if ip -n "${alice_ns}" -"${family}" route get "${bob_address}" >/dev/null 2>&1; then
+			mpudp_it_die "Alice unexpectedly has a route to Bob path ${path}"
+			return 1
+		fi
+	done
+	start_fragment_observers "${family}"
+
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${bob_ns}" "${netprobe}" \
+		--mode server --network "${network}" --listen "${listen_address}" --count 5 \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${server_events}" --ready-file "${ready_file}" \
+		>"${server_log}" 2>&1 &
+	server_pid=$!
+	mpudp_it_record_pid "${server_pid}"
+	if ! wait_ready "${ready_file}" "${server_pid}"; then
+		mpudp_it_die "Bob netprobe did not become ready; see ${server_log}"
+		return 1
+	fi
+
+	if ! timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${alice_ns}" "${netprobe}" \
+		--mode client --network "${network}" --targets "${targets}" \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${client_events}" \
+		>"${client_log}" 2>&1; then
+		mpudp_it_die "Alice netprobe failed; see ${client_log}"
+		return 1
+	fi
+	set +e
+	wait "${server_pid}"
+	server_status=$?
+	set -e
+	if (( server_status != 0 )); then
+		mpudp_it_die "Bob netprobe exited ${server_status}; see ${server_log}"
+		return 1
+	fi
+	if ! stop_fragment_observers; then
+		mpudp_it_die "one or more wire-fragment observers exited unexpectedly"
+		return 1
+	fi
+	assert_no_wire_fragments
+
+	if [[ $(awk 'END {print NR}' "${server_events}") != 5 || $(awk 'END {print NR}' "${client_events}") != 5 ]]; then
+		mpudp_it_die "smoke event count is not 5 server + 5 client"
+		return 1
+	fi
+	if grep -Eq 'payload|psk|authentication_tag|hmac' "${server_events}" "${client_events}"; then
+		mpudp_it_die "event metadata contains a forbidden sensitive field name"
+		return 1
+	fi
+	for path in 1 2 3 4 5; do
+		t_ns=$(mpudp_it_ns "t${path}")
+		assert_counter_at_least "${t_ns}" "${nft_family}" "${table}" mpudp-forward 1
+		assert_counter_at_least "${t_ns}" "${nft_family}" "${table}" mpudp-reverse 1
+		assert_counter_equal "${t_ns}" "${nft_family}" "${table}" mpudp-fragment 0
+	done
+	sed -n 'p' "${server_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	sed -n 'p' "${client_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (five NAT replies; lossless wire capture observed zero fragments)"
+}
+
+run_path_controls() {
+	local family=$1 alice_ns t1_ns t2_ns t3_ns t4_ns t5_ns family_flag minimum
+	local network listen_address drop_target drop_server_events drop_client_events drop_ready_file
+	local drop_server_log drop_blocked_log drop_allowed_log drop_server_pid drop_server_status
+	build_netprobe
+	alice_ns=$(mpudp_it_ns alice)
+	t1_ns=$(mpudp_it_ns t1); t2_ns=$(mpudp_it_ns t2); t3_ns=$(mpudp_it_ns t3)
+	t4_ns=$(mpudp_it_ns t4); t5_ns=$(mpudp_it_ns t5)
+	family_flag=-4; minimum=576
+	network=udp4; listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then family_flag=-6; minimum=1280; network=udp6; listen_address='[::]:9000'; fi
+
+	cleanup_controls() {
+		for cleanup_path in 1 2 3 4 5; do
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path "${cleanup_path}" --family "${family}" --direction both >/dev/null 2>&1 || true
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" link --path "${cleanup_path}" --family "${family}" up >/dev/null 2>&1 || true
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path "${cleanup_path}" --family "${family}" --value 1500 >/dev/null 2>&1 || true
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path "${cleanup_path}" --family "${family}" >/dev/null 2>&1 || true
+		done
+	}
+	trap cleanup_controls RETURN
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 1 --family "${family}" --delay 5ms --loss 0% --reorder 25%
+	if ! ip netns exec "${alice_ns}" tc qdisc show dev "$(mpudp_it_alice_if "${family}" 1)" | grep netem >/dev/null; then
+		mpudp_it_die "path 1 netem was not installed"
+		return 1
+	fi
+	if ip netns exec "${alice_ns}" tc qdisc show dev "$(mpudp_it_alice_if "${family}" 2)" | grep netem >/dev/null; then
+		mpudp_it_die "path 1 netem changed path 2"
+		return 1
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path 1 --family "${family}" --direction both
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 2 --family "${family}" --loss 100%
+	if ip netns exec "${alice_ns}" ping "${family_flag}" -c 1 -W 1 "$(mpudp_it_t_ingress_addr "${family}" 2)" >/dev/null 2>&1; then
+		mpudp_it_die "100% loss on path 2 still passed traffic"
+		return 1
+	fi
+	if ! ip netns exec "${alice_ns}" ping "${family_flag}" -c 1 -W 1 "$(mpudp_it_t_ingress_addr "${family}" 1)" >/dev/null; then
+		mpudp_it_die "path 2 loss affected path 1"
+		return 1
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path 2 --family "${family}" --direction both
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" link --path 3 --family "${family}" down
+	if ip netns exec "${alice_ns}" ping "${family_flag}" -c 1 -W 1 "$(mpudp_it_t_ingress_addr "${family}" 3)" >/dev/null 2>&1; then
+		mpudp_it_die "link-down path 3 still passed traffic"
+		return 1
+	fi
+	if ! ip netns exec "${alice_ns}" ping "${family_flag}" -c 1 -W 1 "$(mpudp_it_t_ingress_addr "${family}" 4)" >/dev/null; then
+		mpudp_it_die "path 3 link-down affected path 4"
+		return 1
+	fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" link --path 3 --family "${family}" up
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 5 --family "${family}" --value "${minimum}"
+	for target in \
+		"${alice_ns}:$(mpudp_it_alice_if "${family}" 5)" \
+		"${t5_ns}:$(mpudp_it_t_in_if "${family}")" \
+		"${t5_ns}:$(mpudp_it_t_out_if "${family}")" \
+		"$(mpudp_it_ns bob):$(mpudp_it_bob_if "${family}" 5)"; do
+		namespace=${target%%:*}; interface=${target#*:}
+		got=$(ip -n "${namespace}" -o link show dev "${interface}" | awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')
+		if [[ ${got} != "${minimum}" ]]; then mpudp_it_die "${namespace}/${interface} MTU=${got}, want ${minimum}"; return 1; fi
+	done
+	other_mtu=$(ip -n "${alice_ns}" -o link show dev "$(mpudp_it_alice_if "${family}" 4)" | awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')
+	if [[ ${other_mtu} != 1500 ]]; then mpudp_it_die "path 5 MTU changed path 4"; return 1; fi
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu --path 5 --family "${family}" --value 1500
+
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	drop_target=$(mpudp_it_target "${family}" 1)
+	drop_server_events=${MPUDP_IT_STATE_DIR}/${case_name}-drop-server.ndjson
+	drop_client_events=${MPUDP_IT_STATE_DIR}/${case_name}-drop-client.ndjson
+	drop_ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-drop.ready
+	drop_server_log=${MPUDP_IT_STATE_DIR}/${case_name}-drop-server.log
+	drop_blocked_log=${MPUDP_IT_STATE_DIR}/${case_name}-drop-blocked.log
+	drop_allowed_log=${MPUDP_IT_STATE_DIR}/${case_name}-drop-allowed.log
+	: >"${drop_server_events}"; : >"${drop_client_events}"; : >"${drop_server_log}"
+	: >"${drop_blocked_log}"; : >"${drop_allowed_log}"; rm -f -- "${drop_ready_file}"
+	timeout --signal=TERM --kill-after=2s 8s \
+		ip netns exec "$(mpudp_it_ns bob)" "${netprobe}" \
+		--mode server --network "${network}" --listen "${listen_address}" --count 1 \
+		--timeout 6s --run-id "${MPUDP_IT_RUN_ID}" --events "${drop_server_events}" --ready-file "${drop_ready_file}" \
+		>"${drop_server_log}" 2>&1 &
+	drop_server_pid=$!
+	mpudp_it_record_pid "${drop_server_pid}"
+	if ! wait_ready "${drop_ready_file}" "${drop_server_pid}"; then
+		mpudp_it_die "Bob drop-match probe did not become ready; see ${drop_server_log}"
+		return 1
+	fi
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path 1 --family "${family}" --offset 0 --hex 6d707564
+	if ! ip netns exec "${t1_ns}" nft list chain "${nft_family}" "${table}" forward | grep mpudp-drop-0-6d707564 >/dev/null; then
+		mpudp_it_die "precise payload drop rule was not installed"
+		return 1
+	fi
+	if timeout --signal=TERM --kill-after=1s 3s \
+		ip netns exec "${alice_ns}" "${netprobe}" \
+		--mode client --network "${network}" --targets "${drop_target}" --timeout 1s \
+		--run-id "${MPUDP_IT_RUN_ID}" --events "${drop_client_events}" >"${drop_blocked_log}" 2>&1; then
+		mpudp_it_die "payload-matched datagram unexpectedly crossed path 1"
+		return 1
+	fi
+	assert_counter_at_least "${t1_ns}" "${nft_family}" "${table}" mpudp-drop-0-6d707564 1
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path 1 --family "${family}"
+	if ! timeout --signal=TERM --kill-after=1s 4s \
+		ip netns exec "${alice_ns}" "${netprobe}" \
+		--mode client --network "${network}" --targets "${drop_target}" --timeout 3s \
+		--run-id "${MPUDP_IT_RUN_ID}" --events "${drop_client_events}" >"${drop_allowed_log}" 2>&1; then
+		mpudp_it_die "datagram did not recover after clearing the payload match; see ${drop_allowed_log}"
+		return 1
+	fi
+	set +e
+	wait "${drop_server_pid}"
+	drop_server_status=$?
+	set -e
+	if (( drop_server_status != 0 )); then
+		mpudp_it_die "Bob drop-match probe exited ${drop_server_status}; see ${drop_server_log}"
+		return 1
+	fi
+	if [[ $(awk 'END {print NR}' "${drop_server_events}") != 1 || $(awk 'END {print NR}' "${drop_client_events}") != 1 ]]; then
+		mpudp_it_die "drop-match behavioral event count is not 1 server + 1 client"
+		return 1
+	fi
+
+	cleanup_controls
+	trap - RETURN
+	mpudp_it_log "case passed: ${case_name} (delay/loss/reorder/link/MTU/drop controls isolated)"
+}
+
+run_nat_rebinding_trigger() {
+	local family=$1 network listen_address alice_ns bob_ns target
+	local server_events client_events ready_file server_log client_log server_pid server_status
+	build_netprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	if [[ ${family} == 4 ]]; then
+		network=udp4; listen_address=0.0.0.0:9000
+	else
+		network=udp6; listen_address='[::]:9000'
+	fi
+	target=$(mpudp_it_target "${family}" 1)
+	server_events=${MPUDP_IT_STATE_DIR}/${case_name}-server.ndjson
+	client_events=${MPUDP_IT_STATE_DIR}/${case_name}-client.ndjson
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	server_log=${MPUDP_IT_STATE_DIR}/${case_name}-server.log
+	client_log=${MPUDP_IT_STATE_DIR}/${case_name}-client.log
+	: >"${server_events}"; : >"${client_events}"; : >"${server_log}"; : >"${client_log}"
+	rm -f -- "${ready_file}"
+
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${bob_ns}" "${netprobe}" \
+		--mode server --network "${network}" --listen "${listen_address}" --count 2 \
+		--require-unique-remotes --timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${server_events}" --ready-file "${ready_file}" >"${server_log}" 2>&1 &
+	server_pid=$!
+	mpudp_it_record_pid "${server_pid}"
+	if ! wait_ready "${ready_file}" "${server_pid}"; then
+		mpudp_it_die "Bob rebinding netprobe did not become ready"
+		return 1
+	fi
+	for source_port in 41001 41002; do
+		if ! timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+			ip netns exec "${alice_ns}" "${netprobe}" \
+			--mode client --network "${network}" --targets "${target}" --local-port-base "${source_port}" \
+			--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" --events "${client_events}" \
+			>>"${client_log}" 2>&1; then
+			mpudp_it_die "Alice rebinding client failed at source port ${source_port}"
+			return 1
+		fi
+	done
+	set +e
+	wait "${server_pid}"
+	server_status=$?
+	set -e
+	if (( server_status != 0 )); then
+		mpudp_it_die "Bob did not observe two distinct NAT endpoints; see ${server_log}"
+		return 1
+	fi
+	if [[ $(awk 'END {print NR}' "${server_events}") != 2 || $(awk 'END {print NR}' "${client_events}") != 2 ]]; then
+		mpudp_it_die "rebinding event count is not 2 server + 2 client"
+		return 1
+	fi
+	sed -n 'p' "${server_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	sed -n 'p' "${client_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (source ports 41001 -> 41002 produced distinct NAT endpoints)"
+}
+
+rs_marker() {
+	printf '%s/%s\n' "${rs_sync_dir}" "$1"
+}
+
+rs_step_marker() {
+	printf '%s/step-%02d-%s\n' "${rs_sync_dir}" "$1" "$2"
+}
+
+assert_rs_carrier_sockets() {
+	local expected=$1 family=$2 alice_ns socket_count unique_count path address
+	alice_ns=$(mpudp_it_ns alice)
+	rs_socket_start=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets-start.log
+	ip netns exec "${alice_ns}" ss -H -u -n -p >"${rs_socket_start}"
+	socket_count=$(awk '$4 ~ /:4000$/ {count++} END {print count+0}' "${rs_socket_start}")
+	unique_count=$(awk '$4 ~ /:4000$/ {print $3}' "${rs_socket_start}" | sort -u | awk 'END {print NR}')
+	if [[ ${socket_count} != "${expected}" || ${unique_count} != "${expected}" ]]; then
+		mpudp_it_die "Alice Carrier sockets=${socket_count}, unique local identities=${unique_count}, want ${expected}/${expected}"
+		return 1
+	fi
+	for (( path=1; path<=expected; path++ )); do
+		address=$(mpudp_it_t_ingress_addr "${family}" "${path}")
+		if ! grep -F "${address}" "${rs_socket_start}" | grep ':4000' >/dev/null; then
+			mpudp_it_die "Alice has no connected Carrier socket for T${path} ${address}:4000"
+			return 1
+		fi
+	done
+}
+
+rs_record_fault() {
+	local event_name=$1 fault=$2 step=${3:-0}
+	printf '{"event":"%s","fault":"%s","step":%s,"run_id":"%s","scenario":"%s"}\n' \
+		"${event_name}" "${fault}" "${step}" "${MPUDP_IT_RUN_ID}" "${case_name}" >>"${rs_fault_events}"
+}
+
+start_rs_peer_pair() {
+	local carrier_count=$1 family=4 alice_ns bob_ns listen_address targets path attempt all_ready current
+	local -a control_before=() data_before=()
+	build_rspeerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	targets=$(mpudp_it_join_targets "${family}")
+	if (( carrier_count == 2 )); then
+		targets="$(mpudp_it_target "${family}" 1),$(mpudp_it_target "${family}" 2)"
+	fi
+	rs_sync_dir=${MPUDP_IT_STATE_DIR}/${case_name}-sync
+	rs_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-bob.ndjson
+	rs_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-alice.ndjson
+	rs_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-bob.log
+	rs_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-alice.log
+	rs_fault_events=${MPUDP_IT_STATE_DIR}/${case_name}-faults.ndjson
+	rs_network_mutation_file=${MPUDP_IT_STATE_DIR}/rs-network.mutations
+	install -d -m 0700 "${rs_sync_dir}"
+	: >"${rs_listener_log}"
+	: >"${rs_initiator_log}"
+	: >"${rs_fault_events}"
+	: >"${rs_network_mutation_file}"
+	snapshot_path_counters "${family}" mpudp-reverse-control
+	control_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-forward-data
+	data_before=("${path_counter_snapshot[@]}")
+
+	ip netns exec "${bob_ns}" "${rspeerprobe}" \
+		--role listener --scenario "${case_name}" --family "${family}" --listen "${listen_address}" \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${rs_listener_events}" --sync-dir "${rs_sync_dir}" >"${rs_listener_log}" 2>&1 &
+	rs_listener_pid=$!
+	mpudp_it_record_pid "${rs_listener_pid}"
+	if ! wait_ready "$(rs_marker listener-ready)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} Bob public Peer did not bind; see ${rs_listener_log}"
+		return 1
+	fi
+	ip netns exec "${alice_ns}" "${rspeerprobe}" \
+		--role initiator --scenario "${case_name}" --family "${family}" --carriers "${targets}" \
+		--timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}" \
+		--events "${rs_initiator_events}" --sync-dir "${rs_sync_dir}" >"${rs_initiator_log}" 2>&1 &
+	rs_initiator_pid=$!
+	mpudp_it_record_pid "${rs_initiator_pid}"
+
+	all_ready=0
+	for attempt in $(seq 1 100); do
+		all_ready=1
+		for (( path=1; path<=carrier_count; path++ )); do
+			current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-reverse-control)
+			if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= control_before[$((path - 1))] )); then
+				all_ready=0
+			fi
+		done
+		if (( all_ready != 0 )); then break; fi
+		if ! kill -0 "${rs_initiator_pid}" 2>/dev/null || ! kill -0 "${rs_listener_pid}" 2>/dev/null; then break; fi
+		sleep 0.05
+	done
+	if (( all_ready == 0 )); then
+		mpudp_it_die "${case_name} did not authenticate all ${carrier_count} real Carriers"
+		return 1
+	fi
+	if ! wait_ready "$(rs_marker handshake-complete)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} public bootstrap failed; see ${rs_initiator_log}"
+		return 1
+	fi
+	printf 'warmup\n' >"$(rs_marker warmup-go)"
+	if ! wait_ready "$(rs_marker scenario-ready)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} public warmup failed; see ${rs_initiator_log}"
+		return 1
+	fi
+	assert_rs_carrier_sockets "${carrier_count}" "${family}"
+	for (( path=1; path<=carrier_count; path++ )); do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-forward-data)
+		if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= data_before[$((path - 1))] )); then
+			mpudp_it_die "${case_name} warmup did not traverse real Carrier T${path}"
+			return 1
+		fi
+	done
+	snapshot_path_counters "${family}" mpudp-forward-data
+	rs_data_start=("${path_counter_snapshot[@]}")
+	rs_expected_data=(0 0 0 0 0)
+	snapshot_path_counters "${family}" mpudp-reverse
+	rs_reverse_start=("${path_counter_snapshot[@]}")
+}
+
+rs_add_expected_data() {
+	local path
+	local -a increments=("$@")
+	if (( ${#increments[@]} != 5 )); then
+		mpudp_it_die "RS DATA expectation requires five path increments"
+		return 2
+	fi
+	for path in 1 2 3 4 5; do
+		rs_expected_data[$((path - 1))]=$((rs_expected_data[$((path - 1))] + increments[$((path - 1))]))
+	done
+}
+
+rs_wait_expected_data() {
+	local attempt path current expected all_exact
+	for attempt in $(seq 1 100); do
+		all_exact=1
+		for path in 1 2 3 4 5; do
+			current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-forward-data)
+			expected=$((rs_data_start[$((path - 1))] + rs_expected_data[$((path - 1))]))
+			if [[ ! ${current} =~ ^[0-9]+$ ]]; then
+				mpudp_it_die "${case_name} T${path} DATA counter is unavailable"
+				return 1
+		fi
+			if (( current > expected )); then
+				mpudp_it_die "${case_name} T${path} DATA counter=${current}, want ${expected}; duplicate or retransmit observed"
+				return 1
+		fi
+			if (( current != expected )); then all_exact=0; fi
+		done
+		if (( all_exact != 0 )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "${case_name} real Carrier DATA counters did not reach the expected totals"
+	return 1
+}
+
+rs_wait_drop_count() {
+	local path=$1 offset=$2 hex_value=$3 expected=$4 attempt current comment
+	comment=mpudp-drop-${offset}-${hex_value}
+	for attempt in $(seq 1 100); do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" "${comment}")
+		if [[ ! ${current} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "${case_name} T${path} ${comment} counter is unavailable"
+			return 1
+		fi
+		if (( current > expected )); then
+			mpudp_it_die "${case_name} T${path} ${comment} counter=${current}, want ${expected}; retransmit observed"
+			return 1
+		fi
+		if (( current == expected )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "${case_name} T${path} ${comment} counter=${current}, want ${expected}"
+	return 1
+}
+
+rs_release_step() {
+	local step=$1 outcome=$2 marker_file
+	printf 'send\n' >"$(rs_step_marker "${step}" go)"
+	if ! wait_ready "$(rs_step_marker "${step}" sent)" "${rs_initiator_pid}"; then
+		mpudp_it_die "${case_name} initiator did not send step ${step}; see ${rs_initiator_log}"
+		return 1
+	fi
+	marker_file=$(rs_step_marker "${step}" "${outcome}")
+	if ! wait_ready "${marker_file}" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} listener did not report ${outcome} for step ${step}; see ${rs_listener_log}"
+		return 1
+	fi
+}
+
+rs_clear_drop_paths() {
+	local path t_ns
+	for path in "$@"; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path "${path}" --family 4
+		t_ns=$(mpudp_it_ns "t${path}")
+		if ip netns exec "${t_ns}" nft list chain ip "${MPUDP_IT_TABLE4}" forward |
+			awk '/comment "mpudp-drop-/ {found=1} END {exit !found}'; then
+			mpudp_it_die "${case_name} failed to clear the T${path} shard drop"
+			return 1
+		fi
+	done
+}
+
+rs_assert_no_reverse_traffic() {
+	local path current
+	for path in 1 2 3 4 5; do
+		current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" ip "${MPUDP_IT_TABLE4}" mpudp-reverse)
+		if [[ ${current:-missing} != "${rs_reverse_start[$((path - 1))]}" ]]; then
+			mpudp_it_die "${case_name} emitted reverse UDP on T${path}; DATA ACK/response behavior is forbidden"
+			return 1
+		fi
+	done
+}
+
+finish_rs_peer_pair() {
+	local initiator_status listener_status completion_count alice_ns socket_end socket_diff
+	if ! wait_ready "$(rs_marker initiator-complete)" "${rs_initiator_pid}" ||
+		! wait_ready "$(rs_marker listener-complete)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} helpers did not complete; see ${rs_listener_log} and ${rs_initiator_log}"
+		return 1
+	fi
+	rs_wait_expected_data
+	rs_assert_no_reverse_traffic
+	alice_ns=$(mpudp_it_ns alice)
+	socket_end=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets-end.log
+	socket_diff=${MPUDP_IT_STATE_DIR}/${case_name}-alice-sockets.diff
+	ip netns exec "${alice_ns}" ss -H -u -n -p >"${socket_end}"
+	assert_socket_snapshots_equal "${rs_socket_start}" "${socket_end}" "${socket_diff}"
+	printf 'finish\n' >"$(rs_marker finish)"
+	set +e
+	wait "${rs_initiator_pid}"
+	initiator_status=$?
+	if (( initiator_status != 0 )) && kill -0 "${rs_listener_pid}" 2>/dev/null; then kill -TERM "${rs_listener_pid}" 2>/dev/null || true; fi
+	wait "${rs_listener_pid}"
+	listener_status=$?
+	set -e
+	if (( initiator_status != 0 || listener_status != 0 )); then
+		mpudp_it_die "${case_name} public helpers exited ${initiator_status}/${listener_status}; see ${rs_listener_log} and ${rs_initiator_log}"
+		return 1
+	fi
+	if grep -Fqi 'integration-test-key' "${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}" ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}"; then
+		mpudp_it_die "${case_name} event metadata contains a forbidden sensitive field"
+		return 1
+	fi
+	completion_count=$(grep -h -c '"event":"scenario_complete"' "${rs_listener_events}" "${rs_initiator_events}" |
+		awk '{total += $1} END {print total+0}')
+	if [[ ${completion_count} != 2 ]]; then
+		mpudp_it_die "${case_name} completion event count=${completion_count}, want 2"
+		return 1
+	fi
+	sed -n 'p' "${rs_listener_events}" "${rs_initiator_events}" "${rs_fault_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+}
+
+run_rs_five_carrier_loss() {
+	local step=0 packet_id first_shard second_shard first_path second_path delayed_path shard_hex
+	local -a combinations=('0 1' '0 2' '0 3' '0 4' '1 2' '1 3' '1 4' '2 3' '2 4' '3 4')
+	start_rs_peer_pair 5
+	for combination in "${combinations[@]}"; do
+		step=$((step + 1))
+		packet_id=$((step + 1))
+		read -r first_shard second_shard <<<"${combination}"
+		first_path=$(( (packet_id + first_shard) % 5 + 1 ))
+		second_path=$(( (packet_id + second_shard) % 5 + 1 ))
+		printf -v shard_hex '%02x' "${first_shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${first_path}" --family 4 --offset 34 --hex "${shard_hex}"
+		printf -v shard_hex '%02x' "${second_shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${second_path}" --family 4 --offset 34 --hex "${shard_hex}"
+		rs_record_fault fault_applied "drop-shards-${first_shard}-${second_shard}" "${step}"
+		increments=(1 1 1 1 1)
+		increments[$((first_path - 1))]=0
+		increments[$((second_path - 1))]=0
+		rs_add_expected_data "${increments[@]}"
+		rs_release_step "${step}" received
+		rs_wait_expected_data
+		printf -v shard_hex '%02x' "${first_shard}"
+		rs_wait_drop_count "${first_path}" 34 "${shard_hex}" 1
+		printf -v shard_hex '%02x' "${second_shard}"
+		rs_wait_drop_count "${second_path}" 34 "${shard_hex}" 1
+		rs_record_fault fault_observed "three-real-shards-delivered-once" "${step}"
+		rs_clear_drop_paths "${first_path}" "${second_path}"
+		rs_record_fault fault_cleared "drop-shards-${first_shard}-${second_shard}" "${step}"
+	done
+
+	step=11
+	packet_id=$((step + 1))
+	three_loss_paths=()
+	for shard in 0 1 2; do
+		path=$(( (packet_id + shard) % 5 + 1 ))
+		three_loss_paths+=("${path}")
+		printf -v shard_hex '%02x' "${shard}"
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${path}" --family 4 --offset 34 --hex "${shard_hex}"
+	done
+	rs_record_fault fault_applied drop-shards-0-1-2 "${step}"
+	increments=(1 1 1 1 1)
+	for path in "${three_loss_paths[@]}"; do increments[$((path - 1))]=0; done
+	rs_add_expected_data "${increments[@]}"
+	rs_release_step "${step}" quiet
+	rs_wait_expected_data
+	for shard in 0 1 2; do
+		path=$(( (packet_id + shard) % 5 + 1 ))
+		printf -v shard_hex '%02x' "${shard}"
+		rs_wait_drop_count "${path}" 34 "${shard_hex}" 1
+	done
+	rs_record_fault fault_observed three-loss-expired-without-delivery "${step}"
+	rs_clear_drop_paths "${three_loss_paths[@]}"
+	rs_record_fault fault_cleared drop-shards-0-1-2 "${step}"
+
+	step=12
+	packet_id=$((step + 1))
+	first_shard=0
+	second_shard=1
+	first_path=$(( (packet_id + first_shard) % 5 + 1 ))
+	second_path=$(( (packet_id + second_shard) % 5 + 1 ))
+	delayed_path=$(( (packet_id + 2) % 5 + 1 ))
+	printf -v shard_hex '%02x' "${first_shard}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${first_path}" --family 4 --offset 34 --hex "${shard_hex}"
+	printf -v shard_hex '%02x' "${second_shard}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${second_path}" --family 4 --offset 34 --hex "${shard_hex}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path "${delayed_path}" --family 4 --direction forward --delay 600ms
+	assert_rs_netem "${delayed_path}" 'delay (600ms|600\.0ms)'
+	rs_record_fault fault_applied two-shards-dropped-third-arrives-after-decode-timeout "${step}"
+	increments=(1 1 1 1 1)
+	increments[$((first_path - 1))]=0
+	increments[$((second_path - 1))]=0
+	rs_add_expected_data "${increments[@]}"
+	rs_release_step "${step}" quiet
+	rs_wait_expected_data
+	printf -v shard_hex '%02x' "${first_shard}"
+	rs_wait_drop_count "${first_path}" 34 "${shard_hex}" 1
+	printf -v shard_hex '%02x' "${second_shard}"
+	rs_wait_drop_count "${second_path}" 34 "${shard_hex}" 1
+	rs_record_fault fault_observed late-third-shard-did-not-revive-expired-block "${step}"
+	rs_clear_drop_paths "${first_path}" "${second_path}"
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path "${delayed_path}" --family 4 --direction forward
+	rs_record_fault fault_cleared two-shards-dropped-third-arrives-after-decode-timeout "${step}"
+
+	rs_add_expected_data 1 1 1 1 1
+	rs_release_step 13 received
+	rs_wait_expected_data
+	rs_record_fault fault_observed same-session-recovered-after-expiry 13
+	cleanup_rs_network_mutations
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public Peer, five real Carriers, all ten two-shard losses, three-loss expiry, no DATA response/retry)"
+}
+
+run_rs_two_carrier_rotation() {
+	local step
+	start_rs_peer_pair 2
+	for step in 1 2 3 4; do
+		if (( step % 2 == 1 )); then
+			rs_add_expected_data 3 2 0 0 0
+		else
+			rs_add_expected_data 2 3 0 0 0
+		fi
+		rs_release_step "${step}" received
+		rs_wait_expected_data
+		rs_record_fault rotation_observed "real-carrier-3-2-step-${step}" "${step}"
+	done
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path 2 --family 4 --offset 5 --hex 03
+	rs_record_fault fault_applied drop-two-shard-carrier 5
+	rs_add_expected_data 3 0 0 0 0
+	rs_release_step 5 received
+	rs_wait_expected_data
+	rs_wait_drop_count 2 5 03 2
+	rs_record_fault fault_observed two-shard-carrier-loss-recovered 5
+	rs_clear_drop_paths 2
+	rs_record_fault fault_cleared drop-two-shard-carrier 5
+
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path 2 --family 4 --offset 5 --hex 03
+	rs_record_fault fault_applied drop-three-shard-carrier 6
+	rs_add_expected_data 2 0 0 0 0
+	rs_release_step 6 quiet
+	rs_wait_expected_data
+	rs_wait_drop_count 2 5 03 3
+	rs_record_fault fault_observed three-shard-carrier-loss-expired 6
+	rs_clear_drop_paths 2
+	rs_record_fault fault_cleared drop-three-shard-carrier 6
+
+	rs_add_expected_data 3 2 0 0 0
+	rs_release_step 7 received
+	rs_wait_expected_data
+	rs_record_fault fault_observed same-session-recovered-after-loss 7
+	cleanup_rs_network_mutations
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public Peer, two real Carriers, observed 3/2 rotation and both loss boundaries)"
+}
+
+assert_rs_netem() {
+	local path=$1 pattern=$2 namespace interface rendered
+	namespace=$(mpudp_it_ns alice)
+	interface=$(mpudp_it_alice_if 4 "${path}")
+	rendered=$(ip netns exec "${namespace}" tc qdisc show dev "${interface}")
+	if [[ ! ${rendered} =~ ${pattern} ]]; then
+		mpudp_it_die "${case_name} T${path} netem does not match ${pattern}: ${rendered}"
+		return 1
+	fi
+}
+
+rs_forward_drop_count() {
+	local path=$1 namespace interface
+	namespace=$(mpudp_it_ns alice)
+	interface=$(mpudp_it_alice_if 4 "${path}")
+	ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+		awk '/ Sent / {for (i=1; i<=NF; i++) if ($i == "(dropped") {value=$(i+1); sub(/,$/, "", value); print value; exit}}'
+}
+
+run_rs_slow_path() {
+	local wire_length=241 delivery_ns path1_ns path3_ns path4_ns path5_ns drop_count line_count
+	local -a fragment_pids=() fragment_event_files=() fragment_log_files=()
+	local -a udp_pids=() udp_event_files=() udp_log_files=()
+	start_rs_peer_pair 5
+	start_udp_observers 4 forward rs-network
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 3 --family 4 --direction forward --delay 10ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 4 --family 4 --direction forward --delay 20ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 5 --family 4 --direction forward --delay 30ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 1 --family 4 --direction forward --delay 500ms
+	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path 2 --family 4 --direction forward --loss 100%
+	assert_rs_netem 3 'delay (10ms|10\.0ms)'
+	assert_rs_netem 4 'delay (20ms|20\.0ms)'
+	assert_rs_netem 5 'delay (30ms|30\.0ms)'
+	assert_rs_netem 1 'delay (500ms|500\.0ms)'
+	assert_rs_netem 2 'loss 100%'
+	rs_record_fault fault_applied real-arrivals-10-20-30-500-drop 1
+	rs_add_expected_data 1 0 1 1 1
+	rs_release_step 1 received
+	if ! wait_ready "$(rs_marker listener-complete)" "${rs_listener_pid}"; then
+		mpudp_it_die "${case_name} listener did not finish its late-shard duplicate check"
+		return 1
+	fi
+	rs_wait_expected_data
+	drop_count=$(rs_forward_drop_count 2)
+	if [[ ! ${drop_count} =~ ^[0-9]+$ ]] || (( drop_count < 1 )); then
+		mpudp_it_die "${case_name} path 2 did not observe the configured dropped shard"
+		return 1
+	fi
+	stop_udp_observers || { mpudp_it_die "${case_name} UDP observers exited unexpectedly"; return 1; }
+	assert_udp_observation_lossless
+	for path in 1 3 4 5; do
+		line_count=$(grep -c "UDP, length ${wire_length}$" "${udp_event_files[$((path - 1))]}" || true)
+		if [[ ${line_count} != 1 ]]; then
+			mpudp_it_die "${case_name} T${path} scenario shard observations=${line_count}, want 1"
+			return 1
+		fi
+	done
+	if grep -q "UDP, length ${wire_length}$" "${udp_event_files[1]}"; then
+		mpudp_it_die "${case_name} observed the shard configured for 100% loss"
+		return 1
+	fi
+	path1_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[0]}")
+	path3_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[2]}")
+	path4_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[3]}")
+	path5_ns=$(awk -v wanted="${wire_length}" '$0 ~ "UDP, length " wanted "$" {printf "%.0f\n", $1 * 1000000000; exit}' "${udp_event_files[4]}")
+	delivery_ns=$(sed -n 's/.*"event":"datagram_received","step":1.*"observed_unix_nano":\([0-9][0-9]*\).*/\1/p' "${rs_listener_events}" | sed -n '1p')
+	for observed in "${path1_ns}" "${path3_ns}" "${path4_ns}" "${path5_ns}" "${delivery_ns}"; do
+		if [[ ! ${observed} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "${case_name} is missing a comparable wire/delivery timestamp: p1=${path1_ns:-missing} p3=${path3_ns:-missing} p4=${path4_ns:-missing} p5=${path5_ns:-missing} delivery=${delivery_ns:-missing}"
+			return 1
+		fi
+	done
+	if ! awk -v first="${path3_ns}" -v second="${path4_ns}" -v third="${path5_ns}" \
+		-v delivered="${delivery_ns}" -v late="${path1_ns}" \
+		'BEGIN {exit !(first < second && second < third && third <= delivered && delivered < late)}'; then
+		mpudp_it_die "${case_name} order=${path3_ns},${path4_ns},${path5_ns},delivery:${delivery_ns},late:${path1_ns}"
+		return 1
+	fi
+	rs_record_fault fault_observed third-shard-delivery-before-500ms-shard 1
+	cleanup_rs_network_mutations
+	rs_record_fault fault_cleared real-arrivals-10-20-30-500-drop 1
+	finish_rs_peer_pair
+	mpudp_it_log "case passed: ${case_name} (public delivery followed real 10/20/30ms shards, preceded 500ms shard, ignored late/lost shards)"
+}
+
+run_rs_network_scenario() {
+	case ${case_name} in
+		rs53-five-carrier-loss) run_rs_five_carrier_loss ;;
+		rs53-two-carrier-rotation) run_rs_two_carrier_rotation ;;
+		slow-path-early-recovery) run_rs_slow_path ;;
+		*) mpudp_it_die "unsupported RS network scenario ${case_name}"; return 2 ;;
+	esac
+}
+
+assert_counter_delta_at_least() {
+	local namespace=$1 nft_family=$2 table=$3 comment=$4 baseline=$5 minimum_delta=$6 value delta
+	value=$(counter_for_comment "${namespace}" "${nft_family}" "${table}" "${comment}")
+	if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+		mpudp_it_die "${namespace} ${comment} counter is missing"
+		return 1
+	fi
+	delta=$((value - baseline))
+	if (( delta < minimum_delta )); then
+		mpudp_it_die "${namespace} ${comment} delta=${delta}, want >=${minimum_delta}"
+		return 1
+	fi
+}
+
+run_peer_auth_pollution() {
+	local family=$1 alice_ns bob_ns listen_address target targets table nft_family path kind
+	local listener_events attacker_events client_events listener_log attacker_log client_log
+	local ready_file attack_done_file checked_file reply_complete_file exit_file final_file
+	local listener_pid client_pid listener_status client_status
+	local -a path_counter_snapshot=() forward_before=() reverse_before=() legit_forward_before=() legit_reverse_before=()
+	build_pollutionprobe
+	build_peerprobe
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	target=$(mpudp_it_target "${family}" 1)
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-listener.ndjson
+	attacker_events=${MPUDP_IT_STATE_DIR}/${case_name}-attacker.ndjson
+	client_events=${MPUDP_IT_STATE_DIR}/${case_name}-legitimate.ndjson
+	listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-listener.log
+	attacker_log=${MPUDP_IT_STATE_DIR}/${case_name}-attacker.log
+	client_log=${MPUDP_IT_STATE_DIR}/${case_name}-legitimate.log
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	attack_done_file=${MPUDP_IT_STATE_DIR}/${case_name}.attack-done
+	checked_file=${MPUDP_IT_STATE_DIR}/${case_name}.checked
+	reply_complete_file=${MPUDP_IT_STATE_DIR}/${case_name}.reply-complete
+	exit_file=${MPUDP_IT_STATE_DIR}/${case_name}.exit
+	final_file=${MPUDP_IT_STATE_DIR}/${case_name}.final
+	rm -f -- "${ready_file}" "${attack_done_file}" "${checked_file}" "${reply_complete_file}" "${exit_file}" "${final_file}"
+	: >"${listener_log}"
+	: >"${attacker_log}"
+	: >"${client_log}"
+
+	snapshot_path_counters "${family}" mpudp-forward
+	forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse
+	reverse_before=("${path_counter_snapshot[@]}")
+	ip netns exec "${bob_ns}" "${pollutionprobe}" \
+		--role listener --family "${family}" --listen "${listen_address}" --max-udp-payload 1200 \
+		--high-sources 128 --body-bytes 512 --reply-bytes 257 --timeout "${case_timeout}s" \
+		--run-id "${MPUDP_IT_RUN_ID}" --events "${listener_events}" --ready-file "${ready_file}" \
+		--attack-done-file "${attack_done_file}" --checked-file "${checked_file}" \
+		--reply-complete-file "${reply_complete_file}" --exit-file "${exit_file}" --final-file "${final_file}" \
+		>"${listener_log}" 2>&1 &
+	listener_pid=$!
+	mpudp_it_record_pid "${listener_pid}"
+	if ! wait_ready "${ready_file}" "${listener_pid}"; then
+		mpudp_it_die "pollution listener did not become ready; see ${listener_log}"
+		return 1
+	fi
+
+	if ! timeout --signal=TERM --kill-after=2s 12s \
+		ip netns exec "${alice_ns}" "${pollutionprobe}" \
+			--role attacker --family "${family}" --target "${target}" --max-udp-payload 1200 \
+			--high-sources 128 --timeout 10s --run-id "${MPUDP_IT_RUN_ID}" --events "${attacker_events}" \
+			>"${attacker_log}" 2>&1; then
+		mpudp_it_die "pollution attack probe failed; see ${attacker_log}"
+		return 1
+	fi
+	assert_counter_delta_at_least "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-forward "${forward_before[0]}" 134
+	assert_counter_equal "$(mpudp_it_ns t1)" "${nft_family}" "${table}" mpudp-reverse "$((reverse_before[0] + 1))"
+	for path in 2 3 4 5; do
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward "${forward_before[$((path - 1))]}"
+		assert_counter_equal "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse "${reverse_before[$((path - 1))]}"
+	done
+	grep -q '"event":"processing_barrier_complete".*"responses":1' "${attacker_events}" || {
+		mpudp_it_die "authenticated processing barrier response is missing"
+		return 1
+	}
+	printf 'done\n' >"${attack_done_file}"
+	if ! wait_ready "${checked_file}" "${listener_pid}"; then
+		mpudp_it_die "listener did not prove clean state after attacks; see ${listener_log}"
+		return 1
+	fi
+	grep -q '"event":"processing_barrier_drained".*"sessions":0' "${listener_events}" || {
+		mpudp_it_die "listener did not drain the authenticated processing barrier"
+		return 1
+	}
+	for kind in wrong-psk single-bit-tamper forged-session-id malformed oversized; do
+		grep -q "\"event\":\"attack_class_complete\".*\"packets\":1.*\"phase\":\"${kind}\".*\"responses\":0" \
+			"${attacker_events}" || { mpudp_it_die "missing zero-response evidence for ${kind}"; return 1; }
+	done
+	grep -q '"event":"attack_class_complete".*"packets":128.*"phase":"high-cardinality".*"responses":0' \
+		"${attacker_events}" || { mpudp_it_die "missing high-cardinality zero-response evidence"; return 1; }
+	grep -q '"event":"attack_batch_complete".*"packets":133.*"responses":0.*"unique_sources":133' \
+		"${attacker_events}" || { mpudp_it_die "attack batch did not retain 133 unique zero-response sources"; return 1; }
+	grep -q '"event":"pollution_state_clean".*"sessions":0' "${listener_events}" || {
+		mpudp_it_die "listener did not record bounded zero-Session state"
+		return 1
+	}
+
+	snapshot_path_counters "${family}" mpudp-forward-data
+	legit_forward_before=("${path_counter_snapshot[@]}")
+	snapshot_path_counters "${family}" mpudp-reverse-data
+	legit_reverse_before=("${path_counter_snapshot[@]}")
+	targets=$(mpudp_it_join_targets "${family}")
+	timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
+		ip netns exec "${alice_ns}" "${peerprobe}" \
+			--role initiator --flow pollution-live --family "${family}" --carriers "${targets}" \
+			--max-udp-payload 1200 --body-bytes 512 --reply-bytes 257 --timeout "${case_timeout}s" \
+			--run-id "${MPUDP_IT_RUN_ID}" --events "${client_events}" \
+			--reply-complete-file "${reply_complete_file}" --exit-file "${exit_file}" --final-file "${final_file}" \
+			>"${client_log}" 2>&1 &
+	client_pid=$!
+	mpudp_it_record_pid "${client_pid}"
+	if ! wait_ready "${exit_file}" "${client_pid}"; then
+		mpudp_it_die "legitimate client did not complete after pollution; see ${client_log}"
+		return 1
+	fi
+	printf 'finish\n' >"${final_file}"
+	set +e
+	wait "${client_pid}"
+	client_status=$?
+	if (( client_status != 0 )) && kill -0 "${listener_pid}" 2>/dev/null; then kill -TERM "${listener_pid}" 2>/dev/null || true; fi
+	wait "${listener_pid}"
+	listener_status=$?
+	set -e
+	if (( client_status != 0 || listener_status != 0 )); then
+		mpudp_it_die "post-pollution liveness process failure: client=${client_status} listener=${listener_status}; see ${client_log} and ${listener_log}"
+		return 1
+	fi
+	grep -q '"event":"legitimate_exchange_complete".*"received_bytes":512.*"reply_bytes":257' "${listener_events}" || {
+		mpudp_it_die "attacked listener did not complete the legitimate exchange"
+		return 1
+	}
+	grep -q '"event":"datagram_received","phase":"main","bytes":257' "${client_events}" || {
+		mpudp_it_die "legitimate client did not receive the post-attack reply"
+		return 1
+	}
+	for path in 1 2 3 4 5; do
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-forward-data "${legit_forward_before[$((path - 1))]}"
+		assert_counter_greater_than "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" \
+			mpudp-reverse-data "${legit_reverse_before[$((path - 1))]}"
+	done
+	if grep -Fqi 'integration-test-key' "${listener_events}" "${attacker_events}" "${client_events}" ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${listener_events}" "${attacker_events}" "${client_events}"; then
+		mpudp_it_die "pollution diagnostics contain a forbidden sensitive field"
+		return 1
+	fi
+	sed -n 'p' "${listener_events}" "${attacker_events}" "${client_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (six attack classes retained no state or responses; attacked Peer remained live)"
+}
+
+sum_path_counters() {
+	local family=$1 comment=$2 table nft_family path value total=0
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	for path in 1 2 3 4 5; do
+		value=$(counter_for_comment "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" "${comment}")
+		if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "T${path} ${comment} counter is missing"
+			return 1
+		fi
+		total=$((total + value))
+	done
+	printf '%s\n' "${total}"
+}
+
+assert_no_netem() {
+	local family=$1 path alice_ns bob_ns alice_if bob_if
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	for path in 1 2 3 4 5; do
+		alice_if=$(mpudp_it_alice_if "${family}" "${path}")
+		bob_if=$(mpudp_it_bob_if "${family}" "${path}")
+		if ip netns exec "${alice_ns}" tc qdisc show dev "${alice_if}" | grep ' netem ' >/dev/null ||
+			ip netns exec "${bob_ns}" tc qdisc show dev "${bob_if}" | grep ' netem ' >/dev/null; then
+			mpudp_it_die "netem residue remains on path ${path}"
+			return 1
+		fi
+	done
+}
+
+apply_shutdown_netem() {
+	local family=$1 direction=$2 kind=$3 value=$4 path
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" netem --path "${path}" --family "${family}" \
+			--direction "${direction}" "--${kind}" "${value}"
+	done
+}
+
+clear_shutdown_netem() {
+	local family=$1 direction=$2 path
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem --path "${path}" --family "${family}" \
+			--direction "${direction}"
+	done
+	assert_no_netem "${family}"
+}
+
+shutdown_forward_netem_total() {
+	local family=$1 metric=$2 path namespace interface value total=0
+	namespace=$(mpudp_it_ns alice)
+	for path in 1 2 3 4 5; do
+		interface=$(mpudp_it_alice_if "${family}" "${path}")
+		case ${metric} in
+			backlog)
+				value=$(ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+					awk '$1 == "backlog" {value=$3; sub(/p$/, "", value); print value; exit}')
+				;;
+			dropped)
+				value=$(ip netns exec "${namespace}" tc -s qdisc show dev "${interface}" |
+					awk '/ Sent / {for (i=1; i<=NF; i++) if ($i == "(dropped") {value=$(i+1); sub(/,$/, "", value); print value; exit}}')
+				;;
+			*) mpudp_it_die "unknown shutdown netem metric ${metric}"; return 2 ;;
+		esac
+		if [[ ! ${value} =~ ^[0-9]+$ ]]; then
+			mpudp_it_die "path ${path} shutdown netem ${metric} is unavailable"
+			return 1
+		fi
+		total=$((total + value))
+	done
+	printf '%s\n' "${total}"
+}
+
+wait_shutdown_netem_total() {
+	local family=$1 metric=$2 minimum=$3 attempt total
+	for attempt in $(seq 1 100); do
+		total=$(shutdown_forward_netem_total "${family}" "${metric}") || return 1
+		if (( total >= minimum )); then return 0; fi
+		sleep 0.02
+	done
+	mpudp_it_die "shutdown forward netem ${metric}=${total}, want >=${minimum}"
+	return 1
+}
+
+record_shutdown_fault() {
+	local event_name=$1 phase=$2 fault=$3
+	printf '{"event":"%s","fault":"%s","phase":"%s","run_id":"%s"}\n' \
+		"${event_name}" "${fault}" "${phase}" "${MPUDP_IT_RUN_ID}" >>"${shutdown_fault_events}"
+}
+
+start_shutdown_pair() {
+	local phase=$1 action=$2 family=$3 alice_ns bob_ns listen_address targets table nft_family path attempt all_ready current
+	local -a listener_args initiator_args path_counter_snapshot=() ack_before=()
+	alice_ns=$(mpudp_it_ns alice)
+	bob_ns=$(mpudp_it_ns bob)
+	listen_address=0.0.0.0:9000
+	if [[ ${family} == 6 ]]; then listen_address='[::]:9000'; fi
+	targets=$(mpudp_it_join_targets "${family}")
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+	if [[ ${phase} != handshake ]]; then
+		snapshot_path_counters "${family}" mpudp-reverse-control
+		ack_before=("${path_counter_snapshot[@]}")
+	fi
+	shutdown_listener_events=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-bob.ndjson
+	shutdown_initiator_events=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-alice.ndjson
+	shutdown_listener_log=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-bob.log
+	shutdown_initiator_log=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}-alice.log
+	shutdown_ready_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.ready
+	shutdown_listener_phase=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.bob-phase
+	shutdown_initiator_phase=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.alice-phase
+	shutdown_bootstrap_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.bootstrap
+	shutdown_send_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.send
+	shutdown_sent_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.sent
+	shutdown_close_file=${MPUDP_IT_STATE_DIR}/${case_name}-${phase}.close
+	rm -f -- "${shutdown_ready_file}" "${shutdown_listener_phase}" "${shutdown_initiator_phase}" \
+		"${shutdown_bootstrap_file}" "${shutdown_send_file}" "${shutdown_sent_file}" "${shutdown_close_file}"
+	: >"${shutdown_listener_log}"
+	: >"${shutdown_initiator_log}"
+	listener_args=(
+		--role listener --phase "${phase}" --action "${action}" --family "${family}" --listen "${listen_address}"
+		--body-bytes 1536 --timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}"
+		--events "${shutdown_listener_events}" --ready-file "${shutdown_ready_file}"
+		--phase-ready-file "${shutdown_listener_phase}"
+	)
+	initiator_args=(
+		--role initiator --phase "${phase}" --action "${action}" --family "${family}" --carriers "${targets}"
+		--body-bytes 1536 --timeout "${case_timeout}s" --run-id "${MPUDP_IT_RUN_ID}"
+		--events "${shutdown_initiator_events}" --phase-ready-file "${shutdown_initiator_phase}"
+	)
+	if [[ ${action} == close ]]; then
+		listener_args+=(--close-file "${shutdown_close_file}")
+		initiator_args+=(--close-file "${shutdown_close_file}")
+	fi
+	if [[ ${phase} == active-transfer || ${phase} == decode-incomplete || ${phase} == network-fault ]]; then
+		initiator_args+=(--send-file "${shutdown_send_file}" --sent-file "${shutdown_sent_file}")
+	fi
+	if [[ ${phase} != handshake ]]; then
+		initiator_args+=(--bootstrap-file "${shutdown_bootstrap_file}")
+	fi
+	ip netns exec "${bob_ns}" "${shutdownprobe}" "${listener_args[@]}" >"${shutdown_listener_log}" 2>&1 &
+	shutdown_listener_pid=$!
+	mpudp_it_record_pid "${shutdown_listener_pid}"
+	if ! wait_ready "${shutdown_ready_file}" "${shutdown_listener_pid}"; then
+		mpudp_it_die "${phase} listener did not bind; see ${shutdown_listener_log}"
+		return 1
+	fi
+	if [[ ${phase} == handshake ]]; then
+		apply_shutdown_netem "${family}" forward loss 100%
+		record_shutdown_fault fault_applied "${phase}" 'forward-loss-100-percent-all-paths'
+	fi
+	ip netns exec "${alice_ns}" "${shutdownprobe}" "${initiator_args[@]}" >"${shutdown_initiator_log}" 2>&1 &
+	shutdown_initiator_pid=$!
+	mpudp_it_record_pid "${shutdown_initiator_pid}"
+	if [[ ${phase} != handshake ]]; then
+		all_ready=0
+		for attempt in $(seq 1 100); do
+			all_ready=1
+			for path in 1 2 3 4 5; do
+				current=$(counter_for_comment "$(mpudp_it_ns "t${path}")" "${nft_family}" "${table}" mpudp-reverse-control)
+				if [[ ! ${current} =~ ^[0-9]+$ ]] || (( current <= ack_before[$((path - 1))] )); then
+					all_ready=0
+				fi
+			done
+			if (( all_ready != 0 )); then break; fi
+			if ! kill -0 "${shutdown_initiator_pid}" 2>/dev/null || ! kill -0 "${shutdown_listener_pid}" 2>/dev/null; then break; fi
+			sleep 0.05
+		done
+		if (( all_ready == 0 )); then
+			mpudp_it_die "${phase} did not authenticate all five Carriers before bootstrap"
+			return 1
+		fi
+		printf 'bootstrap\n' >"${shutdown_bootstrap_file}"
+	fi
+	if ! wait_ready "${shutdown_listener_phase}" "${shutdown_listener_pid}" ||
+		! wait_ready "${shutdown_initiator_phase}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "${phase} helpers did not reach the requested lifecycle phase; see ${shutdown_listener_log} and ${shutdown_initiator_log}"
+		return 1
+	fi
+}
+
+wait_shutdown_helper() {
+	local pid=$1 log=$2 label=$3 attempt status
+	for attempt in $(seq 1 60); do
+		if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+		sleep 0.05
+	done
+	if kill -0 "${pid}" 2>/dev/null; then
+		mpudp_it_die "${label} did not exit within 3 seconds; see ${log}"
+		return 1
+	fi
+	set +e
+	wait "${pid}"
+	status=$?
+	set -e
+	if (( status != 0 )); then
+		mpudp_it_die "${label} exited ${status}; see ${log}"
+		return 1
+	fi
+}
+
+finish_shutdown_pair() {
+	local phase=$1 action=$2 events
+	if [[ ${action} == signal ]]; then
+		kill -TERM "${shutdown_listener_pid}" "${shutdown_initiator_pid}"
+	else
+		printf 'close\n' >"${shutdown_close_file}"
+	fi
+	wait_shutdown_helper "${shutdown_initiator_pid}" "${shutdown_initiator_log}" "${phase} initiator"
+	wait_shutdown_helper "${shutdown_listener_pid}" "${shutdown_listener_log}" "${phase} listener"
+	for events in "${shutdown_listener_events}" "${shutdown_initiator_events}"; do
+		grep -q "\"event\":\"phase_ready\".*\"phase\":\"${phase}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not record phase readiness"
+			return 1
+		}
+		grep -q "\"event\":\"shutdown_trigger\".*\"phase\":\"${phase}\".*\"trigger\":\"${action}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not record ${action} trigger"
+			return 1
+		}
+		grep -q "\"event\":\"peer_close_complete\".*\"phase\":\"${phase}\"" "${events}" || {
+			mpudp_it_die "${phase} helper did not complete bounded Peer.Close"
+			return 1
+		}
+	done
+	if [[ -e /proc/${shutdown_listener_pid} || -e /proc/${shutdown_initiator_pid} ]]; then
+		mpudp_it_die "${phase} left a helper process after bounded shutdown"
+		return 1
+	fi
+	sed -n 'p' "${shutdown_listener_events}" "${shutdown_initiator_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+}
+
+run_peer_shutdown_cleanup() {
+	local family=$1 path shard shard_hex baseline expected current stable attempt table nft_family
+	build_shutdownprobe
+	shutdown_fault_events=${MPUDP_IT_STATE_DIR}/${case_name}-faults.ndjson
+	shutdown_mutation_file=${MPUDP_IT_STATE_DIR}/shutdown-cleanup.mutations
+	: >"${shutdown_fault_events}"
+	table=${MPUDP_IT_TABLE4}; nft_family=ip
+	if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+
+	start_shutdown_pair active-transfer close "${family}"
+	: >"${shutdown_mutation_file}"
+	apply_shutdown_netem "${family}" forward delay 2s
+	record_shutdown_fault fault_applied active-transfer 'forward-delay-2s-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "active-transfer initiator did not place the in-flight Datagram"
+		return 1
+	fi
+	wait_shutdown_netem_total "${family}" backlog 5
+	record_shutdown_fault fault_observed active-transfer 'forward-backlog-at-least-5-packets'
+	finish_shutdown_pair active-transfer close
+	clear_shutdown_netem "${family}" forward
+	record_shutdown_fault fault_cleared active-transfer 'forward-delay-2s-all-paths'
+
+	start_shutdown_pair decode-incomplete signal "${family}"
+	baseline=$(sum_path_counters "${family}" mpudp-forward-data)
+	for path in 1 2 3 4 5; do
+		for shard in 2 3 4; do
+			printf -v shard_hex '%02x' "${shard}"
+			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" drop-match --path "${path}" --family "${family}" \
+				--offset 34 --hex "${shard_hex}"
+		done
+	done
+	record_shutdown_fault fault_applied decode-incomplete 'drop-shard-indexes-2-3-4-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "decode-incomplete initiator did not send its Datagram"
+		return 1
+	fi
+	expected=$((baseline + 2))
+	stable=0
+	for attempt in $(seq 1 40); do
+		current=$(sum_path_counters "${family}" mpudp-forward-data)
+		if (( current > expected )); then
+			mpudp_it_die "decode-incomplete delivered $((current - baseline)) shards, want exactly 2"
+			return 1
+		fi
+		if (( current == expected )); then stable=$((stable + 1)); else stable=0; fi
+		if (( stable == 3 )); then break; fi
+		sleep 0.05
+	done
+	if (( stable != 3 )); then
+		mpudp_it_die "decode-incomplete did not stabilize at exactly 2 delivered shards"
+		return 1
+	fi
+	finish_shutdown_pair decode-incomplete signal
+	for path in 1 2 3 4 5; do
+		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-drop --path "${path}" --family "${family}"
+		if ip netns exec "$(mpudp_it_ns "t${path}")" nft list chain "${nft_family}" "${table}" forward | grep 'mpudp-drop-' >/dev/null; then
+			mpudp_it_die "decode-incomplete left a shard drop rule on path ${path}"
+			return 1
+		fi
+	done
+	record_shutdown_fault fault_cleared decode-incomplete 'drop-shard-indexes-2-3-4-all-paths'
+
+	start_shutdown_pair network-fault close "${family}"
+	apply_shutdown_netem "${family}" both loss 100%
+	record_shutdown_fault fault_applied network-fault 'bidirectional-loss-100-percent-all-paths'
+	printf 'send\n' >"${shutdown_send_file}"
+	if ! wait_ready "${shutdown_sent_file}" "${shutdown_initiator_pid}"; then
+		mpudp_it_die "network-fault initiator did not place its Datagram"
+		return 1
+	fi
+	wait_shutdown_netem_total "${family}" dropped 5
+	record_shutdown_fault fault_observed network-fault 'forward-drops-at-least-5-packets'
+	finish_shutdown_pair network-fault close
+	clear_shutdown_netem "${family}" both
+	record_shutdown_fault fault_cleared network-fault 'bidirectional-loss-100-percent-all-paths'
+
+	# Run the abandoned handshake last so its live UDP conntrack tuples cannot
+	# alias a later fresh process that happens to reuse the same source ports.
+	start_shutdown_pair handshake signal "${family}"
+	wait_shutdown_netem_total "${family}" dropped 5
+	record_shutdown_fault fault_observed handshake 'forward-handshake-drops-at-least-5-packets'
+	finish_shutdown_pair handshake signal
+	clear_shutdown_netem "${family}" forward
+	record_shutdown_fault fault_cleared handshake 'forward-loss-100-percent-all-paths'
+
+	if grep -Fqi 'integration-test-key' "${MPUDP_IT_STATE_DIR}"/${case_name}-*.ndjson ||
+		grep -Eqi '"(payload|psk|authentication[_-]?tag|hmac|session_id)"[[:space:]]*:' \
+			"${MPUDP_IT_STATE_DIR}"/${case_name}-*.ndjson; then
+		mpudp_it_die "shutdown diagnostics contain a forbidden sensitive field"
+		return 1
+	fi
+	cleanup_shutdown_mutations
+	sed -n 'p' "${shutdown_fault_events}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (four phases completed bounded signal/API shutdown with every fault cleared)"
+}
+
+run_case_worker() {
+	state_dir=$1
+	case_name=$2
+	case_timeout=$3
+	runner=$4
+	family=$5
+	mpudp_it_require_root
+	mpudp_it_load_state "${state_dir}"
+	if [[ ! -f ${MPUDP_IT_STATE_DIR}/ready ]]; then
+		mpudp_it_die "topology is not ready"
+		return 1
+	fi
+	printf '{"event":"case_started","run_id":"%s","case":"%s","seed":"%s","runner":"%s","family":"%s","timeout_seconds":%s}\n' \
+		"${MPUDP_IT_RUN_ID}" "${case_name}" "${MPUDP_IT_SEED}" "${runner}" "${family}" "${case_timeout}" \
+		>>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	case ${runner} in
+		raw-nat-smoke) run_raw_nat_smoke "${family}" ;;
+		path-controls) run_path_controls "${family}" ;;
+		nat-rebinding-trigger) run_nat_rebinding_trigger "${family}" ;;
+		direct-single-carrier) run_direct_single_carrier "${family}" ;;
+		transparent-nat-reverse-path) run_transparent_nat_reverse_path "${family}" ;;
+		endpoint-rebinding-and-expiry) run_endpoint_rebinding_and_expiry "${family}" ;;
+		mtu-budget-no-fragment) run_mtu_budget_no_fragment "${family}" ;;
+		peer-rs-network) run_rs_network_scenario ;;
+		peer-smoke) run_peer_smoke "${family}" ;;
+		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
+		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;
+		peer-endpoint-expiry) run_peer_endpoint_expiry "${family}" ;;
+		peer-auth-pollution) run_peer_auth_pollution "${family}" ;;
+		peer-shutdown-cleanup) run_peer_shutdown_cleanup "${family}" ;;
+		*) mpudp_it_die "unsupported runner ${runner}"; return 2 ;;
+	esac
+}

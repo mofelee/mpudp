@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	printf '%s\n' 'Usage: scripts/integration/collect --state DIR [--output DIR]'
+}
+
+state_dir=''
+output_dir=''
+while (( $# > 0 )); do
+	case $1 in
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--output) output_dir=${2:?missing value for --output}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown collect argument: $1"; exit 2 ;;
+	esac
+done
+if [[ -z ${state_dir} ]]; then usage >&2; exit 2; fi
+mpudp_it_require_root
+mpudp_it_require_commands ip nft tc timeout awk sed sha256sum stat
+mpudp_it_load_state "${state_dir}"
+if [[ -z ${output_dir} ]]; then output_dir=${MPUDP_IT_STATE_DIR}/diagnostics; fi
+if [[ -e ${output_dir} || -L ${output_dir} ]]; then
+	mpudp_it_die "diagnostic output already exists: ${output_dir}"
+	exit 1
+fi
+(umask 077 && mkdir -p -- "${output_dir}")
+output_dir=$(CDPATH= cd -- "${output_dir}" && pwd -P)
+
+sanitize_stream() {
+	sed -E \
+		-e 's/(psk|secret|authentication[_ -]?tag|hmac)([" ]*[:=][" ]*)[^ ,}" ]+/\1\2[REDACTED]/Ig' \
+		-e 's/("payload"[ ]*:[ ]*)"[^"]*"/\1"[REDACTED]"/Ig' \
+		-e 's/(payload[ ]*[:=][ ]*)[^ ,}]+/\1[REDACTED]/Ig'
+}
+
+capture() {
+	local file=$1
+	shift
+	{
+		printf '$'
+		printf ' %q' "$@"
+		printf '\n'
+		timeout --signal=TERM --kill-after=1s 5s "$@" 2>&1 || true
+	} | sanitize_stream >"${output_dir}/${file}"
+}
+
+{
+	for role in alice t1 t2 t3 t4 t5 bob; do
+		namespace=$(mpudp_it_ns "${role}")
+		[[ -e /run/netns/${namespace} ]] && ip netns list | awk -v wanted="${namespace}" '$1 == wanted'
+	done
+} >"${output_dir}/host-netns.txt"
+{
+	for family in 4 6; do
+		for path in 1 2 3 4 5; do
+			for segment in i o; do
+				for endpoint in a b; do
+					link=$(mpudp_it_host_link_name "${family}${path}${segment}${endpoint}")
+					ip -details -statistics link show dev "${link}" 2>/dev/null || true
+				done
+			done
+		done
+	done
+} >"${output_dir}/host-links.txt"
+{
+	while read -r pid start_time; do
+		if [[ ${pid:-} =~ ^[1-9][0-9]*$ ]] && mpudp_it_process_is_owned "${pid}" "${start_time:-0}"; then
+			printf 'pid=%s start_time=%s command=' "${pid}" "${start_time}"
+			tr '\0' ' ' <"/proc/${pid}/cmdline"
+			printf '\n'
+		fi
+	done <"${MPUDP_IT_STATE_DIR}/pids"
+} | sanitize_stream >"${output_dir}/processes.txt"
+{
+	printf 'run_id=%s\n' "${MPUDP_IT_RUN_ID}"
+	printf 'seed=%s\n' "${MPUDP_IT_SEED}"
+	printf 'token=%s\n' "${MPUDP_IT_TOKEN}"
+	printf 'kernel=%s\n' "$(uname -srmo)"
+	printf 'conntrack_cli=%s\n' "$(command -v conntrack >/dev/null 2>&1 && printf available || printf missing)"
+	printf 'tcpdump_cli=%s\n' "$(command -v tcpdump >/dev/null 2>&1 && printf available || printf missing)"
+} >"${output_dir}/metadata.txt"
+
+for role in alice t1 t2 t3 t4 t5 bob; do
+	namespace=$(mpudp_it_ns "${role}")
+	if [[ ! -e /run/netns/${namespace} ]]; then
+		printf 'namespace missing: %s\n' "${namespace}" >"${output_dir}/${role}-missing.txt"
+		continue
+	fi
+	capture "${role}-links.txt" ip -n "${namespace}" -details -statistics link show
+	capture "${role}-addresses.txt" ip -n "${namespace}" address show
+	capture "${role}-routes-v4.txt" ip -n "${namespace}" -4 route show table all
+	capture "${role}-routes-v6.txt" ip -n "${namespace}" -6 route show table all
+	capture "${role}-qdisc.txt" ip netns exec "${namespace}" tc -s qdisc show
+	if command -v ss >/dev/null 2>&1; then
+		capture "${role}-sockets.txt" ip netns exec "${namespace}" ss -uapn
+	fi
+	if [[ ${role} == t* ]]; then
+		capture "${role}-nft.txt" ip netns exec "${namespace}" nft -a list ruleset
+		capture "${role}-forwarding.txt" ip netns exec "${namespace}" sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+		if command -v conntrack >/dev/null 2>&1; then
+			capture "${role}-conntrack.txt" ip netns exec "${namespace}" conntrack -L -p udp
+		fi
+	fi
+done
+
+# Only copy harness-owned text/NDJSON logs. Packet captures are deliberately
+# excluded because they may contain complete authentication tags or payloads.
+while IFS= read -r source; do
+	base=${source##*/}
+	sanitize_stream <"${source}" >"${output_dir}/state-${base}"
+done < <(find "${MPUDP_IT_STATE_DIR}" -maxdepth 1 -type f \( -name '*.log' -o -name '*.ndjson' \) -print)
+
+mpudp_it_log "diagnostics collected: ${output_dir}"
+printf '%s\n' "${output_dir}"

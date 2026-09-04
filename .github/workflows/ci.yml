@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-unit:
+    name: build-unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.24.x
+          cache: true
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [[ -n "${unformatted}" ]]; then
+            printf 'gofmt required:\n%s\n' "${unformatted}" >&2
+            exit 1
+          fi
+      - name: Verify modules
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Unit tests
+        run: go test -count=1 ./...
+      - name: Fuzz smoke
+        run: |
+          go test ./internal/wire -run '^$' -fuzz '^FuzzDecodeArbitrary$' -fuzztime 3s -timeout 1m
+          go test ./internal/wire -run '^$' -fuzz '^FuzzRoundTripBounded$' -fuzztime 3s -timeout 1m
+          go test ./internal/wire -run '^$' -fuzz '^FuzzSingleBitTamper$' -fuzztime 3s -timeout 1m
+
+  race:
+    name: race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.24.x
+          cache: true
+      - name: Race tests
+        run: go test -race -count=1 ./...
+
+  integration:
+    name: integration / ${{ matrix.case }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - direct-single-carrier
+          - rs53-five-carrier-loss
+          - rs53-two-carrier-rotation
+          - slow-path-early-recovery
+          - transparent-nat-reverse-path
+          - endpoint-rebinding-and-expiry
+          - auth-and-state-pollution
+          - mtu-budget-no-fragment
+          - shutdown-cleanup
+    env:
+      MPUDP_IT_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      MPUDP_IT_SEED: gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+    steps:
+      - name: Record replay metadata
+        env:
+          MPUDP_IT_CASE: ${{ matrix.case }}
+          MPUDP_IT_REPLAY: ${{ runner.temp }}/mpudp-it-replay.txt
+          MPUDP_IT_SHA: ${{ github.sha }}
+        run: |
+          umask 077
+          {
+            printf 'sha=%s\n' "${MPUDP_IT_SHA}"
+            printf 'case=%s\n' "${MPUDP_IT_CASE}"
+            printf 'run_id=%s\n' "${MPUDP_IT_RUN_ID}"
+            printf 'seed=%s\n' "${MPUDP_IT_SEED}"
+          } >"${MPUDP_IT_REPLAY}"
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.24.x
+          cache: true
+      - name: Install network prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            conntrack diffutils iproute2 iputils-ping nftables procps tcpdump
+      - name: Run integration case
+        env:
+          MPUDP_IT_ARTIFACT_ROOT: ${{ runner.temp }}/mpudp-it-artifacts
+          MPUDP_IT_CASE: ${{ matrix.case }}
+          MPUDP_IT_STATE: ${{ runner.temp }}/mpudp-it-state
+        run: |
+          sudo env \
+            "PATH=${PATH}" \
+            GOFLAGS=-buildvcs=false \
+            MPUDP_IT_REQUIRE_CONNTRACK=1 \
+            "MPUDP_IT_SEED=${MPUDP_IT_SEED}" \
+            scripts/integration/run \
+              --run-id "${MPUDP_IT_RUN_ID}" \
+              --state "${MPUDP_IT_STATE}" \
+              --artifacts "${MPUDP_IT_ARTIFACT_ROOT}" \
+              --case "${MPUDP_IT_CASE}"
+      - name: Collect failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        env:
+          MPUDP_IT_ARTIFACT_ROOT: ${{ runner.temp }}/mpudp-it-artifacts
+          MPUDP_IT_STATE: ${{ runner.temp }}/mpudp-it-state
+        run: |
+          diagnostic_dir="${MPUDP_IT_ARTIFACT_ROOT}/${MPUDP_IT_RUN_ID}"
+          if sudo test -d "${MPUDP_IT_STATE}" && ! sudo test -e "${diagnostic_dir}"; then
+            sudo env "PATH=${PATH}" scripts/integration/collect \
+              --state "${MPUDP_IT_STATE}" \
+              --output "${diagnostic_dir}"
+          fi
+      - name: Tear down integration topology
+        if: ${{ always() }}
+        env:
+          MPUDP_IT_STATE: ${{ runner.temp }}/mpudp-it-state
+        run: |
+          sudo env "PATH=${PATH}" scripts/integration/teardown \
+            --state "${MPUDP_IT_STATE}" \
+            --run-id "${MPUDP_IT_RUN_ID}"
+      - name: Audit integration cleanup
+        if: ${{ always() }}
+        env:
+          MPUDP_IT_STATE: ${{ runner.temp }}/mpudp-it-state
+        run: |
+          sudo env "PATH=${PATH}" scripts/integration/audit \
+            --run-id "${MPUDP_IT_RUN_ID}" \
+            --state "${MPUDP_IT_STATE}" \
+            --expect-clean
+      - name: Prepare failure artifact
+        if: ${{ failure() || cancelled() }}
+        env:
+          MPUDP_IT_ARTIFACT_ROOT: ${{ runner.temp }}/mpudp-it-artifacts
+          MPUDP_IT_REPLAY: ${{ runner.temp }}/mpudp-it-replay.txt
+          MPUDP_IT_UPLOAD: ${{ runner.temp }}/mpudp-it-upload
+        run: |
+          install -d -m 0700 "${MPUDP_IT_UPLOAD}"
+          install -m 0600 "${MPUDP_IT_REPLAY}" "${MPUDP_IT_UPLOAD}/replay.txt"
+          diagnostic_dir="${MPUDP_IT_ARTIFACT_ROOT}/${MPUDP_IT_RUN_ID}"
+          if sudo test -d "${diagnostic_dir}"; then
+            install -d -m 0700 "${MPUDP_IT_UPLOAD}/diagnostics"
+            sudo tar -C "${diagnostic_dir}" -cf - . | \
+              tar -C "${MPUDP_IT_UPLOAD}/diagnostics" --no-same-owner -xf -
+          fi
+      - name: Upload failure diagnostics
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mpudp-it-upload
+          if-no-files-found: error
+          retention-days: 3

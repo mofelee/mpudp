@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	printf '%s\n' 'Usage: scripts/integration/teardown --state DIR [--run-id ID] [--keep-state]'
+}
+
+state_dir=''
+run_id=''
+keep_state=0
+while (( $# > 0 )); do
+	case $1 in
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--run-id) run_id=${2:?missing value for --run-id}; shift 2 ;;
+		--keep-state) keep_state=1; shift ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_log "ERROR: unknown teardown argument: $1"; exit 2 ;;
+	esac
+done
+
+if [[ -z ${state_dir} && -z ${run_id} ]]; then
+	mpudp_it_log 'ERROR: teardown requires --state or --run-id'
+	exit 2
+fi
+
+if [[ -n ${run_id} ]] && ! mpudp_it_validate_run_id "${run_id}"; then exit 2; fi
+if [[ -z ${state_dir} && -n ${run_id} ]]; then
+	state_dir=$(mpudp_it_default_state_dir "${run_id}")
+fi
+
+state_loaded=0
+if [[ -n ${state_dir} && -d ${state_dir} && ! -L ${state_dir} ]]; then
+	if ! mpudp_it_load_state "${state_dir}"; then exit 2; fi
+	state_loaded=1
+	if [[ -n ${run_id} && ${run_id} != "${MPUDP_IT_RUN_ID}" ]]; then
+		mpudp_it_log 'ERROR: --run-id does not match state'
+		exit 2
+	fi
+	run_id=${MPUDP_IT_RUN_ID}
+elif [[ -z ${run_id} && ${state_dir} == /tmp/mpudp-it-* ]]; then
+	run_id=${state_dir#/tmp/mpudp-it-}
+fi
+
+if [[ -z ${run_id} ]] || ! mpudp_it_validate_run_id "${run_id}"; then exit 2; fi
+if (( state_loaded == 0 )); then
+	mpudp_it_log "no validated state ledger; nothing may be deleted for run ${run_id}"
+	exit 0
+fi
+
+cleanup_errors=0
+declare -A owned_namespaces=()
+if (( state_loaded != 0 )); then
+	if [[ -f ${MPUDP_IT_STATE_DIR}/namespaces ]]; then
+		while IFS= read -r namespace; do
+			if [[ -n ${namespace} ]] && mpudp_it_assert_owned_namespace "${namespace}"; then
+				owned_namespaces["${namespace}"]=1
+			else
+				cleanup_errors=1
+			fi
+		done <"${MPUDP_IT_STATE_DIR}/namespaces"
+	else
+		mpudp_it_log "missing namespace ownership ledger: ${MPUDP_IT_STATE_DIR}/namespaces"
+		cleanup_errors=1
+	fi
+fi
+
+stop_pid() {
+	local pid=$1 expected_start=$2 attempt
+	if ! mpudp_it_process_is_owned "${pid}" "${expected_start}"; then
+		return 0
+	fi
+	kill -TERM "${pid}" 2>/dev/null || true
+	for attempt in 1 2 3 4 5 6 7 8 9 10; do
+		if ! mpudp_it_process_is_owned "${pid}" "${expected_start}"; then return 0; fi
+		sleep 0.1
+	done
+	if mpudp_it_process_is_owned "${pid}" "${expected_start}"; then
+		kill -KILL "${pid}" 2>/dev/null || true
+	fi
+}
+
+if (( state_loaded != 0 )) && [[ -f ${MPUDP_IT_STATE_DIR}/pids ]]; then
+	while read -r pid start_time; do
+		if [[ ${pid:-} =~ ^[1-9][0-9]*$ && ${start_time:-} =~ ^[0-9]+$ ]]; then
+			stop_pid "${pid}" "${start_time}"
+		fi
+	done <"${MPUDP_IT_STATE_DIR}/pids"
+fi
+
+# Delete only the two run-derived tables, and only inside one of the seven
+# exact run-derived namespaces. Namespace deletion is still attempted if a
+# table was never created during a partial setup.
+for role in alice t1 t2 t3 t4 t5 bob; do
+	namespace=$(mpudp_it_ns "${role}") || { cleanup_errors=1; continue; }
+	[[ -n ${owned_namespaces[${namespace}]:-} ]] || continue
+	if [[ ! -e /run/netns/${namespace} ]]; then continue; fi
+	if ! mpudp_it_assert_owned_namespace "${namespace}"; then cleanup_errors=1; continue; fi
+	if [[ ${role} == t* ]]; then
+		ip netns exec "${namespace}" nft delete table ip "${MPUDP_IT_TABLE4}" >/dev/null 2>&1 || true
+		ip netns exec "${namespace}" nft delete table ip6 "${MPUDP_IT_TABLE6}" >/dev/null 2>&1 || true
+	fi
+done
+
+for role in bob t5 t4 t3 t2 t1 alice; do
+	namespace=$(mpudp_it_ns "${role}") || { cleanup_errors=1; continue; }
+	[[ -n ${owned_namespaces[${namespace}]:-} ]] || continue
+	if [[ ! -e /run/netns/${namespace} ]]; then continue; fi
+	if ! mpudp_it_assert_owned_namespace "${namespace}"; then cleanup_errors=1; continue; fi
+	if ! ip netns del "${namespace}"; then
+		mpudp_it_log "failed to delete namespace ${namespace}"
+		cleanup_errors=1
+	fi
+done
+
+# Normally no temporary host link survives the move into a namespace. Delete
+# only exact names recorded by the validated state ledger.
+declare -A host_links=()
+if [[ -f ${MPUDP_IT_STATE_DIR}/host-links ]]; then
+	while IFS= read -r link; do
+		[[ -n ${link} ]] && host_links["${link}"]=1
+	done <"${MPUDP_IT_STATE_DIR}/host-links"
+	else
+	mpudp_it_log "missing host-link ownership ledger: ${MPUDP_IT_STATE_DIR}/host-links"
+	cleanup_errors=1
+	fi
+for link in "${!host_links[@]}"; do
+	if ! mpudp_it_assert_owned_host_link "${link}"; then cleanup_errors=1; continue; fi
+	if ip link show dev "${link}" >/dev/null 2>&1; then
+		if ! ip link del dev "${link}"; then
+			mpudp_it_log "failed to delete host link ${link}"
+			cleanup_errors=1
+		fi
+	fi
+done
+
+if (( keep_state == 0 && cleanup_errors == 0 )); then
+	if ! mpudp_it_safe_remove_state "${MPUDP_IT_STATE_DIR}"; then cleanup_errors=1; fi
+fi
+
+if (( cleanup_errors != 0 )); then
+	mpudp_it_log "teardown completed with errors for run ${MPUDP_IT_RUN_ID}"
+	exit 1
+fi
+mpudp_it_log "teardown complete: run=${MPUDP_IT_RUN_ID}"

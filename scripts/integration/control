@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	cat <<'EOF'
+Usage:
+  control --state DIR netem --path N --family 4|6 [--direction forward|reverse|both]
+          [--delay 50ms] [--loss 10%] [--reorder 5%]
+  control --state DIR clear-netem --path N --family 4|6 [--direction ...]
+  control --state DIR link --path N --family 4|6 --link-state up|down
+  control --state DIR mtu --path N --family 4|6 --value BYTES
+  control --state DIR drop-match --path N --family 4|6 --offset BYTES --hex HEX
+  control --state DIR clear-drop --path N --family 4|6
+  control --state DIR nat-rebind --path N --family 4|6 --zone N --source-port PORT
+  control --state DIR clear-rebind --path N --family 4|6
+  control --state DIR stats --path N
+
+drop-match offsets start at the UDP payload (MPUDP byte zero), and match one to
+four bytes. This lets wire-aware tests drop one PacketID/shard without teaching
+the topology harness the protocol layout.
+EOF
+}
+
+state_dir=''
+path=''
+family=''
+direction=forward
+delay=''
+loss=''
+reorder=''
+link_state=''
+mtu=''
+offset=''
+hex_value=''
+zone=''
+source_port=''
+command_name=''
+
+while (( $# > 0 )); do
+	case $1 in
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--path) path=${2:?missing value for --path}; shift 2 ;;
+		--family) family=${2:?missing value for --family}; shift 2 ;;
+		--direction) direction=${2:?missing value for --direction}; shift 2 ;;
+		--delay) delay=${2:?missing value for --delay}; shift 2 ;;
+		--loss) loss=${2:?missing value for --loss}; shift 2 ;;
+		--reorder) reorder=${2:?missing value for --reorder}; shift 2 ;;
+		--link-state) link_state=${2:?missing value for --link-state}; shift 2 ;;
+		--value) mtu=${2:?missing value for --value}; shift 2 ;;
+		--offset) offset=${2:?missing value for --offset}; shift 2 ;;
+		--hex) hex_value=${2:?missing value for --hex}; shift 2 ;;
+		--zone) zone=${2:?missing value for --zone}; shift 2 ;;
+		--source-port) source_port=${2:?missing value for --source-port}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		netem | clear-netem | link | mtu | drop-match | clear-drop | nat-rebind | clear-rebind | stats)
+			if [[ -n ${command_name} ]]; then mpudp_it_die "multiple control commands"; exit 2; fi
+			command_name=$1; shift ;;
+		up | down)
+			# Accept the ergonomic "link ... up" spelling as well as --state-value.
+			if [[ ${command_name} == link && -z ${link_state} ]]; then link_state=$1; shift; else mpudp_it_die "unexpected argument: $1"; exit 2; fi ;;
+		*) mpudp_it_die "unknown control argument: $1"; exit 2 ;;
+	esac
+done
+
+if [[ -z ${state_dir} || -z ${command_name} ]]; then usage >&2; exit 2; fi
+if [[ ${command_name} == netem || ${command_name} == clear-netem ]]; then
+	case ${direction} in
+		forward | reverse | both) ;;
+		*) mpudp_it_die "direction must be forward, reverse, or both"; exit 2 ;;
+	esac
+fi
+mpudp_it_require_root
+mpudp_it_require_commands ip nft tc sha256sum stat
+mpudp_it_load_state "${state_dir}"
+if [[ ! -f ${MPUDP_IT_STATE_DIR}/ready ]]; then mpudp_it_die "topology is not ready"; exit 1; fi
+
+if [[ ${command_name} == stats ]]; then
+	mpudp_it_path_check "${path}"
+	t_ns=$(mpudp_it_ns "t${path}")
+	ip netns exec "${t_ns}" nft -a list table ip "${MPUDP_IT_TABLE4}"
+	ip netns exec "${t_ns}" nft -a list table ip6 "${MPUDP_IT_TABLE6}"
+	exit 0
+fi
+
+mpudp_it_path_check "${path}"
+mpudp_it_family_check "${family}"
+alice_ns=$(mpudp_it_ns alice)
+bob_ns=$(mpudp_it_ns bob)
+t_ns=$(mpudp_it_ns "t${path}")
+alice_if=$(mpudp_it_alice_if "${family}" "${path}")
+bob_if=$(mpudp_it_bob_if "${family}" "${path}")
+t_in_if=$(mpudp_it_t_in_if "${family}")
+t_out_if=$(mpudp_it_t_out_if "${family}")
+
+for namespace in "${alice_ns}" "${t_ns}" "${bob_ns}"; do
+	if [[ ! -e /run/netns/${namespace} ]]; then mpudp_it_die "missing namespace ${namespace}"; exit 1; fi
+done
+
+netem_targets() {
+	case ${direction} in
+		forward)
+			printf '%s %s\n' "${alice_ns}" "${alice_if}"
+			;;
+		reverse)
+			printf '%s %s\n' "${bob_ns}" "${bob_if}"
+			;;
+		both)
+			printf '%s %s\n' "${alice_ns}" "${alice_if}"
+			printf '%s %s\n' "${bob_ns}" "${bob_if}"
+			;;
+	esac
+}
+
+case ${command_name} in
+	netem)
+		if [[ -z ${delay}${loss}${reorder} ]]; then mpudp_it_die "netem requires delay, loss, or reorder"; exit 2; fi
+		if [[ -n ${delay} && ! ${delay} =~ ^[0-9]+(us|ms|s)$ ]]; then mpudp_it_die "invalid delay: ${delay}"; exit 2; fi
+		percent_pattern='^(100|[0-9]{1,2})(\.[0-9]+)?%$'
+		if [[ -n ${loss} && ! ${loss} =~ ${percent_pattern} ]]; then mpudp_it_die "invalid loss: ${loss}"; exit 2; fi
+		if [[ -n ${reorder} && ! ${reorder} =~ ${percent_pattern} ]]; then mpudp_it_die "invalid reorder: ${reorder}"; exit 2; fi
+		if [[ -n ${reorder} && -z ${delay} ]]; then mpudp_it_die "netem reorder requires a delay"; exit 2; fi
+		args=()
+		if [[ -n ${delay} ]]; then args+=(delay "${delay}"); fi
+		if [[ -n ${loss} ]]; then args+=(loss "${loss}"); fi
+		if [[ -n ${reorder} ]]; then args+=(reorder "${reorder}"); fi
+		while read -r namespace interface; do
+			ip netns exec "${namespace}" tc qdisc replace dev "${interface}" root netem "${args[@]}"
+		done < <(netem_targets)
+		;;
+	clear-netem)
+		while read -r namespace interface; do
+			ip netns exec "${namespace}" tc qdisc del dev "${interface}" root >/dev/null 2>&1 || true
+		done < <(netem_targets)
+		;;
+	link)
+		if [[ ${link_state} != up && ${link_state} != down ]]; then mpudp_it_die "link state must be up or down"; exit 2; fi
+		ip -n "${alice_ns}" link set dev "${alice_if}" "${link_state}"
+		;;
+	mtu)
+		if [[ ! ${mtu} =~ ^[0-9]+$ ]]; then mpudp_it_die "MTU must be an integer"; exit 2; fi
+		minimum=576
+		if [[ ${family} == 6 ]]; then minimum=1280; fi
+		if (( mtu < minimum || mtu > 65535 )); then mpudp_it_die "family ${family} MTU must be ${minimum}..65535"; exit 2; fi
+		ip -n "${alice_ns}" link set dev "${alice_if}" mtu "${mtu}"
+		ip -n "${t_ns}" link set dev "${t_in_if}" mtu "${mtu}"
+		ip -n "${t_ns}" link set dev "${t_out_if}" mtu "${mtu}"
+		ip -n "${bob_ns}" link set dev "${bob_if}" mtu "${mtu}"
+		;;
+	drop-match)
+		if [[ ! ${offset} =~ ^[0-9]+$ || ${offset} -gt 65506 ]]; then mpudp_it_die "offset must be 0..65506"; exit 2; fi
+		hex_value=${hex_value#0x}
+		if [[ ! ${hex_value} =~ ^[0-9A-Fa-f]{2}([0-9A-Fa-f]{2}){0,3}$ ]]; then mpudp_it_die "hex match must contain 1..4 bytes"; exit 2; fi
+		bit_offset=$(( (8 + offset) * 8 ))
+		bit_length=$(( ${#hex_value} * 4 ))
+		table=${MPUDP_IT_TABLE4}
+		if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; fi
+		ip netns exec "${t_ns}" nft insert rule "ip${family/4/}" "${table}" forward \
+			iifname "${t_in_if}" meta l4proto udp @th,"${bit_offset}","${bit_length}" "0x${hex_value}" \
+			counter drop comment "mpudp-drop-${offset}-${hex_value}"
+		;;
+	clear-drop)
+		table=${MPUDP_IT_TABLE4}; nft_family=ip
+		if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+		while read -r handle; do
+			[[ ${handle} =~ ^[0-9]+$ ]] && ip netns exec "${t_ns}" nft delete rule "${nft_family}" "${table}" forward handle "${handle}"
+		done < <(ip netns exec "${t_ns}" nft -a list chain "${nft_family}" "${table}" forward | awk '/comment "mpudp-drop-/ {print $NF}')
+		;;
+	nat-rebind)
+		if [[ ! ${zone} =~ ^[1-9][0-9]*$ ]] || (( zone > 65535 )); then mpudp_it_die "conntrack zone must be 1..65535"; exit 2; fi
+		if [[ ! ${source_port} =~ ^[1-9][0-9]*$ ]] || (( source_port > 65535 )); then mpudp_it_die "source port must be 1..65535"; exit 2; fi
+		table=${MPUDP_IT_TABLE4}; nft_family=ip; address_keyword=ip
+		if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; address_keyword=ip6; fi
+		alice_address=$(mpudp_it_alice_addr "${family}" "${path}")
+		ingress_address=$(mpudp_it_t_ingress_addr "${family}" "${path}")
+		egress_address=$(mpudp_it_t_egress_addr "${family}" "${path}")
+		bob_address=$(mpudp_it_bob_addr "${family}" "${path}")
+		while read -r handle; do
+			[[ ${handle} =~ ^[0-9]+$ ]] && ip netns exec "${t_ns}" nft delete rule "${nft_family}" "${table}" raw_prerouting handle "${handle}"
+		done < <(ip netns exec "${t_ns}" nft -a list chain "${nft_family}" "${table}" raw_prerouting | awk '/comment "mpudp-rebind-forward"/ {print $NF}')
+		ip netns exec "${t_ns}" nft add rule "${nft_family}" "${table}" raw_prerouting \
+			iifname "${t_in_if}" "${address_keyword}" saddr "${alice_address}" "${address_keyword}" daddr "${ingress_address}" \
+			udp dport 4000 ct zone set "${zone}" counter comment "mpudp-rebind-forward"
+		ip netns exec "${t_ns}" nft add rule "${nft_family}" "${table}" raw_prerouting \
+			iifname "${t_out_if}" "${address_keyword}" saddr "${bob_address}" "${address_keyword}" daddr "${egress_address}" \
+			udp sport 9000 udp dport "${source_port}" ct zone set "${zone}" counter \
+			comment "mpudp-rebind-reverse-${zone}-${source_port}"
+		if [[ ${family} == 4 ]]; then
+			ip netns exec "${t_ns}" nft insert rule "${nft_family}" "${table}" postrouting \
+				ct zone "${zone}" oifname "${t_out_if}" ip daddr "${bob_address}" udp dport 9000 counter \
+				snat to "${egress_address}:${source_port}" comment "mpudp-rebind-snat-${zone}-${source_port}"
+		else
+			ip netns exec "${t_ns}" nft insert rule "${nft_family}" "${table}" postrouting \
+				ct zone "${zone}" oifname "${t_out_if}" ip6 daddr "${bob_address}" udp dport 9000 counter \
+				snat to "[${egress_address}]:${source_port}" comment "mpudp-rebind-snat-${zone}-${source_port}"
+		fi
+		;;
+	clear-rebind)
+		table=${MPUDP_IT_TABLE4}; nft_family=ip
+		if [[ ${family} == 6 ]]; then table=${MPUDP_IT_TABLE6}; nft_family=ip6; fi
+		ip netns exec "${t_ns}" nft flush chain "${nft_family}" "${table}" raw_prerouting
+		while read -r handle; do
+			[[ ${handle} =~ ^[0-9]+$ ]] && ip netns exec "${t_ns}" nft delete rule "${nft_family}" "${table}" postrouting handle "${handle}"
+		done < <(ip netns exec "${t_ns}" nft -a list chain "${nft_family}" "${table}" postrouting | awk '/comment "mpudp-rebind-snat-/ {print $NF}')
+		;;
+esac
+
+mpudp_it_log "control applied: run=${MPUDP_IT_RUN_ID} command=${command_name} path=${path} family=${family}"

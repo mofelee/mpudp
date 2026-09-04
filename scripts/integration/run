@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/integration/run [--run-id ID] [--state DIR]
+       [--case NAME ...] [--artifacts DIR] [--owner-token TOKEN]
+
+Default case: transparent-nat-v4. The command always performs setup, runs every
+selected case, tears down, and audits that this run left no resources.
+EOF
+}
+
+run_id=''
+state_dir=''
+artifact_root=''
+run_owner_token=''
+declare -a cases=()
+while (( $# > 0 )); do
+	case $1 in
+		--run-id) run_id=${2:?missing value for --run-id}; shift 2 ;;
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--case) cases+=("${2:?missing value for --case}"); shift 2 ;;
+		--artifacts) artifact_root=${2:?missing value for --artifacts}; shift 2 ;;
+		--owner-token) run_owner_token=${2:?missing value for --owner-token}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown run argument: $1"; exit 2 ;;
+	esac
+done
+
+if [[ -z ${run_id} ]]; then run_id=$(mpudp_it_new_run_id); fi
+mpudp_it_validate_run_id "${run_id}"
+if [[ -z ${state_dir} ]]; then state_dir=$(mpudp_it_default_state_dir "${run_id}"); fi
+if (( ${#cases[@]} == 0 )); then cases=(transparent-nat-v4); fi
+if [[ -z ${run_owner_token} ]]; then run_owner_token=$(mpudp_it_new_owner_token); fi
+mpudp_it_validate_owner_token "${run_owner_token}"
+mpudp_it_require_commands realpath
+state_dir=$(realpath -m -- "${state_dir}")
+if [[ -n ${artifact_root} ]]; then
+	artifact_root=$(realpath -m -- "${artifact_root}")
+	diagnostic_target=$(realpath -m -- "${artifact_root%/}/${run_id}")
+	if [[ "${diagnostic_target%/}/" == "${state_dir%/}/"* || "${state_dir%/}/" == "${diagnostic_target%/}/"* ]]; then
+		mpudp_it_die "artifact output overlaps run state: ${diagnostic_target} and ${state_dir}" || true
+		exit 2
+	fi
+fi
+
+topology_owned=0
+finalizing=0
+run_mutation=0
+run_pending_status=0
+finalize() {
+	local status=$? cleanup_status=0 diagnostic_dir='' state_owner_token='' diagnostics_collected=0
+	if (( finalizing != 0 )); then exit "${status}"; fi
+	finalizing=1
+	trap - EXIT
+	trap '' HUP INT TERM
+	if (( topology_owned == 0 )) && [[ -f ${state_dir}/owner-token && ! -L ${state_dir} ]]; then
+		IFS= read -r state_owner_token <"${state_dir}/owner-token" || true
+		if [[ ${state_owner_token} == "${run_owner_token}" ]]; then topology_owned=1; fi
+	fi
+	if (( topology_owned != 0 )); then
+		collect_failure_diagnostics() {
+			if [[ ! -d ${state_dir} || -L ${state_dir} || ${diagnostics_collected} != 0 ]]; then return 0; fi
+			if [[ -n ${artifact_root} ]]; then
+				mkdir -p -- "${artifact_root}"
+				diagnostic_dir=${artifact_root%/}/${run_id}
+			else
+				diagnostic_dir=${state_dir}/diagnostics
+			fi
+			"${SCRIPT_DIR}/collect" --state "${state_dir}" --output "${diagnostic_dir}" >/dev/null || { cleanup_status=1; return 0; }
+			diagnostics_collected=1
+			if [[ -z ${artifact_root} && -d ${diagnostic_dir} ]]; then
+				mpudp_it_log "failure diagnostics (sanitized):"
+				for diagnostic in "${diagnostic_dir}"/metadata.txt "${diagnostic_dir}"/state-*.log; do
+					[[ -f ${diagnostic} ]] || continue
+					printf '%s\n' "--- ${diagnostic##*/}" >&2
+					sed -n '1,120p' "${diagnostic}" >&2
+				done
+			fi
+		}
+		if (( status != 0 )); then
+			collect_failure_diagnostics
+		fi
+		"${SCRIPT_DIR}/teardown" --state "${state_dir}" --run-id "${run_id}" --keep-state || cleanup_status=1
+		"${SCRIPT_DIR}/audit" --run-id "${run_id}" --state "${state_dir}" --expect-clean --ignore-state || cleanup_status=1
+		if (( cleanup_status == 0 )); then
+			"${SCRIPT_DIR}/teardown" --state "${state_dir}" --run-id "${run_id}" || cleanup_status=1
+		fi
+		if (( cleanup_status != 0 )); then
+			collect_failure_diagnostics
+		fi
+	fi
+	if (( status == 0 && cleanup_status != 0 )); then status=1; fi
+	exit "${status}"
+}
+handle_run_signal() {
+	local status=$1
+	if (( finalizing != 0 )); then return 0; fi
+	if (( run_mutation != 0 )); then
+		if (( run_pending_status == 0 )); then run_pending_status=${status}; fi
+		return 0
+	fi
+	exit "${status}"
+}
+finish_run_mutation() {
+	local status
+	run_mutation=0
+	if (( run_pending_status != 0 )); then
+		status=${run_pending_status}
+		run_pending_status=0
+		exit "${status}"
+	fi
+}
+trap finalize EXIT
+trap 'handle_run_signal 129' HUP
+trap 'handle_run_signal 130' INT
+trap 'handle_run_signal 143' TERM
+
+run_mutation=1
+setup_status=0
+setup_output=$("${SCRIPT_DIR}/setup" --run-id "${run_id}" --state "${state_dir}" --owner-token "${run_owner_token}") || setup_status=$?
+if (( setup_status == 0 )); then topology_owned=1; fi
+finish_run_mutation
+if (( setup_status != 0 )); then exit "${setup_status}"; fi
+if [[ ${setup_output} != "${state_dir}" ]]; then
+	mpudp_it_die "setup returned unexpected state path: ${setup_output}"
+	exit 1
+fi
+for case_name in "${cases[@]}"; do
+	"${SCRIPT_DIR}/run-case" --state "${state_dir}" "${case_name}"
+done
+mpudp_it_log "all selected cases passed: run=${run_id} cases=${cases[*]}"

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	printf '%s\n' 'Usage: scripts/integration/repeat [--count N] [--parallel N] [--case NAME]'
+}
+
+count=20
+parallel=1
+case_name=transparent-nat-v4
+while (( $# > 0 )); do
+	case $1 in
+		--count) count=${2:?missing value for --count}; shift 2 ;;
+		--parallel) parallel=${2:?missing value for --parallel}; shift 2 ;;
+		--case) case_name=${2:?missing value for --case}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown repeat argument: $1"; exit 2 ;;
+	esac
+done
+if [[ ! ${count} =~ ^[1-9][0-9]*$ ]] || (( count > 100 )); then mpudp_it_die "count must be 1..100"; exit 2; fi
+if [[ ! ${parallel} =~ ^[1-9][0-9]*$ ]] || (( parallel > 8 || parallel > count )); then mpudp_it_die "parallel must be 1..min(8,count)"; exit 2; fi
+
+log_dir=$(mktemp -d -t mpudp-it-repeat.XXXXXXXX)
+declare -a pids=() iterations=() run_ids=() owner_tokens=() state_dirs=()
+repeat_mutation=0
+repeat_pending_status=0
+cleanup_repeat() {
+	local status=$? cleanup_status=0 pid child_status run_id state_dir owner_token actual_owner index
+	local -A cleanup_pids=()
+	trap - EXIT
+	trap '' HUP INT TERM
+	for pid in "${pids[@]}"; do
+		cleanup_pids["${pid}"]=1
+	done
+	while IFS= read -r pid; do
+		[[ ${pid} =~ ^[1-9][0-9]*$ ]] && cleanup_pids["${pid}"]=1
+	done < <(jobs -pr)
+	for pid in "${!cleanup_pids[@]}"; do
+		if kill -0 "${pid}" 2>/dev/null; then kill -TERM "${pid}" 2>/dev/null || true; fi
+	done
+	for pid in "${!cleanup_pids[@]}"; do
+		set +e
+		wait "${pid}" 2>/dev/null
+		child_status=$?
+		set -e
+		if (( child_status != 0 && child_status != 127 && status == 0 )); then status=${child_status}; fi
+	done
+	for index in "${!run_ids[@]}"; do
+		run_id=${run_ids[${index}]}
+		state_dir=${state_dirs[${index}]}
+		owner_token=${owner_tokens[${index}]}
+		if [[ -d ${state_dir} && ! -L ${state_dir} ]]; then
+			actual_owner=''
+			if [[ -f ${state_dir}/owner-token && ! -L ${state_dir}/owner-token ]]; then
+				IFS= read -r actual_owner <"${state_dir}/owner-token" || true
+			fi
+			if [[ ${actual_owner} == "${owner_token}" ]]; then
+				"${SCRIPT_DIR}/teardown" --state "${state_dir}" --run-id "${run_id}" >/dev/null 2>&1 || cleanup_status=1
+			else
+				mpudp_it_log "refusing cleanup without matching owner token: run=${run_id}"
+				cleanup_status=1
+			fi
+		elif [[ -e ${state_dir} || -L ${state_dir} ]]; then
+			mpudp_it_log "refusing cleanup of non-directory state: ${state_dir}"
+			cleanup_status=1
+		fi
+		"${SCRIPT_DIR}/audit" --run-id "${run_id}" --state "${state_dir}" --expect-clean >/dev/null || cleanup_status=1
+	done
+	if [[ -d ${log_dir} && ! -L ${log_dir} && ${log_dir} == /tmp/mpudp-it-repeat.* ]]; then
+		find "${log_dir}" -xdev -depth -delete || cleanup_status=1
+	fi
+	if (( status == 0 && cleanup_status != 0 )); then status=1; fi
+	exit "${status}"
+}
+handle_repeat_signal() {
+	local status=$1
+	if (( repeat_mutation != 0 )); then
+		if (( repeat_pending_status == 0 )); then repeat_pending_status=${status}; fi
+		return 0
+	fi
+	exit "${status}"
+}
+finish_repeat_mutation() {
+	local status
+	repeat_mutation=0
+	if (( repeat_pending_status != 0 )); then
+		status=${repeat_pending_status}
+		repeat_pending_status=0
+		exit "${status}"
+	fi
+}
+trap cleanup_repeat EXIT
+trap 'handle_repeat_signal 129' HUP
+trap 'handle_repeat_signal 130' INT
+trap 'handle_repeat_signal 143' TERM
+
+batch_start=1
+failures=0
+base=$(mpudp_it_new_run_id)
+base=${base##*-}
+while (( batch_start <= count )); do
+	pids=(); iterations=(); run_ids=(); owner_tokens=(); state_dirs=()
+	for (( slot=0; slot<parallel && batch_start+slot<=count; slot++ )); do
+		iteration=$((batch_start + slot))
+		run_id="repeat-${base}-${iteration}"
+		owner_token=$(mpudp_it_new_owner_token)
+		state_dir=$(mpudp_it_default_state_dir "${run_id}")
+		repeat_mutation=1
+		run_ids+=("${run_id}")
+		owner_tokens+=("${owner_token}")
+		state_dirs+=("${state_dir}")
+		"${SCRIPT_DIR}/run" --run-id "${run_id}" --state "${state_dir}" --owner-token "${owner_token}" --case "${case_name}" >"${log_dir}/${iteration}.log" 2>&1 &
+		pids+=("$!")
+		iterations+=("${iteration}")
+		finish_repeat_mutation
+	done
+	for index in "${!pids[@]}"; do
+		if ! wait "${pids[${index}]}"; then
+			iteration=${iterations[${index}]}
+			mpudp_it_log "repeat iteration ${iteration} failed"
+			sed -n '1,240p' "${log_dir}/${iteration}.log" >&2
+			failures=$((failures + 1))
+		fi
+	done
+	pids=(); iterations=(); run_ids=(); owner_tokens=(); state_dirs=()
+	batch_start=$((batch_start + parallel))
+done
+
+if (( failures != 0 )); then
+	mpudp_it_die "${failures} of ${count} repeated runs failed"
+	exit 1
+fi
+mpudp_it_log "repeat passed: count=${count} parallel=${parallel} case=${case_name}"
