@@ -1158,10 +1158,16 @@ func TestPeerMultipleConcurrentSessions(t *testing.T) {
 }
 
 func TestPeerConcurrentCloseUnblocksReadAndAccept(t *testing.T) {
-	address := reserveUDPAddress(t)
+	listenerAddress := reserveUDPAddress(t)
+	sink, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("open inert UDP sink: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+
 	cfg := runtimeTestConfig()
-	cfg.Listen = address
-	cfg.Carriers = []string{address}
+	cfg.Listen = listenerAddress
+	cfg.Carriers = []string{sink.LocalAddr().String()}
 	peer, err := NewPeer(cfg)
 	if err != nil {
 		t.Fatalf("NewPeer() error = %v", err)
