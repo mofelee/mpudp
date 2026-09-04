@@ -1458,6 +1458,9 @@ run_case_worker() {
 		mpudp_it_die "topology is not ready"
 		return 1
 	fi
+	printf '{"event":"case_started","run_id":"%s","case":"%s","seed":"%s","runner":"%s","family":"%s","timeout_seconds":%s}\n' \
+		"${MPUDP_IT_RUN_ID}" "${case_name}" "${MPUDP_IT_SEED}" "${runner}" "${family}" "${case_timeout}" \
+		>>"${MPUDP_IT_STATE_DIR}/events.ndjson"
 	case ${runner} in
 		raw-nat-smoke) run_raw_nat_smoke "${family}" ;;
 		path-controls) run_path_controls "${family}" ;;

@@ -59,6 +59,8 @@ sudo apt-get install --yes --no-install-recommends \
 ```
 
 使用固定 case、run ID 和 seed 可以重放 CI 失败。state 与诊断目录必须分离；
+seed 是 1..128 个字母、数字、点、下划线、冒号、加号或连字符组成的文本；未指定时
+使用 run ID。harness 会校验并把它写入 state、case-start 事件和失败诊断。
 以下命令无论成功或失败都会执行精确 teardown 和残留审计：
 
 ```bash

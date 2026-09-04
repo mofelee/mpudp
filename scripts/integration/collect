@@ -78,6 +78,7 @@ capture() {
 } | sanitize_stream >"${output_dir}/processes.txt"
 {
 	printf 'run_id=%s\n' "${MPUDP_IT_RUN_ID}"
+	printf 'seed=%s\n' "${MPUDP_IT_SEED}"
 	printf 'token=%s\n' "${MPUDP_IT_TOKEN}"
 	printf 'kernel=%s\n' "$(uname -srmo)"
 	printf 'conntrack_cli=%s\n' "$(command -v conntrack >/dev/null 2>&1 && printf available || printf missing)"

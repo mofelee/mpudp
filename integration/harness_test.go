@@ -122,6 +122,50 @@ func TestDirectSingleCarrierScenarioIsDistinctAndCleanupOwned(t *testing.T) {
 	}
 }
 
+func TestHarnessPersistsBoundedTextualSeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash harness is Linux-only")
+	}
+	repository, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(t.TempDir(), "state")
+	const seed = "gh-123456-2-7:loss_profile.a+b"
+	probe := `
+source "$1"
+export MPUDP_IT_SEED=$4
+mpudp_it_init_state "$2" "$3" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+mpudp_it_load_state "$3"
+printf '%s\n' "$MPUDP_IT_SEED"
+`
+	command := exec.Command("bash", "-c", probe, "seed-probe",
+		filepath.Join(repository, "scripts", "integration", "lib.sh"), "seed-unit", state, seed)
+	output, runErr := command.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("persist textual seed: %v\n%s", runErr, output)
+	}
+	if strings.TrimSpace(string(output)) != seed {
+		t.Fatalf("loaded seed = %q, want %q", strings.TrimSpace(string(output)), seed)
+	}
+	persisted, err := os.ReadFile(filepath.Join(state, "seed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(persisted) != seed+"\n" {
+		t.Fatalf("persisted seed = %q, want %q", persisted, seed+"\n")
+	}
+
+	validator := `source "$1"; mpudp_it_validate_seed "$2"`
+	for _, invalid := range []string{"line\nbreak", "contains space", strings.Repeat("x", 129), "-leading"} {
+		invalidCommand := exec.Command("bash", "-c", validator, "seed-validator",
+			filepath.Join(repository, "scripts", "integration", "lib.sh"), invalid)
+		if invalidOutput, invalidErr := invalidCommand.CombinedOutput(); invalidErr == nil {
+			t.Fatalf("invalid seed %q accepted: %s", invalid, invalidOutput)
+		}
+	}
+}
+
 func TestInheritedCaseChildMarkerDoesNotBypassTimeoutWrapper(t *testing.T) {
 	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
 		t.Skip("run-case timeout wrapper probe requires Linux root")

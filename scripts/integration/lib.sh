@@ -25,6 +25,14 @@ mpudp_it_validate_run_id() {
 	fi
 }
 
+mpudp_it_validate_seed() {
+	local seed=${1:-}
+	if [[ ! ${seed} =~ ^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$ ]]; then
+		mpudp_it_die "invalid seed; expected 1..128 letters, digits, dots, underscores, colons, pluses, or hyphens"
+		return 1
+	fi
+}
+
 mpudp_it_new_run_id() {
 	local random_part
 	if [[ -r /proc/sys/kernel/random/uuid ]]; then
@@ -105,9 +113,11 @@ mpudp_it_run_signal_shielded() {
 }
 
 mpudp_it_init_state() {
-	local run_id=$1 state_dir=$2 owner_token=$3 token
+	local run_id=$1 state_dir=$2 owner_token=$3 token seed
 	mpudp_it_validate_run_id "${run_id}" || return 1
 	mpudp_it_validate_owner_token "${owner_token}" || return 1
+	seed=${MPUDP_IT_SEED:-${run_id}}
+	mpudp_it_validate_seed "${seed}" || return 1
 	token=$(mpudp_it_token_for "${run_id}") || return 1
 	if [[ -e ${state_dir} || -L ${state_dir} ]]; then
 		mpudp_it_die "state path already exists: ${state_dir}"
@@ -117,6 +127,7 @@ mpudp_it_init_state() {
 	MPUDP_IT_STATE_CREATED=1
 	printf 'mpudp integration state v1\n' >"${state_dir}/.mpudp-integration-state" || return 1
 	printf '%s\n' "${run_id}" >"${state_dir}/run-id" || return 1
+	printf '%s\n' "${seed}" >"${state_dir}/seed" || return 1
 	printf '%s\n' "${token}" >"${state_dir}/token" || return 1
 	printf '%s\n' "${MPUDP_IT_REPO_ROOT}" >"${state_dir}/repo-root" || return 1
 	: >"${state_dir}/namespaces" || return 1
@@ -143,9 +154,16 @@ mpudp_it_load_state() {
 		return 1
 	fi
 	IFS= read -r MPUDP_IT_RUN_ID <"${state_dir}/run-id"
+	if [[ -f ${state_dir}/seed ]]; then
+		IFS= read -r MPUDP_IT_SEED <"${state_dir}/seed"
+	else
+		# State written before replay seeds were introduced remains recoverable.
+		MPUDP_IT_SEED=${MPUDP_IT_RUN_ID}
+	fi
 	IFS= read -r MPUDP_IT_TOKEN <"${state_dir}/token"
 	IFS= read -r MPUDP_IT_OWNER_TOKEN <"${state_dir}/owner-token"
 	mpudp_it_validate_run_id "${MPUDP_IT_RUN_ID}"
+	mpudp_it_validate_seed "${MPUDP_IT_SEED}"
 	mpudp_it_validate_owner_token "${MPUDP_IT_OWNER_TOKEN}"
 	expected_token=$(mpudp_it_token_for "${MPUDP_IT_RUN_ID}")
 	if [[ ${MPUDP_IT_TOKEN} != "${expected_token}" || ! ${MPUDP_IT_TOKEN} =~ ^[0-9a-f]{8}$ ]]; then
@@ -156,7 +174,7 @@ mpudp_it_load_state() {
 	MPUDP_IT_NS_PREFIX="mpudp-it-${MPUDP_IT_RUN_ID}"
 	MPUDP_IT_TABLE4="mpu_${MPUDP_IT_TOKEN}_4"
 	MPUDP_IT_TABLE6="mpu_${MPUDP_IT_TOKEN}_6"
-	export MPUDP_IT_RUN_ID MPUDP_IT_TOKEN MPUDP_IT_OWNER_TOKEN MPUDP_IT_STATE_DIR MPUDP_IT_NS_PREFIX MPUDP_IT_TABLE4 MPUDP_IT_TABLE6
+	export MPUDP_IT_RUN_ID MPUDP_IT_SEED MPUDP_IT_TOKEN MPUDP_IT_OWNER_TOKEN MPUDP_IT_STATE_DIR MPUDP_IT_NS_PREFIX MPUDP_IT_TABLE4 MPUDP_IT_TABLE6
 }
 
 mpudp_it_assert_state_child_path() {

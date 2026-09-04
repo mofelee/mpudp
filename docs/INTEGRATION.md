@@ -264,7 +264,11 @@ quiet interval.
 
 ## Run ownership and cleanup
 
-Run IDs contain 1..48 lowercase letters, digits, or hyphens. A SHA-256-derived
+Run IDs contain 1..48 lowercase letters, digits, or hyphens. `MPUDP_IT_SEED`
+accepts 1..128 letters, digits, dots, underscores, colons, pluses, or hyphens
+and defaults to the run ID. The exact textual seed is persisted in run state,
+included in the case-start event, and copied into failure metadata for replay.
+A SHA-256-derived
 eight-hex token makes every transient host interface and nft table unique while
 remaining within Linux's 15-byte interface-name limit. State is mode 0700 and
 records namespaces, transient links, PIDs plus `/proc` start times, capability

@@ -31,6 +31,7 @@ mpudp_it_require_root
 mpudp_it_require_commands ip nft tc sysctl sha256sum stat find
 if [[ -z ${run_id} ]]; then run_id=$(mpudp_it_new_run_id); fi
 mpudp_it_validate_run_id "${run_id}"
+mpudp_it_validate_seed "${MPUDP_IT_SEED:-${run_id}}"
 if [[ -z ${state_dir} ]]; then state_dir=$(mpudp_it_default_state_dir "${run_id}"); fi
 if [[ -z ${owner_token} ]]; then owner_token=$(mpudp_it_new_owner_token); fi
 mpudp_it_validate_owner_token "${owner_token}"
