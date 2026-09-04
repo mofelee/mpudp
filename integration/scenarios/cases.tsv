@@ -1,0 +1,15 @@
+# case	runner	family	timeout_seconds	requires_peer_runtime
+transparent-nat-v4	raw-nat-smoke	4	20	false
+transparent-nat-v6	raw-nat-smoke	6	20	false
+path-controls-v4	path-controls	4	20	false
+path-controls-v6	path-controls	6	20	false
+nat-rebinding-trigger-v4	nat-rebinding-trigger	4	20	false
+nat-rebinding-trigger-v6	nat-rebinding-trigger	6	20	false
+peer-smoke-v4	peer-smoke	4	30	false
+peer-smoke-v6	peer-smoke	6	30	false
+peer-payload-mtu-v4	peer-payload-mtu	4	45	false
+peer-payload-mtu-v6	peer-payload-mtu	6	45	false
+peer-nat-rebinding-v4	peer-nat-rebinding	4	35	false
+peer-nat-rebinding-v6	peer-nat-rebinding	6	35	false
+peer-endpoint-expiry-v4	peer-endpoint-expiry	4	25	false
+peer-endpoint-expiry-v6	peer-endpoint-expiry	6	25	false

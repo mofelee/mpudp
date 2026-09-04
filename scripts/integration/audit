@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	printf '%s\n' 'Usage: scripts/integration/audit --run-id ID [--state DIR] [--expect-clean] [--ignore-state]'
+}
+
+run_id=''
+state_dir=''
+expect_clean=0
+ignore_state=0
+while (( $# > 0 )); do
+	case $1 in
+		--run-id) run_id=${2:?missing value for --run-id}; shift 2 ;;
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--expect-clean) expect_clean=1; shift ;;
+		--ignore-state) ignore_state=1; shift ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown audit argument: $1"; exit 2 ;;
+	esac
+done
+if [[ -z ${run_id} ]]; then usage >&2; exit 2; fi
+mpudp_it_validate_run_id "${run_id}"
+MPUDP_IT_RUN_ID=${run_id}
+MPUDP_IT_TOKEN=$(mpudp_it_token_for "${run_id}")
+MPUDP_IT_NS_PREFIX="mpudp-it-${MPUDP_IT_RUN_ID}"
+MPUDP_IT_TABLE4="mpu_${MPUDP_IT_TOKEN}_4"
+MPUDP_IT_TABLE6="mpu_${MPUDP_IT_TOKEN}_6"
+if [[ -z ${state_dir} ]]; then state_dir=$(mpudp_it_default_state_dir "${run_id}"); fi
+
+findings=0
+for role in alice t1 t2 t3 t4 t5 bob; do
+	namespace=$(mpudp_it_ns "${role}")
+	if [[ -e /run/netns/${namespace} ]]; then
+		printf 'namespace=%s\n' "${namespace}"
+		findings=$((findings + 1))
+	fi
+done
+for family in 4 6; do
+	for path in 1 2 3 4 5; do
+		for segment in i o; do
+			for endpoint in a b; do
+				link=$(mpudp_it_host_link_name "${family}${path}${segment}${endpoint}")
+				if ip link show dev "${link}" >/dev/null 2>&1; then
+					printf 'host_link=%s\n' "${link}"
+					findings=$((findings + 1))
+				fi
+			done
+		done
+	done
+done
+for proc_dir in /proc/[0-9]*; do
+	pid=${proc_dir##*/}
+	if mpudp_it_process_matches_run "${pid}"; then
+		printf 'process=%s\n' "${proc_dir##*/}"
+		findings=$((findings + 1))
+	fi
+done
+if (( ignore_state == 0 )) && [[ -e ${state_dir} || -L ${state_dir} ]]; then
+	printf 'state=%s\n' "${state_dir}"
+	findings=$((findings + 1))
+fi
+
+if (( expect_clean != 0 && findings != 0 )); then
+	mpudp_it_log "cleanup audit failed: run=${run_id} findings=${findings}"
+	exit 1
+fi
+if (( findings == 0 )); then
+	mpudp_it_log "cleanup audit clean: run=${run_id}"
+else
+	mpudp_it_log "audit found ${findings} live resources for run ${run_id}"
+fi

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+usage() {
+	printf '%s\n' 'Usage: capture-fragments --state DIR --run-id ID --path N --family 4|6 --events FILE --log FILE --ready FILE'
+}
+
+state_dir=''
+run_id=''
+path=''
+family=''
+events_file=''
+log_file=''
+ready_file=''
+while (( $# > 0 )); do
+	case $1 in
+		--state) state_dir=${2:?missing value for --state}; shift 2 ;;
+		--run-id) run_id=${2:?missing value for --run-id}; shift 2 ;;
+		--path) path=${2:?missing value for --path}; shift 2 ;;
+		--family) family=${2:?missing value for --family}; shift 2 ;;
+		--events) events_file=${2:?missing value for --events}; shift 2 ;;
+		--log) log_file=${2:?missing value for --log}; shift 2 ;;
+		--ready) ready_file=${2:?missing value for --ready}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		*) mpudp_it_die "unknown capture-fragments argument: $1"; exit 2 ;;
+	esac
+done
+
+if [[ -z ${state_dir} || -z ${run_id} || -z ${path} || -z ${family} || -z ${events_file} || -z ${log_file} || -z ${ready_file} ]]; then
+	usage >&2
+	exit 2
+fi
+mpudp_it_require_root
+mpudp_it_require_commands ip tcpdump grep sha256sum stat
+mpudp_it_load_state "${state_dir}"
+if [[ ${run_id} != "${MPUDP_IT_RUN_ID}" ]]; then mpudp_it_die "--run-id does not match state"; exit 2; fi
+mpudp_it_path_check "${path}"
+mpudp_it_family_check "${family}"
+for output_path in "${events_file}" "${log_file}" "${ready_file}"; do
+	mpudp_it_assert_state_child_path "${output_path}" || exit 2
+	if [[ -L ${output_path} ]]; then mpudp_it_die "refusing symlink capture output: ${output_path}"; exit 2; fi
+done
+
+t_ns=$(mpudp_it_ns "t${path}")
+fragment_filter='ip[6:2] & 0x3fff != 0'
+if [[ ${family} == 6 ]]; then fragment_filter='ip6 protochain 44'; fi
+: >"${events_file}"
+: >"${log_file}"
+
+capture_pid=''
+cleanup_capture() {
+	local status=$? child_status
+	trap - EXIT
+	trap '' HUP INT TERM
+	if [[ ${capture_pid:-} =~ ^[1-9][0-9]*$ ]] && kill -0 "${capture_pid}" 2>/dev/null; then
+		kill -TERM "${capture_pid}" 2>/dev/null || true
+		set +e
+		wait "${capture_pid}" 2>/dev/null
+		child_status=$?
+		set -e
+		if (( status == 0 && child_status != 0 && child_status != 143 )); then status=${child_status}; fi
+	fi
+	exit "${status}"
+}
+trap cleanup_capture EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ip netns exec "${t_ns}" env LC_ALL=C tcpdump --immediate-mode -i any -nn -q -l -s 128 "${fragment_filter}" \
+	>"${events_file}" 2>"${log_file}" &
+capture_pid=$!
+capture_ready=0
+for (( capture_attempt=0; capture_attempt<100; capture_attempt++ )); do
+	if grep -q 'listening on' "${log_file}"; then capture_ready=1; break; fi
+	if ! kill -0 "${capture_pid}" 2>/dev/null; then break; fi
+	sleep 0.05
+done
+if (( capture_ready == 0 )); then
+	mpudp_it_die "fragment observer failed to become ready in ${t_ns}; see ${log_file}"
+	exit 1
+fi
+printf 'ready\n' >"${ready_file}"
+
+set +e
+wait "${capture_pid}"
+capture_status=$?
+set -e
+capture_pid=''
+exit "${capture_status}"
