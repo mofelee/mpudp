@@ -103,9 +103,18 @@ Linux UDP socket 创建时按地址族设置并回读验证：
 | IPv4 | `IP_MTU_DISCOVER` | `IP_PMTUDISC_DO` |
 | IPv6 | `IPV6_MTU_DISCOVER` | `IPV6_PMTUDISC_DO` |
 
-因此超过真实路径能力的 datagram 由内核以 `EMSGSIZE` / Packet Too Big 报告，不会在
-transport 内拆 shard。该错误同时分类为 `ErrPathMTUExceeded`，只影响本次 shard 尝试，
-不会关闭 Carrier 或 Session；同一 block 的其他路径继续发送。
+`AF_INET6` socket 还会读取 `IPV6_V6ONLY`。值为 0 时，同一 dual-stack socket 可以发送
+IPv4-mapped datagram，因此实现会同时设置并回读验证 IPv6 和 IPv4 两组 PMTU discovery
+option；值为 1 的 IPv6-only socket 只需设置 IPv6 option。
+
+DF/PMTU socket mode 禁止本地 IPv4 fragmentation，并让内核在已知路径能力不足时以
+`EMSGSIZE`（或收到 Packet Too Big 后的等价错误）拒绝 datagram；transport 不会再拆
+shard。该错误同时分类为 `ErrPathMTUExceeded`，只影响本次 shard 尝试，不会关闭
+Carrier 或 Session；同一 block 的其他路径继续发送。
+
+这不是动态 PMTU 探测器。远端 ICMP Packet Too Big 被过滤时，错误可能不会同步返回，
+流量会静默黑洞。部署者必须把 `transport.max_udp_payload` 配置为所有 Carrier 的已知安全
+最小 UDP payload；v0.1 不实现 PLPMTUD、自动提高预算或每 Carrier 可变 shard size。
 
 非 Linux build 的 `PMTUDiscoverySupported()` 明确返回 false。默认仍可使用 UDP，但不
 声称具备无 IP fragmentation 保证；设置 `RequirePMTU` 会以 `ErrPMTUUnsupported` 拒绝

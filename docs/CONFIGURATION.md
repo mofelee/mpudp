@@ -61,6 +61,15 @@ HMAC 认证与完整性保护，不提供 Payload 加密。`Secret.String`、`Go
 
 ## UDP payload budget
 
+为避免混淆，本文使用以下四个大小概念：
+
+| 术语 | 定义 |
+|---|---|
+| Path MTU | 一个完整 IP packet 在路径上的大小上限 |
+| UDP payload | UDP header 之后的 bytes，包括完整 MPUDP wire packet |
+| shard data capacity | 协商 UDP payload 减去固定 71-byte `DATA_SHARD` wire overhead |
+| Datagram 上限 | `min(k * shard data capacity, limits.max_datagram_size)` |
+
 | 字段 | 默认值 | 合法闭区间 | 归属 |
 |---|---:|---:|---|
 | `transport.max_udp_payload` | 1200 bytes | 72..65507 bytes | 完整 MPUDP UDP payload |
@@ -69,11 +78,16 @@ HMAC 认证与完整性保护，不提供 Payload 加密。`Secret.String`、`Go
 prefix、type-specific body、完整 32-byte HMAC tag 和 packet payload。它不是 IP MTU，
 也不是单纯的 RS shard data capacity。72 bytes 是固定 v0.1 layout 中强制控制包
 （PING/PONG）的完整最小预算；65507 是保守的 UDP payload 硬上限。1200 为 IPv6
-minimum link MTU 留出了 IP/UDP header 空间，但不能保证穿过管理员配置得更小的
-下层隧道。
+minimum link MTU 留出了 IP/UDP header 空间，但它不是探测出的 Path MTU，也不能保证
+穿过管理员配置得更小的下层隧道。部署者必须按所有 Carrier 中已知的最小安全 UDP
+payload 向下配置。Linux DF/PMTU socket mode 只阻止本地分片；远端 ICMP Packet Too Big
+被过滤时仍可能形成静默黑洞，v0.1 不实现 PLPMTUD 或自动调高预算。
 
-本字段是 Session 全局声明值；后续握手使用双方声明值的较小值。所有控制包和
-`DATA_SHARD` 都受协商值约束。每 Carrier 可变 shard size 不属于 v0.1。
+本字段是 Session 全局声明值。HELLO 字段声明发送方的本地能力，整个 HELLO packet 也
+按发送方本地预算编码。HELLO_ACK 字段声明响应方的本地能力，但整个 ACK packet 按双方
+声明值的较小值编码。认证握手成功后，每个方向冻结该协商预算；后续 PING、PONG、
+`DATA_SHARD` 和 CLOSE 都按它编码。CLOSE 的固定 wire size 是 56 bytes。每 Carrier 可变
+shard size 不属于 v0.1。
 
 ## 资源上限
 

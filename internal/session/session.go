@@ -492,6 +492,7 @@ func (s *Session) Close(ctx context.Context) error {
 		now := s.settings.clock.Now()
 		s.mu.Lock()
 		wasEstablished := s.state == StateEstablished
+		budget := s.sendMaxUDPPayload
 		paths := s.closePathsLocked(now)
 		decoder := s.decoder
 		s.decoder = nil
@@ -510,7 +511,7 @@ func (s *Session) Close(ctx context.Context) error {
 			} else {
 				plans := make([]sendPlan, 0, len(paths))
 				for _, path := range paths {
-					plans = append(plans, sendPlan{message: message, path: path, budget: s.settings.localMaxUDPPayload})
+					plans = append(plans, sendPlan{message: message, path: path, budget: budget})
 				}
 				attempts := s.executePlansWithoutLifetime(ctx, plans)
 				var failures []error

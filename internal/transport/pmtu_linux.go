@@ -26,6 +26,17 @@ func configurePMTU(conn syscall.Conn, network string) (bool, error) {
 			socketErr = setAndVerifySocketOption(int(fd), unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO)
 		case "udp6":
 			socketErr = setAndVerifySocketOption(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MTU_DISCOVER, unix.IPV6_PMTUDISC_DO)
+			if socketErr != nil {
+				break
+			}
+			ipv6Only, getErr := unix.GetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY)
+			if getErr != nil {
+				socketErr = getErr
+				break
+			}
+			if ipv6Only == 0 {
+				socketErr = setAndVerifySocketOption(int(fd), unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO)
+			}
 		default:
 			socketErr = fmt.Errorf("%w: cannot determine UDP address family", ErrPMTUUnsupported)
 		}

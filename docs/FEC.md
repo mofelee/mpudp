@@ -50,7 +50,9 @@ OriginalLength` 表示。它在计算前检查 `k*C` 和 `n*C` 的 `int` 乘法�
 
 Datagram 长度可以恰好等于 `EffectiveLimit`。多一个 byte 会在取得 PacketID 或分配
 任何 shard storage 之前返回 `ErrMessageTooLarge`。每个 shard 长度相同，并被限制在
-`C` 内，因此完整 `DATA_SHARD` UDP payload 不超过协商预算，也不依赖 IP fragmentation。
+`C` 内，因此完整 `DATA_SHARD` UDP payload 不超过协商预算。只有当该预算不高于真实路径
+安全 UDP payload 且 Linux DF/PMTU mode 生效时，网络层才能进一步保证不产生本地 IP
+fragment；FEC 层本身只保证不会把一个 shard 再做协议内分片。
 
 ## 编码语义
 

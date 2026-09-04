@@ -377,6 +377,38 @@ func TestCloseIsBestEffortIdempotentAndStableAcrossConcurrentCallers(t *testing.
 	}
 }
 
+func TestCloseUsesFrozenNegotiatedBudgetAfterAsymmetricHandshake(t *testing.T) {
+	clock := newFakeClock()
+	path := newFakePath("carrier", "198.51.100.1:9000")
+	session, err := NewInitiator(testSessionID, testConfig(clock, 1200), []Path{path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.HandlePacket(context.Background(), received(path, ackPacket(t, testSessionID, 3, 2, 1000))); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := session.Snapshot(); snapshot.SendMaxUDPPayload != 1000 || snapshot.ReceiveMaxUDPPayload != 1000 {
+		t.Fatalf("asymmetric negotiation = %+v, want 1000-byte frozen budgets", snapshot)
+	}
+
+	// CLOSE has fixed wire bytes for every valid budget, so poison the private
+	// local setting to prove Close uses the already-frozen negotiated budget.
+	session.settings.localMaxUDPPayload = wire.MinUDPPayload - 1
+	before := path.PacketCount()
+	if err := session.Close(context.Background()); err != nil {
+		t.Fatalf("Close after 1200/1000 negotiation: %v", err)
+	}
+	if path.PacketCount() != before+1 {
+		t.Fatalf("Close sends = %d, want 1", path.PacketCount()-before)
+	}
+	if got := decodeSent(t, path.Packets()[before], 1000).Header.Type; got != wire.TypeClose {
+		t.Fatalf("packet type = %d, want CLOSE", got)
+	}
+}
+
 func TestHighFrequencyWriteContextsCleanUpBeforeClose(t *testing.T) {
 	clock := newFakeClock()
 	path := newFakePath("carrier", "198.51.100.1:9000")
