@@ -114,7 +114,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            conntrack iproute2 iputils-ping nftables procps tcpdump
+            conntrack diffutils iproute2 iputils-ping nftables procps tcpdump
       - name: Run integration case
         env:
           MPUDP_IT_ARTIFACT_ROOT: ${{ runner.temp }}/mpudp-it-artifacts

@@ -142,6 +142,7 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 		"actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
 		"persist-credentials: false",
 		"GOFLAGS=-buildvcs=false",
+		"conntrack diffutils iproute2 iputils-ping nftables procps tcpdump",
 		"MPUDP_IT_REQUIRE_CONNTRACK=1",
 		"MPUDP_IT_SEED=${MPUDP_IT_SEED}",
 		"--run-id \"${MPUDP_IT_RUN_ID}\"",
