@@ -56,14 +56,16 @@ if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
 	if [[ ${runner} == peer-smoke || ${runner} == peer-nat-rebinding || ${runner} == direct-single-carrier ]]; then
 		mpudp_it_require_commands ss diff
 	fi
-	exec timeout --signal=TERM --kill-after=2s "${case_timeout}s" \
-		bash -c 'source "$1"; trap cleanup_case_worker EXIT; run_case_worker "$2" "$3" "$4" "$5" "$6"' \
+	exec timeout --signal=TERM --kill-after=10s "${case_timeout}s" \
+		bash -c 'source "$1"; trap cleanup_case_worker EXIT; trap "exit 129" HUP; trap "exit 130" INT; trap "exit 143" TERM; run_case_worker "$2" "$3" "$4" "$5" "$6"' \
 		"${SCRIPT_DIR}/run-case-worker" "${0}" "${state_dir}" "${case_name}" "${case_timeout}" "${runner}" "${family}"
 fi
 
 netprobe=''
 peerprobe=''
 direct_mutation_file=''
+canonical_rebinding_mutation_file=''
+canonical_mtu_mutation_file=''
 rsprobe=''
 build_netprobe() {
 	netprobe=${MPUDP_IT_STATE_DIR}/bin/netprobe
@@ -152,6 +154,8 @@ cleanup_case_worker() {
 		fi
 	done
 	if ! cleanup_direct_single_carrier; then cleanup_status=1; fi
+	if ! cleanup_canonical_rebinding; then cleanup_status=1; fi
+	if ! cleanup_canonical_mtu; then cleanup_status=1; fi
 	if (( worker_status == 0 && cleanup_status != 0 )); then worker_status=1; fi
 	exit "${worker_status}"
 }
@@ -667,6 +671,67 @@ cleanup_direct_single_carrier() {
 	return "${status}"
 }
 
+cleanup_canonical_rebinding() {
+	local marker=${canonical_rebinding_mutation_file:-${MPUDP_IT_STATE_DIR:-}/endpoint-rebinding-and-expiry.mutations}
+	local t1_ns cleanup_path status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	t1_ns=$(mpudp_it_ns t1)
+	for cleanup_path in 2 3; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
+			--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1; then
+			status=1
+		fi
+	done
+	if ! remove_nft_rules_with_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" forward \
+		mpudp-expired-endpoint-drop >/dev/null 2>&1; then
+		status=1
+	fi
+	if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-rebind \
+		--path 1 --family 4 >/dev/null 2>&1; then
+		status=1
+	fi
+	for cleanup_path in 2 3; do
+		if ip netns exec "$(mpudp_it_ns alice)" tc qdisc show dev "a4p${cleanup_path}" |
+			awk '$2 == "netem" {found=1} END {exit !found}'; then
+			mpudp_it_die "canonical rebinding netem remains on path ${cleanup_path}"
+			status=1
+		fi
+	done
+	if ip netns exec "${t1_ns}" nft -a list table ip "${MPUDP_IT_TABLE4}" |
+		awk '/comment "mpudp-(rebind-|expired-endpoint-drop)/ {found=1} END {exit !found}'; then
+		mpudp_it_die "canonical rebinding nft rule remains after cleanup"
+		status=1
+	fi
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
+cleanup_canonical_mtu() {
+	local marker=${canonical_mtu_mutation_file:-${MPUDP_IT_STATE_DIR:-}/mtu-budget-no-fragment.mutations}
+	local family namespace interface current status=0
+	if [[ -z ${MPUDP_IT_STATE_DIR:-} || ! -f ${marker} ]]; then return 0; fi
+	for family in 4 6; do
+		if ! "${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
+			--path 1 --family "${family}" --value 1500 >/dev/null 2>&1; then
+			status=1
+		fi
+		while read -r namespace interface; do
+			current=$(ip -n "${namespace}" -o link show dev "${interface}" |
+				awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')
+			if [[ ${current} != 1500 ]]; then
+				mpudp_it_die "canonical MTU cleanup left ${namespace}/${interface} at ${current:-unknown}"
+				status=1
+			fi
+		done < <(printf '%s %s\n' \
+			"$(mpudp_it_ns alice)" "a${family}p1" \
+			"$(mpudp_it_ns t1)" "in${family}" \
+			"$(mpudp_it_ns t1)" "out${family}" \
+			"$(mpudp_it_ns bob)" "b${family}p1")
+	done
+	if (( status == 0 )); then rm -f -- "${marker}"; fi
+	return "${status}"
+}
+
 configure_direct_single_carrier() {
 	local alice_ns bob_ns t_ns alice_address bob_address alice_gateway bob_gateway
 	alice_ns=$(mpudp_it_ns alice)
@@ -977,16 +1042,8 @@ run_endpoint_rebinding_and_expiry() {
 		return 2
 	fi
 	t1_ns=$(mpudp_it_ns t1)
-	cleanup_canonical_rebinding() {
-		for cleanup_path in 2 3; do
-			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-netem \
-				--path "${cleanup_path}" --family 4 --direction forward >/dev/null 2>&1 || true
-		done
-		remove_nft_rules_with_comment "${t1_ns}" ip "${MPUDP_IT_TABLE4}" forward \
-			mpudp-expired-endpoint-drop >/dev/null 2>&1 || true
-		"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" clear-rebind \
-			--path 1 --family 4 >/dev/null 2>&1 || true
-	}
+	canonical_rebinding_mutation_file=${MPUDP_IT_STATE_DIR}/endpoint-rebinding-and-expiry.mutations
+	: >"${canonical_rebinding_mutation_file}"
 	trap cleanup_canonical_rebinding RETURN
 
 	"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" nat-rebind \
@@ -1185,13 +1242,9 @@ run_mtu_budget_no_fragment() {
 	local -a udp_pids=() udp_event_files=() udp_log_files=()
 	local -a path_counter_snapshot=() failure_forward_before=()
 	mpudp_it_require_commands tcpdump grep
-	restore_canonical_mtu() {
-		for restore_family in 4 6; do
-			"${SCRIPT_DIR}/control" --state "${MPUDP_IT_STATE_DIR}" mtu \
-				--path 1 --family "${restore_family}" --value 1500 >/dev/null 2>&1 || true
-		done
-	}
-	trap restore_canonical_mtu RETURN
+	canonical_mtu_mutation_file=${MPUDP_IT_STATE_DIR}/mtu-budget-no-fragment.mutations
+	: >"${canonical_mtu_mutation_file}"
+	trap cleanup_canonical_mtu RETURN
 
 	# The first exchange freezes min(1200,1000) in both directions.
 	run_canonical_mtu_safe_phase 4 mtu-negotiate 1500 1000 1200 2787 1000
@@ -1231,7 +1284,7 @@ run_mtu_budget_no_fragment() {
 	assert_event_count "${peer_listener_events}" datagram_received main 3387 1 \
 		"PMTU surviving-path recovery"
 
-	restore_canonical_mtu
+	cleanup_canonical_mtu
 	trap - RETURN
 	mpudp_it_log "case passed: ${case_name} (1200/1000 negotiation, IPv6 1280, 520 tunnel budget, exact/+1, PMTU, zero fragments)"
 }

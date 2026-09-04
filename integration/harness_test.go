@@ -123,6 +123,33 @@ func TestDirectSingleCarrierScenarioIsDistinctAndCleanupOwned(t *testing.T) {
 	}
 }
 
+func TestCanonicalMutationCasesHaveWorkerExitCleanup(t *testing.T) {
+	repository, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := os.ReadFile(filepath.Join(repository, "scripts", "integration", "run-case"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(runner)
+	for _, required := range []string{
+		`if ! cleanup_canonical_rebinding; then cleanup_status=1; fi`,
+		`if ! cleanup_canonical_mtu; then cleanup_status=1; fi`,
+		`--kill-after=10s`,
+		`trap "exit 143" TERM`,
+		`canonical_rebinding_mutation_file=${MPUDP_IT_STATE_DIR}/endpoint-rebinding-and-expiry.mutations`,
+		`canonical_mtu_mutation_file=${MPUDP_IT_STATE_DIR}/mtu-budget-no-fragment.mutations`,
+		`mpudp-expired-endpoint-drop`,
+		`for family in 4 6; do`,
+		`--path 1 --family "${family}" --value 1500`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("canonical worker-exit cleanup is missing %q", required)
+		}
+	}
+}
+
 func TestHarnessPersistsBoundedTextualSeed(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("bash harness is Linux-only")
