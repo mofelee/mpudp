@@ -63,6 +63,7 @@ func TestHarnessShellSyntaxAndPublicArguments(t *testing.T) {
 		"transparent-nat-v4", "transparent-nat-v6", "path-controls-v4", "peer-smoke-v4", "peer-smoke-v6",
 		"peer-payload-mtu-v4", "peer-payload-mtu-v6", "peer-nat-rebinding-v4", "peer-nat-rebinding-v6",
 		"peer-endpoint-expiry-v4", "peer-endpoint-expiry-v6", "direct-single-carrier",
+		"rs53-five-carrier-loss", "rs53-two-carrier-rotation", "slow-path-early-recovery",
 	} {
 		if !strings.Contains(cases, name) {
 			t.Fatalf("case manifest output is missing %q:\n%s", name, cases)
@@ -504,7 +505,7 @@ if mpudp_it_process_matches_run "$4"; then exit 10; fi
 MPUDP_IT_RUN_ID=$3
 mpudp_it_process_matches_run "$4"
 `
-	for _, helper := range []string{"netprobe", "peerprobe", "capture-fragments", "capture-udp"} {
+	for _, helper := range []string{"netprobe", "peerprobe", "rsprobe", "capture-fragments", "capture-udp"} {
 		t.Run(helper, func(t *testing.T) {
 			const exactRunID = "argv-exact-long"
 			decoy := exec.Command("bash", "-c", `trap 'exit 0' TERM; while :; do sleep 1 & wait $!; done`,

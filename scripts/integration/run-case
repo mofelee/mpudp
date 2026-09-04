@@ -64,6 +64,7 @@ fi
 netprobe=''
 peerprobe=''
 direct_mutation_file=''
+rsprobe=''
 build_netprobe() {
 	netprobe=${MPUDP_IT_STATE_DIR}/bin/netprobe
 	if [[ -x ${netprobe} ]]; then return 0; fi
@@ -91,6 +92,21 @@ build_peerprobe() {
 	)
 	chmod 0700 "${temporary}"
 	mv -- "${temporary}" "${peerprobe}"
+	trap - RETURN
+}
+
+build_rsprobe() {
+	rsprobe=${MPUDP_IT_STATE_DIR}/bin/rsprobe
+	if [[ -x ${rsprobe} ]]; then return 0; fi
+	mkdir -p -- "${MPUDP_IT_STATE_DIR}/bin"
+	temporary=${rsprobe}.tmp.$$
+	trap 'rm -f -- "${temporary}"' RETURN
+	(
+		cd "${MPUDP_IT_REPO_ROOT}"
+		go build -trimpath -o "${temporary}" ./integration/cmd/rsprobe
+	)
+	chmod 0700 "${temporary}"
+	mv -- "${temporary}" "${rsprobe}"
 	trap - RETURN
 }
 
@@ -1768,6 +1784,82 @@ run_nat_rebinding_trigger() {
 	mpudp_it_log "case passed: ${case_name} (source ports 41001 -> 41002 produced distinct NAT endpoints)"
 }
 
+run_rs_scenario() {
+	local events_file log_file ready_file continue_file rsprobe_pid rsprobe_status
+	local complete_count primary_count boundary_count
+	build_rsprobe
+	events_file=${MPUDP_IT_STATE_DIR}/${case_name}-events.ndjson
+	log_file=${MPUDP_IT_STATE_DIR}/${case_name}.log
+	ready_file=${MPUDP_IT_STATE_DIR}/${case_name}.ready
+	continue_file=${MPUDP_IT_STATE_DIR}/${case_name}.continue
+	: >"${events_file}"
+	: >"${log_file}"
+	rm -f -- "${ready_file}" "${continue_file}"
+	"${rsprobe}" --scenario "${case_name}" --run-id "${MPUDP_IT_RUN_ID}" \
+		--timeout "${case_timeout}s" --events "${events_file}" \
+		--ready-file "${ready_file}" --continue-file "${continue_file}" >"${log_file}" 2>&1 &
+	rsprobe_pid=$!
+	if ! mpudp_it_record_pid "${rsprobe_pid}"; then
+		kill -TERM "${rsprobe_pid}" 2>/dev/null || true
+		wait "${rsprobe_pid}" 2>/dev/null || true
+		return 1
+	fi
+	if ! wait_ready "${ready_file}" "${rsprobe_pid}"; then
+		mpudp_it_die "${case_name} deterministic Session probe did not become ready; see ${log_file}"
+		return 1
+	fi
+	printf 'continue\n' >"${continue_file}"
+	set +e
+	wait "${rsprobe_pid}"
+	rsprobe_status=$?
+	set -e
+	if (( rsprobe_status != 0 )); then
+		mpudp_it_die "${case_name} deterministic Session probe failed; see ${log_file}"
+		return 1
+	fi
+	complete_count=$(grep -c '"event":"scenario_complete"' "${events_file}" || true)
+	if [[ ${complete_count} != 1 ]]; then
+		mpudp_it_die "${case_name} completion event count=${complete_count}, want 1"
+		return 1
+	fi
+	case ${case_name} in
+		rs53-five-carrier-loss)
+			primary_count=$(grep -c '"event":"two_loss_recovered"' "${events_file}" || true)
+			boundary_count=$(grep -c '"event":"three_loss_expired"' "${events_file}" || true)
+			if [[ ${primary_count} != 10 || ${boundary_count} != 1 ]]; then
+				mpudp_it_die "five-Carrier evidence counts=${primary_count}/${boundary_count}, want 10/1"
+				return 1
+			fi
+			;;
+		rs53-two-carrier-rotation)
+			primary_count=$(grep -c '"event":"rotation_observed"' "${events_file}" || true)
+			boundary_count=$(grep -Ec '"event":"(two_shard_carrier_lost_recovered|three_shard_carrier_lost_expired|post_loss_session_recovered)"' "${events_file}" || true)
+			if [[ ${primary_count} != 4 || ${boundary_count} != 3 ]]; then
+				mpudp_it_die "two-Carrier evidence counts=${primary_count}/${boundary_count}, want 4/3"
+				return 1
+			fi
+			;;
+		slow-path-early-recovery)
+			primary_count=$(grep -c '"event":"shard_arrived"' "${events_file}" || true)
+			boundary_count=$(grep -c '"event":"datagram_recovered"' "${events_file}" || true)
+			if [[ ${primary_count} != 4 || ${boundary_count} != 1 ]]; then
+				mpudp_it_die "slow-path evidence counts=${primary_count}/${boundary_count}, want 4/1"
+				return 1
+			fi
+			;;
+		*)
+			mpudp_it_die "unsupported deterministic RS scenario ${case_name}"
+			return 2
+			;;
+	esac
+	if grep -Eiq '"(payload|session_id|authentication_tag|psk)"' "${events_file}"; then
+		mpudp_it_die "${case_name} event metadata contains a forbidden sensitive field"
+		return 1
+	fi
+	sed -n 'p' "${events_file}" >>"${MPUDP_IT_STATE_DIR}/events.ndjson"
+	mpudp_it_log "case passed: ${case_name} (deterministic authenticated Session/FEC invariants)"
+}
+
 run_case_worker() {
 	state_dir=$1
 	case_name=$2
@@ -1791,6 +1883,7 @@ run_case_worker() {
 		transparent-nat-reverse-path) run_transparent_nat_reverse_path "${family}" ;;
 		endpoint-rebinding-and-expiry) run_endpoint_rebinding_and_expiry "${family}" ;;
 		mtu-budget-no-fragment) run_mtu_budget_no_fragment "${family}" ;;
+		rs-scenario) run_rs_scenario ;;
 		peer-smoke) run_peer_smoke "${family}" ;;
 		peer-payload-mtu) run_peer_payload_mtu "${family}" ;;
 		peer-nat-rebinding) run_peer_nat_rebinding "${family}" ;;

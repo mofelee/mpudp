@@ -166,6 +166,23 @@ Topology and control cases:
 - `nat-rebinding-trigger-v4` and `nat-rebinding-trigger-v6` create two explicit
   Alice source ports and require Bob to observe two distinct NAT Endpoints.
 
+Deterministic RS(5,3) cases run the production encoder, authenticated wire
+codec, Session state machines, scheduler, one-shot transport sender, and
+decoder through test-only in-memory paths. The injected logical clock makes
+exact shard loss and arrival ordering observable without wall-clock sleeps;
+the outer namespace runner still owns timeout, diagnostics, and cleanup:
+
+- `rs53-five-carrier-loss` covers all ten two-shard loss combinations, injects
+  a duplicate after every recovery, then expires a three-loss block while
+  asserting five one-shot DATA attempts and no reverse DATA response;
+- `rs53-two-carrier-rotation` proves four consecutive `3/2`, `2/3` mappings,
+  recovery when the two-shard Carrier is lost, non-delivery when the
+  three-shard Carrier is lost, and subsequent Session recovery;
+- `slow-path-early-recovery` injects logical arrivals at 10ms, 20ms, 30ms, and
+  500ms while dropping the fifth shard. Its event order requires delivery
+  immediately after the third arrival and before the late shard, with no
+  second delivery.
+
 Public `mpudp.Peer` cases use only the exported Datagram API with fixed RS(5,3)
 and a test-only PSK:
 
