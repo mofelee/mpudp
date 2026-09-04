@@ -1,10 +1,12 @@
 package integration_test
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -37,6 +39,25 @@ type ciWorkflowTrigger struct {
 type ciWorkflowStep struct {
 	If  string `yaml:"if"`
 	Run string `yaml:"run"`
+}
+
+type canonicalCaseContract struct {
+	Name    string
+	Runner  string
+	Family  string
+	Timeout int
+}
+
+var canonicalCaseContracts = []canonicalCaseContract{
+	{Name: "direct-single-carrier", Runner: "direct-single-carrier", Family: "4", Timeout: 30},
+	{Name: "rs53-five-carrier-loss", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
+	{Name: "rs53-two-carrier-rotation", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
+	{Name: "slow-path-early-recovery", Runner: "rs-scenario", Family: "protocol", Timeout: 20},
+	{Name: "transparent-nat-reverse-path", Runner: "transparent-nat-reverse-path", Family: "4", Timeout: 35},
+	{Name: "endpoint-rebinding-and-expiry", Runner: "endpoint-rebinding-and-expiry", Family: "4", Timeout: 40},
+	{Name: "auth-and-state-pollution", Runner: "peer-auth-pollution", Family: "4", Timeout: 45},
+	{Name: "mtu-budget-no-fragment", Runner: "mtu-budget-no-fragment", Family: "dual", Timeout: 70},
+	{Name: "shutdown-cleanup", Runner: "peer-shutdown-cleanup", Family: "4", Timeout: 90},
 }
 
 func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
@@ -88,16 +109,9 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 		}
 	}
 
-	wantCases := []string{
-		"direct-single-carrier",
-		"rs53-five-carrier-loss",
-		"rs53-two-carrier-rotation",
-		"slow-path-early-recovery",
-		"transparent-nat-reverse-path",
-		"endpoint-rebinding-and-expiry",
-		"auth-and-state-pollution",
-		"mtu-budget-no-fragment",
-		"shutdown-cleanup",
+	wantCases := make([]string, 0, len(canonicalCaseContracts))
+	for _, contract := range canonicalCaseContracts {
+		wantCases = append(wantCases, contract.Name)
 	}
 	integrationJob := workflow.Jobs["integration"]
 	if integrationJob.Strategy.FailFast {
@@ -158,6 +172,87 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 	for _, forbidden := range []string{"pull_request_target", "secrets.", "ssh ", "virsh", "hypervisor"} {
 		if strings.Contains(strings.ToLower(text), forbidden) {
 			t.Errorf("CI workflow contains forbidden privileged/external input %q", forbidden)
+		}
+	}
+}
+
+func TestCICanonicalCasesMatchRunnableManifest(t *testing.T) {
+	repository, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.Open(filepath.Join(repository, "integration", "scenarios", "cases.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manifest.Close()
+
+	type manifestCase struct {
+		runner          string
+		family          string
+		timeout         int
+		requiresRuntime string
+	}
+	rows := make(map[string]manifestCase)
+	scanner := bufio.NewScanner(manifest)
+	for lineNumber := 1; scanner.Scan(); lineNumber++ {
+		line := scanner.Text()
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 5 {
+			t.Fatalf("manifest line %d has %d fields, want 5", lineNumber, len(fields))
+		}
+		timeout, parseErr := strconv.Atoi(fields[3])
+		if parseErr != nil || timeout < 1 || timeout > 120 {
+			t.Fatalf("manifest line %d has invalid timeout %q", lineNumber, fields[3])
+		}
+		if _, duplicate := rows[fields[0]]; duplicate {
+			t.Fatalf("manifest case %q is duplicated", fields[0])
+		}
+		rows[fields[0]] = manifestCase{
+			runner: fields[1], family: fields[2], timeout: timeout, requiresRuntime: fields[4],
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	runnerContents, err := os.ReadFile(filepath.Join(repository, "scripts", "integration", "run-case"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerText := string(runnerContents)
+	foundationRunners := map[string]bool{
+		"raw-nat-smoke": true, "path-controls": true, "nat-rebinding-trigger": true,
+		"peer-smoke": true, "peer-payload-mtu": true, "peer-nat-rebinding": true,
+		"peer-endpoint-expiry": true,
+	}
+	seenRunners := make(map[string]bool)
+	for _, contract := range canonicalCaseContracts {
+		row, ok := rows[contract.Name]
+		if !ok {
+			t.Errorf("canonical CI case %q is absent from the manifest", contract.Name)
+			continue
+		}
+		if row.runner != contract.Runner || row.family != contract.Family || row.timeout != contract.Timeout {
+			t.Errorf("canonical case %q manifest = runner %q, family %q, timeout %d; want %q, %q, %d",
+				contract.Name, row.runner, row.family, row.timeout,
+				contract.Runner, contract.Family, contract.Timeout)
+		}
+		if row.requiresRuntime != "false" {
+			t.Errorf("canonical CI case %q is not runnable: requires_peer_runtime=%q", contract.Name, row.requiresRuntime)
+		}
+		if foundationRunners[row.runner] {
+			t.Errorf("canonical CI case %q silently aliases foundation runner %q", contract.Name, row.runner)
+		}
+		seenRunners[row.runner] = true
+	}
+	for runner := range seenRunners {
+		dispatch := runner + `) `
+		if strings.Count(runnerText, dispatch) != 1 {
+			t.Errorf("canonical runner %q dispatch count = %d, want 1", runner, strings.Count(runnerText, dispatch))
 		}
 	}
 }
