@@ -1,4 +1,4 @@
-# Bootstrap Vectors
+# V2 Wire Vectors
 
 `handshake.json` fixes complete 512-byte HELLO, CHALLENGE, FINISH, READY and
 REJECT packets, the 480-byte HELLO digest, the exact HELLO/CHALLENGE transcript,
