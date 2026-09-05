@@ -14,6 +14,20 @@ one descriptor with zero total length and offset. Decoding rejects noncanonical
 ordering, duplicates, truncated or trailing bytes, conflicting bounds, and
 nonzero padding. No partial systematic-shard delivery is exposed.
 
+`EncodePrefix` greedily fills one group from at most 256 already admitted,
+ordered input fragments. It can split the last fragment and returns an explicit
+cursor for the caller's unconsumed input. Empty Datagrams consume descriptors;
+a context with only 24 logical bytes can carry an empty Datagram but rejects a
+nonempty fragment with `ErrNoPayloadCapacity`. All input metadata is checked
+before packing, and failure does not advance the cursor. Queue admission,
+timers, original ownership/deadlines, flush fences and ID assignment remain
+caller responsibilities. Unconsumed input must stay owned until later packing
+or terminal cleanup; a cursor never releases that storage by itself.
+
+A deterministic 1000-by-1400-byte stream test verifies reconstructed original
+bytes, offsets, descriptor/padding accounting and the documented 1472-byte UDP
+capacity model. This proves packing arithmetic only, not network throughput.
+
 Each immutable context fixes data/parity counts and the exact shard length,
 including tail groups. Encoding rejects invalid inputs before shard allocation.
 Decoding requires at least k authenticated, exact-length indexed shards,
@@ -38,4 +52,5 @@ covered in `group_test.go`. Run:
 go test ./internal/fecv2
 go test -race ./internal/fecv2
 go test ./internal/fecv2 -run '^$' -fuzz '^FuzzManifest$' -fuzztime=10s -parallel=2
+go test ./internal/fecv2 -run '^$' -fuzz '^FuzzPrefixPacking$' -fuzztime=10s -parallel=2
 ```
