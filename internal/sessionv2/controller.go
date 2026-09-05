@@ -115,6 +115,10 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 	if err != nil || local != cfg.LocalProfile || setup.ID == (wirev2.SessionID{}) || setup.PathID != setup.Contract.BootstrapPathID || !validBinding(setup.Binding) || cfg.BootstrapPath == nil || cfg.Emit == nil || cfg.Entropy == nil || len(setup.Initial) != InitialCount || setup.Scope == nil {
 		return nil, ErrInvalid
 	}
+	pathCount := min(local.MaxPaths, remote.MaxPaths)
+	if setup.Contract.MaxPaths != pathCount || setup.PathID == 0 || setup.PathID > pathCount {
+		return nil, ErrInvalid
+	}
 	if cfg.Aggregation && setup.Contract.ActiveCaps&negotiationv2.Aggregation == 0 {
 		return nil, ErrUnsupported
 	}
@@ -174,7 +178,9 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.paths = make([]pathState, int(local.MaxPaths))
+	// Only negotiated PathIDs can acquire state. Initial credit remains sized
+	// for the local offer because it was reserved before the peer was selected.
+	c.paths = make([]pathState, int(pathCount))
 	for i := range c.paths {
 		c.paths[i].id = uint16(i + 1)
 		c.paths[i].rate = cfg.PathRatesBPS[uint16(i+1)]
