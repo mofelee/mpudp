@@ -184,7 +184,7 @@ func (s *Session) HandlePacket(ctx context.Context, packet ReceivedPacket) (Hand
 	if err := ctx.Err(); err != nil {
 		return HandleResult{}, err
 	}
-	message, err := wire.DecodeAuthenticated(packet.Payload, s.settings.psk, s.settings.localMaxUDPPayload)
+	message, err := s.settings.authenticator.Decode(packet.Payload, s.settings.localMaxUDPPayload)
 	if err != nil {
 		return HandleResult{}, err
 	}
@@ -473,7 +473,7 @@ func (s *Session) WritePacket(ctx context.Context, payload []byte) (WriteResult,
 		if makeErr != nil {
 			return WriteResult{PacketID: block.PacketID}, makeErr
 		}
-		packets[index], makeErr = wire.AppendAuthenticated(nil, message, s.settings.psk, budget)
+		packets[index], makeErr = s.settings.authenticator.Append(nil, message, budget)
 		if makeErr != nil {
 			return WriteResult{PacketID: block.PacketID}, makeErr
 		}
@@ -627,7 +627,7 @@ func (s *Session) execute(ctx context.Context, plans []sendPlan, cleanFailedProb
 	attempts := make([]SendAttempt, 0, len(plans))
 	for _, plan := range plans {
 		attempt := SendAttempt{Type: plan.message.Header.Type, PathID: plan.path.PathID()}
-		packet, err := wire.AppendAuthenticated(nil, plan.message, s.settings.psk, plan.budget)
+		packet, err := s.settings.authenticator.Append(nil, plan.message, plan.budget)
 		if err == nil {
 			err = plan.path.Send(ctx, packet)
 		}

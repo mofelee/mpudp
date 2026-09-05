@@ -17,7 +17,7 @@ type realClock struct{}
 func (realClock) Now() time.Time { return time.Now() }
 
 type settings struct {
-	psk                    []byte
+	authenticator          *wire.Authenticator
 	params                 fec.Params
 	localMaxUDPPayload     int
 	maxDatagramSize        int
@@ -79,8 +79,12 @@ func normalizeConfig(config Config) (*settings, error) {
 	if clock == nil {
 		clock = realClock{}
 	}
+	authenticator, err := wire.NewAuthenticator(config.PSK)
+	if err != nil {
+		return nil, err
+	}
 	return &settings{
-		psk:                    append([]byte(nil), config.PSK...),
+		authenticator:          authenticator,
 		params:                 config.FEC,
 		localMaxUDPPayload:     config.LocalMaxUDPPayload,
 		maxDatagramSize:        config.MaxDatagramSize,

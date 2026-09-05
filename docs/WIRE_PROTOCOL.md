@@ -59,6 +59,21 @@ boundaries are specified in [PSK management](CONFIGURATION.md#psk-管理).
 HMAC supplies authentication and integrity only. MPUDP v0.1 does **not**
 encrypt payloads and provides no confidentiality.
 
+### Runtime authentication cache
+
+The MPUDP runtime owns a copied PSK and retains at most four reusable HMAC states
+per immutable normalized Session configuration. Listener Sessions share that
+configuration. Each operation borrows a state exclusively and resets it before
+reuse. An empty cache uses a fresh HMAC; a full cache discards excess returned
+states. This bounds retained cache storage, not concurrent callers or in-flight
+hash states, and adds no wait queue or background goroutine.
+
+The cache retains no references to caller-owned key or packet buffers. Encode
+writes its tag into the output packet; decode compares private digest scratch
+before returning the borrowed state. Decoded shard payloads still alias the
+input datagram. Closing one Session does not close a shared cache or change its
+key. Wire bytes and the required authentication-before-state order are unchanged.
+
 ## HELLO and HELLO_ACK
 
 Both handshake packet types use the same four-byte body and have a total UDP
