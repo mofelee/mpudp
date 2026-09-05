@@ -148,6 +148,67 @@ def instant(value):
     return parsed.timestamp()
 
 
+KCP_CORRELATION_COUNTERS = (
+    "malformed_packets", "outbound_packets", "outbound_push_segments", "first_observed_push_segments",
+    "repeated_push_segments", "unclassified_push_segments", "outbound_push_payload_bytes", "outbound_header_bytes",
+    "outbound_ack_segments", "inbound_packets", "inbound_push_segments", "inbound_ack_segments",
+    "incoming_una_advances", "matched_acks", "unmatched_acks", "ambiguous_acks", "incomplete_history_acks",
+    "duplicate_acks", "ack_before_adapter_return", "slot_evictions", "attempt_evictions", "adapter_errors")
+KCP_CORRELATION_DISTRIBUTIONS = ("application_write", "adapter_call", "entry_to_ack", "return_to_ack")
+
+
+def verify_duration_distribution(value):
+    require_counters(value, ("count", "sum_ns", "max_ns"), "KCP duration")
+    buckets = value.get("buckets")
+    if (not isinstance(buckets, list) or len(buckets) != 25 or
+            any(type(count) is not int or count < 0 for count in buckets) or sum(buckets) != value["count"]):
+        raise ValueError("KCP duration histogram bins disagree with count")
+    if value["count"] == 0:
+        if value["sum_ns"] != 0 or value["max_ns"] != 0:
+            raise ValueError("empty KCP duration histogram has nonzero timing")
+    elif not value["max_ns"] <= value["sum_ns"] <= value["count"] * value["max_ns"]:
+        raise ValueError("KCP duration sum or maximum is inconsistent")
+    else:
+        micros = (value["max_ns"] + 999) // 1000
+        maximum_bin = min(24, (micros - 1).bit_length() if micros > 1 else 0)
+        if not buckets[maximum_bin] or any(buckets[maximum_bin + 1:]):
+            raise ValueError("KCP duration maximum disagrees with histogram bins")
+
+
+def verify_kcp_correlation(value, case):
+    traces = value.get("kcp_correlation")
+    if not case["diagnostics"] or case["protocol"] not in ("kcp", "kcp-mpudp"):
+        if traces is not None and traces != []:
+            raise ValueError("unexpected KCP correlation while diagnostics are disabled or protocol is not KCP")
+        return
+    if not isinstance(traces, list) or len(traces) != case["flows_per_worker"]:
+        raise ValueError("missing per-flow KCP correlation diagnostics")
+    packet_correlation = case["protocol"] == "kcp-mpudp"
+    boundary = ("mpudp_datagram_adapter_call; not_individual_socket_write" if packet_correlation else
+                "application_write_only; native_batch_socket_correlation_unavailable")
+    for index, trace in enumerate(traces):
+        require_counters(trace, ("flow", "slot_limit", "attempts_per_slot", *KCP_CORRELATION_COUNTERS), "KCP correlation")
+        if (trace["flow"] != index or trace.get("packet_correlation_available") is not packet_correlation or
+                trace.get("retransmit_reason_available") is not False or trace.get("boundary") != boundary or
+                trace["slot_limit"] != (1024 if packet_correlation else 0) or
+                trace["attempts_per_slot"] != (4 if packet_correlation else 0)):
+            raise ValueError("KCP correlation flow, bounds or measurement boundary is incorrect")
+        for name in KCP_CORRELATION_DISTRIBUTIONS:
+            verify_duration_distribution(trace.get(name))
+        classified_acks = sum(trace[key] for key in ("matched_acks", "unmatched_acks", "ambiguous_acks",
+                                                    "incomplete_history_acks", "duplicate_acks"))
+        if (classified_acks != trace["inbound_ack_segments"] or
+                trace["entry_to_ack"]["count"] != trace["matched_acks"] or
+                trace["return_to_ack"]["count"] + trace["ack_before_adapter_return"] > trace["matched_acks"]):
+            raise ValueError("KCP correlation ACK classification or timing count is inconsistent")
+        if sum(trace[key] for key in ("first_observed_push_segments", "repeated_push_segments",
+                                     "unclassified_push_segments")) != trace["outbound_push_segments"]:
+            raise ValueError("KCP correlation PUSH classification is inconsistent")
+        if not packet_correlation and (any(trace[key] for key in KCP_CORRELATION_COUNTERS) or
+                any(trace[key]["count"] for key in KCP_CORRELATION_DISTRIBUTIONS if key != "application_write")):
+            raise ValueError("native KCP reports unavailable packet correlation observations")
+
+
 def verify_telemetry(value, case, source_sha):
     if not isinstance(value, dict):
         raise ValueError("missing telemetry")
@@ -189,6 +250,7 @@ def verify_telemetry(value, case, source_sha):
                 raise ValueError("KCP flow telemetry differs from requested flows")
         if value["kcp_timeout_retransmits"] != snmp["LostSegs"]:
             raise ValueError("KCP timeout telemetry disagrees with SNMP")
+    verify_kcp_correlation(value, case)
 
 
 def verify_latency(value, case):

@@ -85,7 +85,143 @@ def telemetry_fixture(case):
         value["kcp_snmp"] = {key: 0 for key in ("InSegs", "OutSegs", "RetransSegs", "FastRetransSegs", "EarlyRetransSegs", "LostSegs")}
         value["kcp_sessions"] = [{"flow": flow, "srtt_ms": 0, "srtt_variation_ms": 0, "rto_ms": 0}
                                   for flow in range(case["flows_per_worker"])]
+        if case["diagnostics"]:
+            value["kcp_correlation"] = [correlation_fixture(case["protocol"], flow)
+                                          for flow in range(case["flows_per_worker"])]
     return value
+
+
+def duration_fixture(count=0):
+    return {"count": count, "sum_ns": count * 1000, "max_ns": 1000 if count else 0,
+            "buckets": [count, *([0] * 24)]}
+
+
+def correlation_fixture(protocol, flow):
+    packet = protocol == "kcp-mpudp"
+    value = {key: 0 for key in runner.KCP_CORRELATION_COUNTERS}
+    value.update({"flow": flow, "packet_correlation_available": packet, "retransmit_reason_available": False,
+                  "slot_limit": 1024 if packet else 0, "attempts_per_slot": 4 if packet else 0,
+                  "boundary": "mpudp_datagram_adapter_call; not_individual_socket_write" if packet else
+                  "application_write_only; native_batch_socket_correlation_unavailable"})
+    value.update({key: duration_fixture() for key in runner.KCP_CORRELATION_DISTRIBUTIONS})
+    return value
+
+
+class CorrelationTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        self.case = {"protocol": "kcp-mpudp", "diagnostics": True, "flows_per_worker": 2}
+
+    def verify(self, value, source_sha=SOURCE_SHA):
+        runner.verify_telemetry(value, self.case, source_sha)
+
+    def test_each_kcp_mode_has_its_actual_boundary(self):
+        for protocol in ("kcp", "kcp-mpudp"):
+            self.case["protocol"] = protocol
+            value = telemetry_fixture(self.case)
+            for trace in value["kcp_correlation"]:
+                trace["application_write"] = duration_fixture(1)
+            self.verify(value)
+
+    def test_missing_or_duplicate_flow_trace_is_rejected(self):
+        for traces in (None, [], [correlation_fixture("kcp-mpudp", 0)],
+                       [correlation_fixture("kcp-mpudp", 0), correlation_fixture("kcp-mpudp", 0)]):
+            with self.subTest(traces=traces):
+                value = telemetry_fixture(self.case)
+                value["kcp_correlation"] = traces
+                with self.assertRaisesRegex(ValueError, "correlation"):
+                    self.verify(value)
+
+    def test_original_product_baseline_still_requires_new_probe_trace(self):
+        value = telemetry_fixture(self.case)
+        value.pop("mpudp")
+        value["mpudp_statistics_available"] = False
+        self.verify(value, runner.calibrate.BASELINE_SHA)
+        value.pop("kcp_correlation")
+        with self.assertRaisesRegex(ValueError, "correlation"):
+            self.verify(value, runner.calibrate.BASELINE_SHA)
+
+    def test_disabled_diagnostics_and_non_kcp_cannot_report_trace(self):
+        for protocol, enabled in (("kcp", False), ("kcp-mpudp", False), ("tcp", True), ("mpudp", True)):
+            with self.subTest(protocol=protocol, diagnostics=enabled):
+                self.case.update(protocol=protocol, diagnostics=enabled)
+                value = telemetry_fixture(self.case)
+                self.verify(value)
+                value["kcp_correlation"] = [correlation_fixture("kcp-mpudp", 0)]
+                with self.assertRaisesRegex(ValueError, "unexpected KCP correlation"):
+                    self.verify(value)
+
+    def test_boundary_bounds_and_unknown_reason_are_bound(self):
+        for protocol in ("kcp", "kcp-mpudp"):
+            self.case["protocol"] = protocol
+            for field, wrong in (("packet_correlation_available", protocol != "kcp-mpudp"),
+                                 ("packet_correlation_available", 1), ("retransmit_reason_available", True),
+                                 ("retransmit_reason_available", 0), ("boundary", "individual_socket_write"),
+                                 ("slot_limit", 999), ("attempts_per_slot", 99)):
+                with self.subTest(protocol=protocol, field=field, wrong=wrong):
+                    value = telemetry_fixture(self.case)
+                    value["kcp_correlation"][0][field] = wrong
+                    with self.assertRaisesRegex(ValueError, "boundary"):
+                        self.verify(value)
+
+    def test_histograms_require_25_nonnegative_bins_with_matching_count(self):
+        for field, wrong in (("buckets", [0] * 24), ("buckets", [0] * 26),
+                             ("buckets", [1] + [0] * 24), ("buckets", [-1] + [0] * 24),
+                             ("buckets", [True] + [0] * 24), ("count", True), ("sum_ns", 1), ("max_ns", 1)):
+            with self.subTest(field=field, wrong=wrong):
+                value = telemetry_fixture(self.case)
+                value["kcp_correlation"][0]["entry_to_ack"][field] = wrong
+                with self.assertRaisesRegex(ValueError, "KCP duration"):
+                    self.verify(value)
+
+    def test_missing_or_negative_correlation_fields_are_rejected(self):
+        for field in (*runner.KCP_CORRELATION_COUNTERS, *runner.KCP_CORRELATION_DISTRIBUTIONS):
+            with self.subTest(field=field):
+                value = telemetry_fixture(self.case)
+                del value["kcp_correlation"][0][field]
+                with self.assertRaises(ValueError):
+                    self.verify(value)
+        value = telemetry_fixture(self.case)
+        value["kcp_correlation"][0]["matched_acks"] = -1
+        with self.assertRaises(ValueError):
+            self.verify(value)
+
+    def test_duration_maximum_must_fit_its_nonempty_bucket(self):
+        value = telemetry_fixture(self.case)
+        distribution = duration_fixture(1)
+        value["kcp_correlation"][0]["application_write"] = distribution
+        distribution.update(sum_ns=2000, max_ns=2000)
+        with self.assertRaisesRegex(ValueError, "maximum disagrees"):
+            self.verify(value)
+        distribution["buckets"] = [0, 1, *([0] * 23)]
+        self.verify(value)
+
+    def test_ack_classes_and_exact_timing_cannot_double_count(self):
+        value = telemetry_fixture(self.case)
+        trace = value["kcp_correlation"][0]
+        trace.update(inbound_ack_segments=5, matched_acks=1, unmatched_acks=1, ambiguous_acks=1,
+                     incomplete_history_acks=1, duplicate_acks=1)
+        trace["entry_to_ack"] = duration_fixture(1)
+        # An ACK may be observed before its in-flight adapter call returns.
+        self.verify(value)
+        for field, wrong in (("inbound_ack_segments", 4), ("matched_acks", 2),
+                             ("incomplete_history_acks", 0), ("ack_before_adapter_return", 2)):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(value)
+                invalid["kcp_correlation"][0][field] = wrong
+                with self.assertRaisesRegex(ValueError, "ACK classification"):
+                    self.verify(invalid)
+        trace["return_to_ack"] = duration_fixture(1)
+        self.verify(value)
+        trace["ack_before_adapter_return"] = 1
+        with self.assertRaisesRegex(ValueError, "ACK classification"):
+            self.verify(value)
+
+    def test_native_cannot_fill_unavailable_packet_counters(self):
+        self.case["protocol"] = "kcp"
+        value = telemetry_fixture(self.case)
+        value["kcp_correlation"][0]["outbound_packets"] = 1
+        with self.assertRaisesRegex(ValueError, "unavailable packet"):
+            self.verify(value)
 
 
 class MatrixTests(unittest.TestCase):
