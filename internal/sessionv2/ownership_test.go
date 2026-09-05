@@ -110,13 +110,13 @@ func TestDecodedGroupRetainsOwnershipUntilAtomicOriginalAdmission(t *testing.T) 
 		t.Fatal(err)
 	}
 	result, err := receivePacket(p, packets[2])
-	if err != nil || len(result.Deliveries) != 0 || c.groups[1] != group || group.fragments == nil || c.groupWindow.State(1) != recvwindow.Unseen || !group.admitted.Add(c.cfg.GroupTimeout).Equal(deadline) {
+	if err != nil || len(result.Deliveries) != 0 || c.groups[1] != group || group.fragments == nil || c.decodedGroups != 1 || c.groupWindow.State(1) != recvwindow.Unseen || !group.admitted.Add(c.cfg.GroupTimeout).Equal(deadline) {
 		t.Fatalf("decoded group lost pending ownership: %+v %v", result, err)
 	}
 	held.Release()
 	p.now = p.now.Add(time.Millisecond)
 	result, err = c.Advance(p.now)
-	if err != nil || len(result.Deliveries) != 0 || c.groups[1] != nil || c.groupWindow.State(1) != recvwindow.Completed || c.originals.Snapshot().Pending != 1 {
+	if err != nil || len(result.Deliveries) != 0 || c.groups[1] != nil || c.decodedGroups != 0 || c.groupHead != 0 || c.groupTail != 0 || c.groupWindow.State(1) != recvwindow.Completed || c.originals.Snapshot().Pending != 1 {
 		t.Fatalf("retry did not atomically admit first fragment group: %+v %v", result, err)
 	}
 	for _, pk := range packets[5:8] {

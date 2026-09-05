@@ -554,11 +554,11 @@ func (c *Controller) NextDeadline() time.Time {
 			include(old.until)
 		}
 	}
-	for _, group := range c.groups {
-		include(group.admitted.Add(c.cfg.GroupTimeout))
-		if group.fragments != nil {
-			include(later(c.last, c.retryStorage))
-		}
+	if c.groupHead != 0 {
+		include(c.groups[c.groupHead].admitted.Add(c.cfg.GroupTimeout))
+	}
+	if c.decodedGroups != 0 {
+		include(later(c.last, c.retryStorage))
 	}
 	if c.context.pending {
 		include(c.context.deadline)

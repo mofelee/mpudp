@@ -25,6 +25,8 @@ type Controller struct {
 	queue                          *aggregationv2.Queue
 	originals                      *reassemblyv2.Receiver
 	groups                         map[uint64]*pendingGroup
+	groupHead, groupTail           uint64
+	decodedGroups                  int
 	groupWindow                    *recvwindow.Window
 	groupWindowLease, controlLease *creditv2.Lease
 	sendContext, receiveContext    wirev2.EncodingContext
