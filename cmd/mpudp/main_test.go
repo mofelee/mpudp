@@ -184,6 +184,25 @@ func TestMainSignalHelper(t *testing.T) {
 	main()
 }
 
+func TestRunVersionDoesNotOpenConfigurationOrPeer(t *testing.T) {
+	t.Parallel()
+	for _, option := range []string{"-version", "--version"} {
+		t.Run(option, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runContextWithPeerFactory(context.Background(), []string{option, "-config", "does-not-exist.yaml"}, &stdout, &stderr, func(context.Context, config.Config) (runtimePeer, error) {
+				t.Fatal("version command must not create a Peer")
+				return nil, nil
+			})
+			if code != 0 || stderr.Len() != 0 {
+				t.Fatalf("version exit = %d, stderr = %q", code, stderr.String())
+			}
+			if want := fmt.Sprintf("mpudp %s (commit %s)\n", version, commit); stdout.String() != want {
+				t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+			}
+		})
+	}
+}
+
 func TestRunRequiresConfigPath(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer

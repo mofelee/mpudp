@@ -14,6 +14,11 @@ import (
 	"github.com/mofelee/mpudp/config"
 )
 
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := runContext(ctx, os.Args[1:], os.Stdout, os.Stderr)
@@ -42,8 +47,13 @@ func runContextWithPeerFactory(ctx context.Context, args []string, stdout, stder
 	flags := flag.NewFlagSet("mpudp", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "path to the MPUDP YAML configuration")
+	showVersion := flags.Bool("version", false, "print version and source commit")
 	if err := flags.Parse(args); err != nil {
 		return 2
+	}
+	if *showVersion {
+		fmt.Fprintf(stdout, "mpudp %s (commit %s)\n", version, commit)
+		return 0
 	}
 	if *configPath == "" {
 		fmt.Fprintln(stderr, "mpudp: -config is required")

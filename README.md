@@ -33,6 +33,29 @@ go test -race -count=1 ./...
 go vet ./...
 ```
 
+## 下载二进制
+
+[GitHub Releases](https://github.com/mofelee/mpudp/releases) 提供 Linux `amd64` 和
+`arm64` 的静态二进制归档，以及 `checksums.txt`。归档包含文档、构建信息和第三方许可证。
+
+以 Linux amd64 的首个版本为例（ARM64 请把 `arch` 改为 `arm64`）：
+
+```bash
+version=v0.1.0
+arch=amd64
+archive="mpudp_${version#v}_linux_${arch}"
+curl -fLO "https://github.com/mofelee/mpudp/releases/download/${version}/${archive}.tar.gz"
+curl -fLO "https://github.com/mofelee/mpudp/releases/download/${version}/checksums.txt"
+sha256sum --ignore-missing --check checksums.txt
+tar -xzf "${archive}.tar.gz"
+"./${archive}/mpudp" --version
+sudo install -m 0755 "${archive}/mpudp" /usr/local/bin/mpudp
+```
+
+`mpudp --version` 显示版本和源码 commit，无需配置文件，也不会打开网络 socket。
+发布方式及本地打包步骤见 [发布流程](docs/RELEASING.md)。CLI 的业务流量边界与源码运行相同，
+详见下节；发布二进制不会增加 TUN、SOCKS 或 stream 适配功能。
+
 ## 启动 CLI
 
 最小 initiator 配置如下。示例 PSK 仅供本机开发测试；生产环境必须注入高熵密钥，并按
@@ -200,3 +223,4 @@ sudo env PATH="${PATH}" GOFLAGS=-buildvcs=false \
 - [v0.1 需求](docs/MPUDP_REQUIREMENTS.md)
 - [需求追踪矩阵](docs/TRACEABILITY.md)
 - [依赖与许可证审计](docs/DEPENDENCIES.md)
+- [发布流程](docs/RELEASING.md)
