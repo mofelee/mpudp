@@ -1,0 +1,26 @@
+=== RUN   TestMPUDPBothFINPreservesUnreadTail
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v1_Read
+    mpudp_dependency_test.go:127: peer=0 want=3072 read=3072 error=<nil>
+    mpudp_dependency_test.go:127: peer=1 want=3072 read=3072 error=<nil>
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v1_WriteTo
+    mpudp_dependency_test.go:127: peer=0 want=3072 read=3072 error=<nil>
+    mpudp_dependency_test.go:127: peer=1 want=3072 read=3072 error=<nil>
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v2_Read
+    mpudp_dependency_test.go:127: peer=0 want=3072 read=3072 error=<nil>
+    mpudp_dependency_test.go:127: peer=1 want=3072 read=3072 error=<nil>
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v2_WriteTo
+    mpudp_dependency_test.go:127: peer=0 want=3072 read=3072 error=<nil>
+    mpudp_dependency_test.go:127: peer=1 want=3072 read=3072 error=<nil>
+--- PASS: TestMPUDPBothFINPreservesUnreadTail (0.00s)
+    --- PASS: TestMPUDPBothFINPreservesUnreadTail/v1_Read (0.00s)
+    --- PASS: TestMPUDPBothFINPreservesUnreadTail/v1_WriteTo (0.00s)
+    --- PASS: TestMPUDPBothFINPreservesUnreadTail/v2_Read (0.00s)
+    --- PASS: TestMPUDPBothFINPreservesUnreadTail/v2_WriteTo (0.00s)
+=== RUN   TestMPUDPRemoteSYNAllocatesBeforeAccept
+    mpudp_dependency_test.go:179: Accept calls=0 allocated=32 queued=32 initial_ring_slots=256 receive_byte_tokens=65536
+--- PASS: TestMPUDPRemoteSYNAllocatesBeforeAccept (0.00s)
+=== RUN   TestMPUDPReservedControlAdmissionKeepsSiblingUsable
+    mpudp_dependency_test.go:311: business_limit=1 refused_open_allocations=0 ungranted_SYN_allocations=0 sibling_echo_bytes=41 grant_after_drain=true
+--- PASS: TestMPUDPReservedControlAdmissionKeepsSiblingUsable (0.00s)
+PASS
+ok  	github.com/xtaci/smux	0.009s

@@ -1,0 +1,67 @@
+diff --git a/stream.go b/stream.go
+index ec1177c..e2bf1e7 100644
+--- a/stream.go
++++ b/stream.go
+@@ -202,6 +202,7 @@ func (s *stream) ID() uint32 {
+ 
+ // Read reads data from the stream into the provided buffer.
+ func (s *stream) Read(b []byte) (n int, err error) {
++	defer s.tryHalfCloseCleanup()
+ 	if s.sess.config.Version == 2 {
+ 		for {
+ 			n, err = s.tryReadV2(b)
+@@ -314,6 +315,7 @@ func (s *stream) tryReadV2(b []byte) (n int, err error) {
+ // If the underlying stream is a v2 stream, it will send window update to peer when necessary.
+ // If the underlying stream is a v1 stream, it will not send window update to peer.
+ func (s *stream) WriteTo(w io.Writer) (n int64, err error) {
++	defer s.tryHalfCloseCleanup()
+ 	switch s.sess.config.Version {
+ 	case 2:
+ 		return s.writeToV2(w)
+@@ -455,7 +457,12 @@ func (s *stream) waitRead() error {
+ 	case <-deadline:
+ 		return ErrTimeout
+ 	case <-s.die:
+-		return io.ErrClosedPipe
++		select {
++		case <-s.chFinEvent:
++			return io.EOF
++		default:
++			return io.ErrClosedPipe
++		}
+ 	}
+ 
+ }
+@@ -812,7 +819,7 @@ func (s *stream) fin() {
+ 	s.tryHalfCloseCleanup()
+ }
+ 
+-// tryHalfCloseCleanup removes stream after both sides have sent FIN.
++// tryHalfCloseCleanup removes a fully half-closed stream after its data drains.
+ func (s *stream) tryHalfCloseCleanup() {
+ 	select {
+ 	case <-s.chFinEvent:
+@@ -826,10 +833,22 @@ func (s *stream) tryHalfCloseCleanup() {
+ 		return
+ 	}
+ 
++	// Follow recvLoop's session-then-buffer lock order so a concurrent payload
++	// cannot arrive between checking the buffer and removing the stream.
++	s.sess.streamLock.Lock()
++	defer s.sess.streamLock.Unlock()
++	if s.sess.streams[s.id] != s {
++		return
++	}
++	s.bufferLock.Lock()
++	defer s.bufferLock.Unlock()
++	if s.bufferRing.len() != 0 {
++		return
++	}
+ 	s.dieOnce.Do(func() {
+ 		close(s.die)
+ 	})
+-	s.sess.streamClosed(s.id)
++	delete(s.sess.streams, s.id)
+ }
+ 
+ // stopTimer stops the supplied timer and drains its channel if needed.

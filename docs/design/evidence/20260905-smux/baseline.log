@@ -1,0 +1,32 @@
+=== RUN   TestMPUDPBothFINPreservesUnreadTail
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v1_Read
+    mpudp_dependency_test.go:125: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:125: peer=1 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=1 want=3072 read=0 error=<nil>
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v1_WriteTo
+    mpudp_dependency_test.go:125: peer=0 want=3072 read=0 error=io: read/write on closed pipe
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=0 want=3072 read=0 error=io: read/write on closed pipe
+    mpudp_dependency_test.go:125: peer=1 want=3072 read=0 error=io: read/write on closed pipe
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=1 want=3072 read=0 error=io: read/write on closed pipe
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v2_Read
+    mpudp_dependency_test.go:125: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:125: peer=1 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=1 want=3072 read=0 error=<nil>
+=== RUN   TestMPUDPBothFINPreservesUnreadTail/v2_WriteTo
+    mpudp_dependency_test.go:125: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=0 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:125: peer=1 want=3072 read=0 error=<nil>
+    mpudp_dependency_test.go:127: unread tail lost or failed: peer=1 want=3072 read=0 error=<nil>
+--- FAIL: TestMPUDPBothFINPreservesUnreadTail (0.01s)
+    --- FAIL: TestMPUDPBothFINPreservesUnreadTail/v1_Read (0.00s)
+    --- FAIL: TestMPUDPBothFINPreservesUnreadTail/v1_WriteTo (0.00s)
+    --- FAIL: TestMPUDPBothFINPreservesUnreadTail/v2_Read (0.00s)
+    --- FAIL: TestMPUDPBothFINPreservesUnreadTail/v2_WriteTo (0.00s)
+=== RUN   TestMPUDPRemoteSYNAllocatesBeforeAccept
+    mpudp_dependency_test.go:177: Accept calls=0 allocated=32 queued=32 initial_ring_slots=256 receive_byte_tokens=65536
+--- PASS: TestMPUDPRemoteSYNAllocatesBeforeAccept (0.00s)
+FAIL
+FAIL	github.com/xtaci/smux	0.021s
+FAIL
