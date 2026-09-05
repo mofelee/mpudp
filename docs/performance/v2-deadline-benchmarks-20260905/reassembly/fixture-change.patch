@@ -1,0 +1,57 @@
+--- a/internal/reassemblyv2/deadline_test.go
++++ b/internal/reassemblyv2/deadline_test.go
+@@ -31,2 +31,19 @@
+ 	}
++	count, previous := 0, uint64(0)
++	var admitted time.Time
++	for id := r.head; id != 0; {
++		a := r.pending[id]
++		if a == nil || a.previous != previous || count == len(r.pending) {
++			t.Fatalf("broken deadline links at %d", id)
++		}
++		if count > 0 && a.admitted.Before(admitted) {
++			t.Fatal("deadline links reordered admissions")
++		}
++		admitted = a.admitted
++		previous, id = id, a.next
++		count++
++	}
++	if count != len(r.pending) || previous != r.tail {
++		t.Fatal("deadline links disagree with pending originals")
++	}
+ }
+@@ -70,3 +87,3 @@
+ 	r.Close()
+-	if !r.NextDeadline().IsZero() || len(r.pending) != 0 || pending.data != nil || pending.ranges != nil || pending.lease != nil {
++	if !r.NextDeadline().IsZero() || len(r.pending) != 0 || r.head != 0 || r.tail != 0 || pending.data != nil || pending.ranges != nil || pending.lease != nil || pending.previous != 0 || pending.next != 0 {
+ 		t.Fatal("Close retained pending expiry ownership")
+@@ -75,2 +92,29 @@
+ 
++func TestDeadlineLinkStorageCharged(t *testing.T) {
++	for _, size := range []int{0, 2} {
++		t.Run(fmt.Sprint(size), func(t *testing.T) {
++			r, p, _ := fixture(t, nil)
++			before := p.Snapshot().Bytes
++			payload := ""
++			if size != 0 {
++				payload = "a"
++			}
++			done := add(t, r, start, fragment(1, uint32(size), 0, payload))
++			if got, want := p.Snapshot().Bytes-before, uint64(size+r.limits.MaxFragments*8+16); got != want {
++				t.Fatalf("original charge = %d, want %d including deadline links", got, want)
++			}
++			if size != 0 {
++				done = add(t, r, start, fragment(1, uint32(size), 1, "b"))
++			}
++			checkDeadline(t, r)
++			for _, d := range done {
++				d.Release()
++			}
++			if p.Snapshot().Bytes != before {
++				t.Fatal("completed original retained deadline link credit")
++			}
++		})
++	}
++}
++
+ func TestDeadlineMatchesPendingScan(t *testing.T) {

@@ -1,0 +1,92 @@
+--- a/internal/sessionv2/data.go
++++ b/internal/sessionv2/data.go
+@@ -23,2 +23,4 @@
+ 	lease     *creditv2.Lease
++	previous  uint64
++	next      uint64
+ }
+@@ -126,2 +128,15 @@
+ 
++func (c *Controller) insertGroup(id uint64, group *pendingGroup) {
++	// enter enforces monotonic admission times; the fixed timeout preserves
++	// this order for expiry even when GroupIDs arrive out of order.
++	group.previous = c.groupTail
++	if c.groupTail == 0 {
++		c.groupHead = id
++	} else {
++		c.groups[c.groupTail].next = id
++	}
++	c.groupTail = id
++	c.groups[id] = group
++}
++
+ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, packetBytes int, result *Result) error {
+@@ -157,3 +172,3 @@
+ 			c.groupWindow.Admit(record.GroupID)
+-			c.groups[record.GroupID] = group
++			c.insertGroup(record.GroupID, group)
+ 		}
+@@ -192,2 +207,3 @@
+ 			group.shards, group.fragments = nil, fragments
++			c.decodedGroups++
+ 			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
+@@ -218,3 +234,3 @@
+ func (c *Controller) retryGroups(now time.Time, result *Result) error {
+-	if now.Before(c.retryStorage) {
++	if c.decodedGroups == 0 || now.Before(c.retryStorage) {
+ 		return nil
+@@ -232,3 +248,17 @@
+ func (c *Controller) releaseGroup(id uint64, group *pendingGroup) {
++	if group.previous == 0 {
++		c.groupHead = group.next
++	} else {
++		c.groups[group.previous].next = group.next
++	}
++	if group.next == 0 {
++		c.groupTail = group.previous
++	} else {
++		c.groups[group.next].previous = group.previous
++	}
+ 	delete(c.groups, id)
++	group.previous, group.next = 0, 0
++	if group.fragments != nil {
++		c.decodedGroups--
++	}
+ 	for _, shard := range group.shards {
+@@ -245,7 +275,10 @@
+ func (c *Controller) expireGroups(now time.Time) {
+-	for id, group := range c.groups {
+-		if !now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
+-			c.groupWindow.Finish(id, recvwindow.Expired)
+-			c.releaseGroup(id, group)
++	for c.groupHead != 0 {
++		id := c.groupHead
++		group := c.groups[id]
++		if now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
++			break
+ 		}
++		c.groupWindow.Finish(id, recvwindow.Expired)
++		c.releaseGroup(id, group)
+ 	}
+--- a/internal/sessionv2/control.go
++++ b/internal/sessionv2/control.go
+@@ -556,7 +556,7 @@
+ 	}
+-	for _, group := range c.groups {
+-		include(group.admitted.Add(c.cfg.GroupTimeout))
+-		if group.fragments != nil {
+-			include(later(c.last, c.retryStorage))
+-		}
++	if c.groupHead != 0 {
++		include(c.groups[c.groupHead].admitted.Add(c.cfg.GroupTimeout))
++	}
++	if c.decodedGroups != 0 {
++		include(later(c.last, c.retryStorage))
+ 	}
+--- a/internal/sessionv2/controller.go
++++ b/internal/sessionv2/controller.go
+@@ -27,2 +27,4 @@
+ 	groups                         map[uint64]*pendingGroup
++	groupHead, groupTail            uint64
++	decodedGroups                  int
+ 	groupWindow                    *recvwindow.Window

@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "baseline_production_revision": "c7d3ab00baf74c84f4864d877f3f5332bcc2f205",
+  "source_recovery": "Exact recorded file changes and completed command stdout; no benchmarks rerun during recovery.",
+  "controller_after_state": "Uncommitted baseline plus controller/production-change.patch; benchmark setup adapted by controller/fixture-change.patch. This was not a benchmark run at the later committed revision.",
+  "reassembly_after_state": "Uncommitted baseline plus reassembly/production-change.patch, formatted with gofmt. Exact after fixture matches ed2d6484170562f02474f3c0ebf31b6d115c1f5d.",
+  "reassembly_before_fixture_recovery": "Original recorded added source, formatted by the recorded gofmt step. Verified byte-for-byte against reverse application of the recorded fixture update to the after fixture.",
+  "scope": "Local microbenchmarks, not network throughput or formal performance acceptance.",
+  "runs": [
+    {
+      "component": "controller",
+      "phase": "before",
+      "command": "go test ./internal/sessionv2 -run '^$' -bench '^BenchmarkProbe' -benchtime=200ms -count=1 -benchmem",
+      "started_at": "2026-09-05T12:38:29.421Z",
+      "completed_at": "2026-09-05T12:38:35.439Z",
+      "exit_code": 0,
+      "stdout": "controller/before.stdout.log",
+      "stdout_sha256": "2f052c82691d2192dd9d4b09538f500d66c1d47b574f41eebfe11f075b7f809c",
+      "fixture": "controller/before_test.go.txt",
+      "fixture_sha256": "8de82dee07f0bc0148f7b56ec8f61123e00782bc3625c1cba3ec6a61a0189db7"
+    },
+    {
+      "component": "controller",
+      "phase": "after",
+      "command": "go test ./internal/sessionv2 -run '^$' -bench '^BenchmarkProbe' -benchtime=200ms -count=1 -benchmem",
+      "started_at": "2026-09-05T12:43:16.898Z",
+      "completed_at": "2026-09-05T12:43:21.589Z",
+      "exit_code": 0,
+      "stdout": "controller/after.stdout.log",
+      "stdout_sha256": "1a4f90bb62190d0861a078433cd987ed2d6e8fe76ed8e49a7c813ce1e461eacf",
+      "fixture": "controller/after_test.go.txt",
+      "fixture_sha256": "2322b3d57d0efde6dfcde6cb77d4fb5b13a278479d01de798b8340768204612b"
+    },
+    {
+      "component": "reassembly",
+      "phase": "before",
+      "command": "set -o pipefail\ngo test ./internal/reassemblyv2 -run '^$' -bench '^BenchmarkReceiver(NextDeadline|ExpireNotDue)$' -benchmem -benchtime=200ms -count=3 -cpu=1 | tee /tmp/mpudp-reassembly-deadline-before-20260905.log",
+      "started_at": "2026-09-05T12:44:19.406Z",
+      "completed_at": "2026-09-05T12:44:27.819Z",
+      "exit_code": 0,
+      "stdout": "reassembly/before.stdout.log",
+      "stdout_sha256": "003cb2dacf00d4d69b4c874092995a5fc5c5c98599b702bc5452f6c8d87bcb76",
+      "fixture": "reassembly/before_test.go.txt",
+      "fixture_sha256": "9fdb46d769266462619e4128028fc786bf2e430a6b6ddaa363f88104c901eb74"
+    },
+    {
+      "component": "reassembly",
+      "phase": "after",
+      "command": "set -o pipefail\ngo test ./internal/reassemblyv2 -run '^$' -bench '^BenchmarkReceiver(NextDeadline|ExpireNotDue)$' -benchmem -benchtime=200ms -count=3 -cpu=1 | tee /tmp/mpudp-reassembly-deadline-after-20260905.log",
+      "started_at": "2026-09-05T12:45:48.759Z",
+      "completed_at": "2026-09-05T12:45:58.030Z",
+      "exit_code": 0,
+      "stdout": "reassembly/after.stdout.log",
+      "stdout_sha256": "1938e712488ee18df80ecd215c2dcba7b14be2b70de582596bef7ba603249ce9",
+      "fixture": "reassembly/after_test.go.txt",
+      "fixture_sha256": "128223d83ab43123dd7e9f8e4f59641c5fd8167f45ec39f90d49f6ca91f4d50c"
+    }
+  ],
+  "artifacts": {
+    "controller/before_test.go.txt": {
+      "bytes": 1654,
+      "sha256": "8de82dee07f0bc0148f7b56ec8f61123e00782bc3625c1cba3ec6a61a0189db7"
+    },
+    "controller/after_test.go.txt": {
+      "bytes": 1658,
+      "sha256": "2322b3d57d0efde6dfcde6cb77d4fb5b13a278479d01de798b8340768204612b"
+    },
+    "controller/fixture-change.patch": {
+      "bytes": 355,
+      "sha256": "fd04803acabc6e46f1f8b3afa6058ff82f23537c5e092123ab2e3d658e43a4df"
+    },
+    "reassembly/before_test.go.txt": {
+      "bytes": 5487,
+      "sha256": "9fdb46d769266462619e4128028fc786bf2e430a6b6ddaa363f88104c901eb74"
+    },
+    "reassembly/after_test.go.txt": {
+      "bytes": 6858,
+      "sha256": "128223d83ab43123dd7e9f8e4f59641c5fd8167f45ec39f90d49f6ca91f4d50c"
+    },
+    "reassembly/fixture-change.patch": {
+      "bytes": 1947,
+      "sha256": "e45772d506da521d933dd7908d66feebbb4f733ecb7af048e5510f7917ca8fa1"
+    },
+    "controller/production-change.patch": {
+      "bytes": 2901,
+      "sha256": "8cf287642b9eecf6311d0dd491c21a745ea3cfd7587cb43293b963130a1ec8f8"
+    },
+    "reassembly/production-change.patch": {
+      "bytes": 3128,
+      "sha256": "d0c2ed11194d77a790959d05103f9df59c57de33f105117c656d4afbe1c68597"
+    },
+    "controller/before.stdout.log": {
+      "bytes": 2178,
+      "sha256": "2f052c82691d2192dd9d4b09538f500d66c1d47b574f41eebfe11f075b7f809c"
+    },
+    "controller/after.stdout.log": {
+      "bytes": 2216,
+      "sha256": "1a4f90bb62190d0861a078433cd987ed2d6e8fe76ed8e49a7c813ce1e461eacf"
+    },
+    "reassembly/before.stdout.log": {
+      "bytes": 3447,
+      "sha256": "003cb2dacf00d4d69b4c874092995a5fc5c5c98599b702bc5452f6c8d87bcb76"
+    },
+    "reassembly/after.stdout.log": {
+      "bytes": 3522,
+      "sha256": "1938e712488ee18df80ecd215c2dcba7b14be2b70de582596bef7ba603249ce9"
+    }
+  }
+}

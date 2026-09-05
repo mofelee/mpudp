@@ -1,0 +1,61 @@
+package sessionv2
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/mofelee/mpudp/internal/creditv2"
+)
+
+var probeDeadline time.Time
+var probeScope creditv2.SessionSnapshot
+
+func BenchmarkProbePendingGroupScans(b *testing.B) {
+	for _, count := range []int{0, 128, 512, 1024, 8192} {
+		b.Run(fmt.Sprintf("groups_%d", count), func(b *testing.B) {
+			now := time.Unix(1700000000, 0)
+			c := &Controller{started: true, paths: make([]pathState, 5), cfg: Config{GroupTimeout: 10 * time.Second}, groups: make(map[uint64]*pendingGroup)}
+			for id := 1; id <= count; id++ {
+				c.insertGroup(uint64(id), &pendingGroup{admitted: now.Add(time.Duration(id) * time.Nanosecond)})
+			}
+			b.Run("NextDeadline", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					probeDeadline = c.NextDeadline()
+				}
+			})
+			b.Run("expireGroups", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					c.expireGroups(now)
+				}
+			})
+			b.Run("retryGroups", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					if err := c.retryGroups(now, &Result{}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkProbeScopeSnapshot(b *testing.B) {
+	p, err := creditv2.New(creditv2.Limits{MaxPeerBytes: 16 << 20, MaxSessionBytes: 16 << 20, MaxSessions: 1, MaxPendingHandshakes: 1, MaxPendingAccepts: 1, MaxStreamsPerSession: 1, MaxPeerStreams: 1, MaxReservations: 1024})
+	if err != nil {
+		b.Fatal(err)
+	}
+	s, _, err := p.BeginSession(creditv2.Claim{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer p.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		probeScope = s.Snapshot()
+	}
+}

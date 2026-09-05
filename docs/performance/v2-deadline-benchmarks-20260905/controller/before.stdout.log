@@ -1,0 +1,22 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mofelee/mpudp/internal/sessionv2
+cpu: Intel(R) Xeon(R) CPU E3-1245 v5 @ 3.50GHz
+BenchmarkProbePendingGroupScans/groups_0/NextDeadline-6         	  431208	       504.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_0/expireGroups-6         	15829567	        19.83 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_0/retryGroups-6          	 8767110	        26.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/NextDeadline-6       	   40702	      5707 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/expireGroups-6       	   51529	      4772 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/retryGroups-6        	  112107	      2192 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/NextDeadline-6       	   11116	     21045 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/expireGroups-6       	   12471	     19123 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/retryGroups-6        	   26022	      8924 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/NextDeadline-6      	    5600	     43073 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/expireGroups-6      	    6140	     38524 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/retryGroups-6       	   13183	     16779 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/NextDeadline-6      	     759	    321636 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/expireGroups-6      	     754	    307076 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/retryGroups-6       	    1771	    138884 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbeScopeSnapshot-6                                   	 7765040	        30.67 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mofelee/mpudp/internal/sessionv2	4.806s
