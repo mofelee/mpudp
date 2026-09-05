@@ -4,7 +4,7 @@
 Run only after the shared CPU hold is released. The fixture must emit one
 ready JSON line containing receiver_pid, receiver_fd and sender_pid, then
 wait for a newline on stdin after warmup. Counts cover measurement and teardown.
-This helper has not yet been exercised on the target kernel.
+Trace runs perturb timing and must be kept separate from performance samples.
 """
 
 import argparse
@@ -24,8 +24,13 @@ SYSCALLS = ("recvfrom", "recvmsg", "recvmmsg")
 
 
 def write_control(path, value):
-    with path.open("w", encoding="ascii") as handle:
-        handle.write(value + "\n")
+    try:
+        # O_TRUNC unregisters existing triggers before applying a command.
+        mode = "a" if path.name == "trigger" else "w"
+        with path.open(mode, encoding="ascii") as handle:
+            handle.write(value + "\n")
+    except OSError as exc:
+        raise OSError("tracefs control " + str(path) + " = " + repr(value) + ": " + str(exc)) from exc
 
 
 def task_states(pid):
