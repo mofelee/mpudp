@@ -76,7 +76,7 @@ func (e *Engine) startAttempt(now time.Time, d *dial, carrier Carrier, result *R
 	if err != nil {
 		return err
 	}
-	scope, receiveLease, packetLease, initial, err := e.reserve(policy)
+	scope, receiveLease, packetLease, initial, retirement, err := e.reserve(policy)
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,7 @@ func (e *Engine) startAttempt(now time.Time, d *dial, carrier Carrier, result *R
 	if !d.request.Deadline.IsZero() && d.request.Deadline.Before(deadline) {
 		deadline = d.request.Deadline
 	}
-	a := &attempt{setup: Setup{ID: id, DialID: d.id, Role: negotiationv2.Initiator, PathID: carrier.PathID, Binding: carrier.Binding, Scope: scope, Receive: policy.Receive, Initial: initial}, state: waitChallenge, policy: policy, hello: hello, deadline: deadline, packets: new(packets), receiveLease: receiveLease, packetLease: packetLease}
+	a := &attempt{setup: Setup{ID: id, DialID: d.id, Role: negotiationv2.Initiator, PathID: carrier.PathID, Binding: carrier.Binding, Scope: scope, Receive: policy.Receive, Initial: initial}, state: waitChallenge, policy: policy, hello: hello, deadline: deadline, packets: new(packets), receiveLease: receiveLease, packetLease: packetLease, retirement: retirement}
 	message := wirev2.Handshake{Header: wirev2.Header{Type: wirev2.TypeHello, SessionID: id}, ClientNonce: nonce, TLVs: tlvs}
 	if err := encode(&a.packets.hello, message, e.handshakeKey); err != nil {
 		e.disposeAttempt(a)

@@ -89,7 +89,7 @@ func (c *Controller) driveData(now time.Time, result *Result) error {
 			return err
 		}
 		bundle := wirev2.FECBundle{Header: wirev2.Header{Type: wirev2.TypeFECBundle, SessionID: c.setup.ID}, Route: p.route(), Records: []wirev2.FECRecord{{GroupID: view.GroupID, EncodingEpoch: view.EncodingEpoch, LogicalBytes: view.Group.LogicalBytes, ShardIndex: uint8(c.outNext), Payload: view.Group.Shards[c.outNext]}}}
-		packet, err := wirev2.AppendFECBundle(nil, bundle, c.sendLookup, c.sendKey, int(p.sendBudget))
+		packet, err := c.sendAuth.AppendFECBundle(nil, bundle, c.sendLookup, int(p.sendBudget))
 		if err != nil {
 			lease.Release()
 			return err
