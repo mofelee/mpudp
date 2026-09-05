@@ -132,6 +132,46 @@ select。
 
 ## SessionID 与诊断
 
+`Peer.Statistics()` 返回可直接 JSON 编码的有界累计统计；`CapturedAt` 用于相邻采样差分，
+例如 `ΔPaths[i].SentPackets / Δseconds` 得到 PPS。统计贯穿 Peer 生命周期，不因 Session
+关闭或 socket rebuild 清零，`Peer.Close()` 后仍可读取。各字段独立原子采样，正在收发时
+不是同一瞬间的一致性事务；不可用单次快照中字段之间的细微差异推断丢包。
+
+默认记录 ingress accepted/drop、delivery accepted/drop、成功写入的 Datagram 和实际
+`ReadPacket` 返回的 payload 字节，以及 FEC 完成、需要 parity 的恢复 block/缺失 data
+shard、pending 超时、decoder-full、pending duplicate 和 completed-cache late shard。
+`FEC.LateShards` 包括已经恢复完成后正常抵达的剩余 parity/data shard，不等于网络丢包，
+也不覆盖 completed cache 过期或淘汰后的到达。`IngressDrops` 仅统计完整 packet ingress
+队列溢出；可恢复错误事件、鉴权拒绝及关闭时未消费的数据不计入这个数值。
+
+`Paths` 只包含配置顺序的 `carrier-N` 和可选的 `listener`：同一 Carrier 索引的多个
+Session socket 合并，listener 为单个共享 socket 的汇总，不输出地址、SessionID、PSK
+或业务内容。计数是 UDP payload 层，包括 MPUDP 头部、FEC 和控制报文，不含 IP/UDP/L2
+头部。接收字节使用 `Read`/`ReadFrom` 返回的长度；超大报文可能已被内核截断至接收
+buffer，因此该情况另计 `ReceiveOversizeDrops`。`SentBytes` 只累计 socket write 返回
+的已写入字节，`SentPackets` 仅计完整成功的 socket write，`SendErrors` 计 socket write
+错误或 short write；写前校验、设置 deadline 失败和内核/qdisc 后续丢弃不在其中。
+
+`Peer.SetDiagnosticsEnabled(true)` 打开额外诊断，默认关闭：
+
+- `IngressQueue`：callback enqueue 到 dispatcher 处理之间的队列时间。
+- `SendLatency`：公共 Session 写入通过生命周期检查后，内部 Datagram 写入的总耗时，
+  包括编码、调度和 socket send；不是接收确认时间。
+- 每路径 `WriteQueue`：socket 写锁排队到实际 `Write`/`WriteTo` 调用前的耗时；
+  `SocketWrite` 是该 socket 调用及紧随其后的固定计数开销。
+- 每路径 `SentPacketSizes` / `ReceivedPacketSizes`：完整 UDP payload 长度的固定分桶，
+  `UpperBounds` 为包含上界，`Counts` 为各桶独立计数。
+
+延迟使用固定 24 桶：`<=1us, <=2us, ..., <=4194304us, overflow`，同样为独立计数；
+`TotalNS` 和 `MaxNS` 单位为纳秒。关闭诊断保留已有样本；开关切换前启动的在途操作仍可
+完成统计。关闭状态保留基本原子计数，但不读取额外时钟或记录包长分布；
+`go test -run '^$' -bench BenchmarkIngressDiagnostics -benchmem .` 可比较 ingress 局部
+开销，不代替完整负载下的开启/关闭实验。
+
+这些统计不声称覆盖监听端每个远端、socket receive overflow、qdisc drop、KCP
+RTT/RTO/重传、业务 ACK 返回排队、per-Carrier MTU epoch/probe/padding 等指标。它们需要
+基准工具的相应内核/上层采样或后续协议实现，不能以零值替代缺失证据。
+
 `SessionID` 是 `[16]byte`。`NewSessionID()` 和公开 `NewPeer()` 始终使用
 `crypto/rand.Reader`；全零结果有限重试，随机源失败不会返回可用 ID。配置和公共 API 没有
 设置固定 SessionID 的入口。

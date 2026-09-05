@@ -17,6 +17,7 @@ type ListenerOptions struct {
 	OnPacket    PacketHandler
 	OnError     ErrorHandler
 	RequirePMTU bool
+	Statistics  *Counters
 }
 
 // Listener owns one unconnected UDP socket. Every ReplyPath created by its
@@ -32,6 +33,7 @@ type Listener struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	pmtuEnabled bool
+	statistics  *Counters
 
 	mu        sync.RWMutex
 	writeMu   sync.Mutex
@@ -114,6 +116,7 @@ func newListener(conn net.PacketConn, options ListenerOptions, pmtuEnabled bool)
 		done:        make(chan struct{}),
 		closeDone:   make(chan struct{}),
 		pmtuEnabled: pmtuEnabled,
+		statistics:  options.Statistics,
 	}
 	go listener.readLoop()
 	return listener, nil
@@ -143,6 +146,7 @@ func (l *Listener) readLoop() {
 			}
 			return
 		}
+		l.statistics.receive(n, l.maxPayload)
 		if n > l.maxPayload {
 			l.reportError(&PathError{
 				PathID: l.id, Generation: l.generation, Operation: "read",
@@ -214,6 +218,7 @@ func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Add
 	if len(payload) > l.maxPayload {
 		return &PayloadSizeError{Size: len(payload), Limit: l.maxPayload}
 	}
+	queuedAt := l.statistics.start()
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -229,7 +234,13 @@ func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Add
 		_ = l.conn.SetWriteDeadline(time.Now())
 		close(callbackDone)
 	})
+	var writeStarted time.Time
+	if !queuedAt.IsZero() {
+		writeStarted = time.Now()
+		l.statistics.WriteQueue.Observe(writeStarted.Sub(queuedAt))
+	}
 	n, err := l.conn.WriteTo(payload, remote)
+	l.statistics.wrote(n, err == nil && n == len(payload), err, writeStarted)
 	if !stop() {
 		<-callbackDone
 	}

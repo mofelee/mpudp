@@ -63,6 +63,7 @@ type DecoderConfig struct {
 	MaxPendingBlocks   int
 	MaxCompletedBlocks int
 	Clock              Clock
+	Statistics         *Counters
 }
 
 // Stats reports retained state; it does not mutate or expire entries.
@@ -108,6 +109,7 @@ type Decoder struct {
 	pendingShards      int
 	pendingBytes       int
 	closed             bool
+	statistics         *Counters
 }
 
 // NewDecoder constructs an empty bounded Decoder.
@@ -148,6 +150,7 @@ func NewDecoder(config DecoderConfig) (*Decoder, error) {
 		maxCompletedBlocks: config.MaxCompletedBlocks,
 		pending:            make(map[BlockKey]*pendingBlock, config.MaxPendingBlocks),
 		completed:          make(map[BlockKey]*expiryEntry, config.MaxCompletedBlocks),
+		statistics:         config.Statistics,
 	}, nil
 }
 
@@ -171,12 +174,18 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 	now := d.clock.Now()
 	d.sweepLocked(now)
 	if _, ok := d.completed[input.Key]; ok {
+		if d.statistics != nil {
+			d.statistics.LateShards.Add(1)
+		}
 		return Result{Outcome: OutcomeDuplicate}, nil
 	}
 
 	block := d.pending[input.Key]
 	if block == nil {
 		if len(d.pending) >= d.maxPendingBlocks {
+			if d.statistics != nil {
+				d.statistics.DecoderFull.Add(1)
+			}
 			return Result{}, ErrDecoderFull
 		}
 		expiry := &expiryEntry{key: input.Key, deadline: now.Add(d.decodeTimeout), index: -1}
@@ -194,6 +203,9 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 
 	if existing := block.shards[input.Index]; existing != nil {
 		if bytes.Equal(existing, input.Payload) {
+			if d.statistics != nil {
+				d.statistics.DuplicateShards.Add(1)
+			}
 			return Result{Outcome: OutcomeDuplicate}, nil
 		}
 		return Result{}, ErrConflictingShard
@@ -208,6 +220,14 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 		return Result{Outcome: OutcomePending}, nil
 	}
 
+	missingData := 0
+	if d.statistics != nil {
+		for _, shard := range block.shards[:d.params.DataShards] {
+			if shard == nil {
+				missingData++
+			}
+		}
+	}
 	working := append([][]byte(nil), block.shards...)
 	if err := d.codec.ReconstructData(working); err != nil {
 		d.removePendingLocked(input.Key, block)
@@ -228,6 +248,13 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 
 	d.removePendingLocked(input.Key, block)
 	d.rememberCompletedLocked(input.Key, now)
+	if d.statistics != nil {
+		d.statistics.CompletedBlocks.Add(1)
+		if missingData != 0 {
+			d.statistics.RecoveredBlocks.Add(1)
+			d.statistics.RecoveredShards.Add(uint64(missingData))
+		}
+	}
 	return Result{Outcome: OutcomeComplete, Datagram: datagram}, nil
 }
 
@@ -270,6 +297,9 @@ func (d *Decoder) sweepLocked(now time.Time) ExpireStats {
 		d.pendingShards -= block.present
 		d.pendingBytes -= block.bytes
 		expired.PendingBlocks++
+		if d.statistics != nil {
+			d.statistics.ExpiredBlocks.Add(1)
+		}
 	}
 	for d.completedExpiry.Len() != 0 && !d.completedExpiry[0].deadline.After(now) {
 		entry := heap.Pop(&d.completedExpiry).(*expiryEntry)

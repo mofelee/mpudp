@@ -31,6 +31,7 @@ type settings struct {
 	handshakeRetryInterval time.Duration
 	handshakeJitterLimit   time.Duration
 	clock                  Clock
+	fecStatistics          *fec.Counters
 }
 
 func normalizeConfig(config Config) (*settings, error) {
@@ -92,6 +93,7 @@ func normalizeConfig(config Config) (*settings, error) {
 		handshakeRetryInterval: config.HandshakeRetryInterval,
 		handshakeJitterLimit:   jitter,
 		clock:                  clock,
+		fecStatistics:          config.FECStatistics,
 	}, nil
 }
 

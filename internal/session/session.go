@@ -542,6 +542,7 @@ func (s *Session) establishLocked(handshake wire.Handshake, now time.Time) error
 		Params: s.settings.params, Budget: budget, DecodeTimeout: s.settings.decodeTimeout,
 		CompletionTTL: s.settings.completionTTL, MaxPendingBlocks: s.settings.maxPendingFECBlocks,
 		MaxCompletedBlocks: s.settings.maxCompletedFECBlocks, Clock: s.settings.clock,
+		Statistics: s.settings.fecStatistics,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrHandshakeIncompatible, err)

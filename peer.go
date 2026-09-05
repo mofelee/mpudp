@@ -65,9 +65,10 @@ type Peer struct {
 	listenerSocket runtimePacketListener
 	deps           runtimeDependencies
 
-	closeOnce sync.Once
-	closeDone chan struct{}
-	closeErr  error
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
+	statistics peerCounters
 }
 
 // NewPeer validates cfg, binds the configured listener when present, and
@@ -126,10 +127,13 @@ func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config
 		deps:            deps,
 		closeDone:       make(chan struct{}),
 	}
+	p.initStatistics()
 
 	if cfg.ListenerEnabled() {
+		stateConfig := mapSessionConfig(cfg)
+		stateConfig.FECStatistics = &p.statistics.fec
 		state, err := internalsession.NewListener(internalsession.ListenerConfig{
-			Session:     mapSessionConfig(cfg),
+			Session:     stateConfig,
 			MaxSessions: cfg.Limits.MaxSessions,
 		})
 		if err != nil {
@@ -146,6 +150,7 @@ func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config
 		socket, err := deps.openListener(runtimeContext, "udp", cfg.Listen, transport.ListenerOptions{
 			PathID:     "listener",
 			MaxPayload: cfg.Transport.MaxUDPPayload,
+			Statistics: p.statistics.listener,
 			OnPacket: func(packet transport.ReceivedPacket) {
 				p.enqueue(ingressEvent{packet: packet, listener: true})
 			},

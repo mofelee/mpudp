@@ -21,6 +21,7 @@ type CarrierOptions struct {
 	OnPacket    PacketHandler
 	OnError     ErrorHandler
 	RequirePMTU bool
+	Statistics  *Counters
 }
 
 type carrierGeneration struct {
@@ -55,6 +56,7 @@ type Carrier struct {
 	lifetime    context.Context
 	cancelLife  context.CancelFunc
 	requirePMTU bool
+	statistics  *Counters
 }
 
 // OpenCarrier validates options, creates one connected socket, and starts its
@@ -92,6 +94,7 @@ func OpenCarrier(ctx context.Context, id, remote string, options CarrierOptions)
 		lifetime:    lifetime,
 		cancelLife:  cancelLife,
 		requirePMTU: options.RequirePMTU,
+		statistics:  options.Statistics,
 	}
 	if err := c.Rebuild(ctx); err != nil {
 		cancelLife()
@@ -239,7 +242,7 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 	if len(payload) > c.maxPayload {
 		return &PayloadSizeError{Size: len(payload), Limit: c.maxPayload}
 	}
-	if err := writeConnected(ctx, generation, payload); err != nil {
+	if err := writeConnected(ctx, generation, payload, c.statistics); err != nil {
 		if isPathMTUError(err) {
 			err = errors.Join(ErrPathMTUExceeded, err)
 		}
@@ -248,7 +251,8 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 	return nil
 }
 
-func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte) error {
+func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte, statistics *Counters) error {
+	queuedAt := statistics.start()
 	generation.writeMu.Lock()
 	defer generation.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -265,7 +269,13 @@ func writeConnected(ctx context.Context, generation *carrierGeneration, payload 
 		_ = generation.conn.SetWriteDeadline(time.Now())
 		close(callbackDone)
 	})
+	var writeStarted time.Time
+	if !queuedAt.IsZero() {
+		writeStarted = time.Now()
+		statistics.WriteQueue.Observe(writeStarted.Sub(queuedAt))
+	}
 	n, err := generation.conn.Write(payload)
+	statistics.wrote(n, err == nil && n == len(payload), err, writeStarted)
 	if !stop() {
 		<-callbackDone
 	}
@@ -297,6 +307,7 @@ func (c *Carrier) readLoop(generation *carrierGeneration) {
 			}
 			return
 		}
+		c.statistics.receive(n, c.maxPayload)
 		if n > c.maxPayload {
 			c.reportIfCurrent(generation, &PathError{
 				PathID: c.id, Generation: generation.number, Operation: "read",
