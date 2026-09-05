@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mofelee/mpudp/internal/creditv2"
 	"github.com/mofelee/mpudp/internal/handshakev2"
 	"github.com/mofelee/mpudp/internal/reassemblyv2"
 	"github.com/mofelee/mpudp/internal/sessionv2"
@@ -17,26 +16,34 @@ import (
 )
 
 type v2Session struct {
-	owner        *v2Peer
-	ctx          context.Context
-	cancel       context.CancelFunc
-	id           wirev2.SessionID
-	dial         handshakev2.DialID
-	inbound      bool
-	controller   *sessionv2.Controller
-	carriers     []runtimeCarrier
-	paths        []sessionv2.Carrier
-	delivery     chan *reassemblyv2.Datagram
-	done         chan struct{}
-	changed      chan struct{}
-	closed       bool
-	draining     bool
-	closeErr     error
-	terminalErr  error
-	startupScope *creditv2.Session
-	startupLease *creditv2.Lease
-	graceOnce    sync.Once
-	graceErr     error
+	owner           *v2Peer
+	ctx             context.Context
+	cancel          context.CancelFunc
+	id              wirev2.SessionID
+	dial            handshakev2.DialID
+	inbound         bool
+	controller      *sessionv2.Controller
+	carriers        []runtimeCarrier
+	paths           []sessionv2.Carrier
+	delivery        chan *reassemblyv2.Datagram
+	done            chan struct{}
+	changed         chan struct{}
+	closed          bool
+	draining        bool
+	closeErr        error
+	terminalErr     error
+	prepared        *handshakev2.PreparedDial
+	constructing    bool
+	sendNext        *v2Session
+	sendPrev        *v2Session
+	activeSends     int
+	carrierRetiring []bool
+	cleanupReady    bool
+	cleanupActive   bool
+	cleanupDone     chan struct{}
+	releaseStorage  func()
+	graceOnce       sync.Once
+	graceErr        error
 }
 
 func (r *v2Peer) newWrapper(inbound bool) *v2Session {
@@ -47,8 +54,9 @@ func (r *v2Peer) newWrapper(inbound bool) *v2Session {
 	ctx, cancel := context.WithCancel(parent)
 	s := &v2Session{owner: r, ctx: ctx, cancel: cancel, inbound: inbound,
 		delivery: make(chan *reassemblyv2.Datagram, r.peer.config.Limits.DeliveryQueueCapacity),
-		done:     make(chan struct{}), changed: make(chan struct{})}
+		done:     make(chan struct{}), changed: make(chan struct{}), cleanupDone: make(chan struct{})}
 	r.sessions[s] = struct{}{}
+	r.linkSendSession(s)
 	return s
 }
 
@@ -200,10 +208,10 @@ func (s *v2Session) CloseGracefully(ctx context.Context) error {
 	}
 	s.graceOnce.Do(func() {
 		s.owner.mu.Lock()
-		closed, closeErr := s.closed, s.closeErr
+		closed := s.closed
 		s.owner.mu.Unlock()
 		if closed {
-			s.graceErr = closeErr
+			s.graceErr = s.Close()
 			return
 		}
 		err := s.flush(ctx, true)
@@ -216,9 +224,12 @@ func (s *v2Session) Close() error {
 	s.cancel()
 	r := s.owner
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.closeSession(s)
 	r.peer.wakeDriver()
+	r.mu.Unlock()
+	<-s.cleanupDone
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return s.closeErr
 }
 

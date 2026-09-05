@@ -201,7 +201,10 @@ def report(root, tolerance=.25):
             workers.append(worker_cost(rows[receiver], rows["client" if receiver == "server" else "server"], pair, tolerance))
             pairs.append(pair)
         runner.receiver_overlap(pairs, case)
-        result["cases"].append({"case": case, "aggregate_receiver_mbps": sum(p["receiver"]["mbps"] for p in pairs),
+        result["cases"].append({"case": case,
+                                "configured_v2_max_send_workers": case.get("v2_max_send_workers")
+                                    if case["protocol"] in runner.MPUDP and case.get("mpudp_profile", "v1") != "v1" else None,
+                                "aggregate_receiver_mbps": sum(p["receiver"]["mbps"] for p in pairs),
                                 "receiver_results": [{"worst_5_second_mbps": p["receiver"]["worst_5_second_mbps"],
                                     "echo_rtt": p["receiver"]["echo_rtt"],
                                     **{k: p["receiver"][k] for k in ("corrupt_frames", "duplicate_frames", "too_old_frames")}}

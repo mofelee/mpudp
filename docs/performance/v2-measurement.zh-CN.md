@@ -41,6 +41,11 @@ Datagram，并非原生产品 KCP。固定版本 kcp-go 的 `--kcp-mtu` 上限�
 `--v2-max-original-bytes` 在边界内覆盖。它们是配置值，并非实测速率或延迟。
 v2 原始报文上限同时受 manifest 分片容量限制，不使用 v1 单 block 的公式。
 
+`--v2-max-send-workers` 为每端 Peer 选择 1..32 个发送 worker，默认值为 8。
+运行器将该上限显式写入两端 v2 配置，并在 manifest 参数及每个 v2 case 中记录
+`v2_max_send_workers`。已有 `workers` 字段表示探针进程数；无论发送 worker
+上限是多少，MPUDP 每端仍使用一个探针进程。v1 与原生协议配置保持不变。
+
 ## 受控诊断
 
 从已提交且干净的源码构建：
@@ -56,6 +61,7 @@ python3 scripts/perf/run-probe.py \
   --binary /tmp/mpudp-perfprobe --source-sha "$(git rev-parse HEAD)" \
   --psk-file /private/mpudp-perf.psk --output /tmp/mpudp-v2-diagnostic \
   --protocols mpudp --mpudp-profiles v1 v2 v2-aggregation \
+  --v2-max-send-workers 8 \
   --paths 5 --directions upload download --payloads 1400 \
   --flows 1 --rounds 1 --seconds 15 --warmup 3 --host-diagnostics basic
 ```
@@ -66,6 +72,30 @@ python3 scripts/perf/run-probe.py \
 1 ms，无法精确分辨 250 微秒聚合差异。RTT 包含未获回复的全部计划机会，与
 bulk 共用同一 Session。
 
+## 发送 Worker 对照
+
+两个上限使用同一份干净源码和同一探针二进制。将上述命令的配置选择改为
+`--mpudp-profiles v2 v2-aggregation --diagnostics off on`，设置
+`--v2-max-send-workers 1`，输出目录以 `-sw1` 结尾；再设置
+`--v2-max-send-workers 8`，使用以 `-sw8` 结尾的独立目录重复运行。
+保持五路径、单流、1400 字节报文、RS(3+2)、UDP1200、3 秒预热和 15 秒稳态。
+worker 上限、profile、方向与诊断开关共组成 16 个 case，测量窗口共 288 秒，
+不含准备和清理。保持 profile 关闭、基础主机采样开启，流量运行期间暂停无关
+本地测试和构建。第二次按相反 worker 顺序重复可观察主机漂移；这些短时诊断
+不满足正式验收门槛。
+
+分别报告接收端校验吞吐与最差五秒、socket PPS/UDP 字节、分配字节/s 和
+分配字节/已校验字节，以及传输计时。主要吞吐和分配对照使用诊断关闭的运行，
+匹配的诊断开启运行用于计时和观测开销对照。`write_queue` 测量传输写锁等待，
+`socket_write` 测量传输写调用的墙上时间区间；两者都不测量 worker 队列驻留、
+owner 锁等待或 pacing 延迟。使用对齐区间的 count/total 和 bucket 差值，
+保留独立采样导致的 count/bucket 差异，百分位报告分桶边界，不将生命周期
+最大值相减作为区间最大值。诊断关闭时的空直方图表示计时不可用。
+
+配置上限不是实测并发数。单 Session、五路径时，即使 Peer 上限为 8，当前
+controller 也最多允许五个同时在途的发送 intent。listener 写入共用 socket
+写锁。这一单流矩阵不测量 Session 之间的公平性。
+
 ## 校验后的稳态报告
 
 ```sh
@@ -74,6 +104,12 @@ python3 scripts/perf/report-probe.py /tmp/mpudp-v2-diagnostic
 
 报告校验索引中的输入哈希、完成状态和源码/二进制身份、两端元数据、接收端字节
 计量、RTT 与交换的 summary。派生输出应写在原产物树之外，以保留原校验索引。
+
+新 v2 运行要求 manifest、case 及两端的整数 `config.limits.MaxSendWorkers`
+一致。报告以 `configured_v2_max_send_workers` 单独输出选定上限，与探针进程
+计数区分。缺少该参数和 case 字段的旧归档仍可读取，其报告上限为 null。
+部分旧源码解析了默认上限却未启用发送 worker，因此不能从默认值推断历史
+运行时并发数；识别实现仍需依据源码身份。
 
 CPU、分配和 socket PPS 使用每秒累计计数的差值。发送端与接收端的 sample 序号
 不代表同一时钟；报告按时间戳在接收端名义稳态窗口内匹配边界，默认允许最多

@@ -57,7 +57,11 @@ func v2ControllerConfig(cfg config.Config, responder bool) (sessionv2.Config, er
 		profile.RequiredCaps |= negotiationv2.Aggregation
 	}
 	controller := sessionv2.Config{
-		LocalProfile: profile,
+		OwnedSends: true, MaxInFlightSends: cfg.Limits.MaxSendWorkers,
+		MaxPathQueuedPackets: cfg.Limits.MaxPathQueuedPackets,
+		MaxPathQueuedBytes:   uint64(cfg.Limits.MaxPathQueuedBytes),
+		MaxQueueResidence:    100 * time.Millisecond,
+		LocalProfile:         profile,
 		SendLimits: negotiationv2.SendLimits{Datagram: negotiationv2.DatagramLimits{
 			DatagramWindow: uint32(cfg.Repair.MaxOutstandingDatagramSpan), GroupWindow: uint32(cfg.Repair.MaxOutstandingGroupSpan),
 			MaxDatagramBytes: uint32(cfg.Limits.MaxDatagramSize), MaxFragments: uint16(cfg.Limits.MaxFragmentsPerDatagram),

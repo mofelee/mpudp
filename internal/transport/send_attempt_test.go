@@ -68,7 +68,7 @@ func (c *attemptTestConn) writeTime() time.Time {
 type attemptFixture struct {
 	path     ReplyPath
 	conn     *attemptTestConn
-	writeMu  *sync.Mutex
+	writeMu  sync.Locker
 	counters *Counters
 	close    func() error
 }

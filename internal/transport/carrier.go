@@ -33,7 +33,7 @@ type carrierGeneration struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	active      sync.WaitGroup
-	writeMu     sync.Mutex
+	writeMu     writeGate
 	alive       atomic.Bool
 	pmtuEnabled bool
 }
@@ -272,7 +272,9 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 
 func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte, statistics *Counters, attempt *time.Time) error {
 	queuedAt := statistics.start()
-	generation.writeMu.Lock()
+	if err := generation.writeMu.acquire(ctx); err != nil {
+		return err
+	}
 	var acquired time.Time
 	if !queuedAt.IsZero() {
 		acquired = time.Now()

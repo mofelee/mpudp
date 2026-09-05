@@ -55,6 +55,12 @@ overrides. These are configured limits, not measured rates or delays. V2 maximum
 original size also respects manifest fragment capacity; it does not use the v1
 single-block payload formula.
 
+`--v2-max-send-workers` selects 1..32 send workers per endpoint Peer and defaults
+to 8. The runner explicitly writes this limit into both v2 endpoint configs and
+records `v2_max_send_workers` in the manifest parameters and each v2 case.
+The existing `workers` field counts probe processes; MPUDP uses one process per
+endpoint regardless of this send-worker limit. V1 and native configs are unchanged.
+
 ## Controlled Diagnostic
 
 Build from a clean, committed source checkout:
@@ -70,6 +76,7 @@ python3 scripts/perf/run-probe.py \
   --binary /tmp/mpudp-perfprobe --source-sha "$(git rev-parse HEAD)" \
   --psk-file /private/mpudp-perf.psk --output /tmp/mpudp-v2-diagnostic \
   --protocols mpudp --mpudp-profiles v1 v2 v2-aggregation \
+  --v2-max-send-workers 8 \
   --paths 5 --directions upload download --payloads 1400 \
   --flows 1 --rounds 1 --seconds 15 --warmup 3 --host-diagnostics basic
 ```
@@ -82,6 +89,35 @@ to compare latency. The existing 1 ms RTT bins cannot resolve a 250 microsecond
 aggregation change precisely. RTT includes all scheduled opportunities, including
 unanswered requests, and shares the same Session as bulk traffic.
 
+## Send Worker Comparison
+
+Use the same clean source and binary for both limits. In the command above,
+select `--mpudp-profiles v2 v2-aggregation --diagnostics off on`, set
+`--v2-max-send-workers 1` and use an output directory ending in `-sw1`. Repeat
+with `--v2-max-send-workers 8` and a separate directory ending in `-sw8`.
+Keep five paths, one flow, 1400-byte messages, RS(3+2), UDP1200, three warmup
+seconds and 15 steady seconds. This gives 16 cases across worker limit, profile,
+direction and diagnostics, totaling 288 seconds before setup and cleanup.
+Keep profiles disabled, retain basic host sampling and pause unrelated local
+tests/builds during traffic. A second pass with reversed worker order can expose
+host drift; these short diagnostics do not satisfy the formal acceptance gates.
+
+Report receiver-verified throughput and worst five seconds, socket PPS/UDP
+bytes, allocation bytes/s and bytes/verified byte, and transport timing
+separately. Use diagnostics-off runs for the primary throughput/allocation
+comparison and matching diagnostics-on runs for timing and instrumentation
+controls. `write_queue` measures the transport write-lock wait; `socket_write`
+measures the transport write-call wall interval. Neither measures worker queue
+residence, owner-lock wait or pacing delay. Use aligned count/total and bucket
+deltas, retain independently sampled count/bucket discrepancies, report
+percentile bucket bounds, and do not subtract lifetime maxima into interval
+maxima. Empty diagnostics-off histograms mean unavailable timing.
+
+The configured limit is not observed concurrency. With one Session and five
+paths, the current controller permits at most five simultaneous send intents
+even when the Peer limit is 8. Listener writes share a socket write mutex.
+This single-flow matrix does not measure fairness between Sessions.
+
 ## Checked Steady-Window Report
 
 ```sh
@@ -92,6 +128,14 @@ The report verifies indexed input checksums, completion/source/binary identity,
 endpoint metadata, receiver byte accounting, RTT and exchanged summaries. Keep
 derived output outside the original artifact tree so its checksum index remains
 unchanged.
+
+For new v2 runs, the report requires the manifest, case and both endpoints'
+integer `config.limits.MaxSendWorkers` values to agree. It reports the selected
+limit as `configured_v2_max_send_workers`, independently of probe process
+counts. Older archives without the parameter and case field remain readable;
+their reported limit is null. Some older sources parsed a default limit without
+activating send workers, so that default does not establish historical runtime
+concurrency. Source identity remains necessary to identify the implementation.
 
 CPU, allocations and socket PPS use cumulative per-second sample deltas. Sender
 and receiver sample indices do not imply a common clock. The report selects

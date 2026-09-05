@@ -2,8 +2,9 @@
 
 [English](v2-owned-send-intents.md)
 
-`Config.OwnedSends` 显式启用发送所有权，默认仍使用同步 `Config.Emit`。本次改动
-不启用公共运行时工作线程，也不声称提高吞吐量。控制器不持有 goroutine、定时器或
+`Config.OwnedSends` 显式启用发送所有权，默认仍使用同步 `Config.Emit`。Linux 公共
+runtime 通过[固定发送 worker](v2-send-workers.zh-CN.md) 启用此模式。控制器本身不声称
+提高吞吐量，也不持有 goroutine、定时器或
 socket。除工作线程执行意图的 `Release` 外，所有调用仍由所有者串行执行。
 
 ## 准入与所有权

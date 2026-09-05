@@ -40,9 +40,10 @@ for listener/dual roles, then starts one Peer dispatcher. Initiator-only Peers
 do not bind a listener. `NewSession` opens one long-lived UDP socket per
 configured Carrier and begins authenticated bootstrap. Failed construction
 closes sockets opened by that call and removes partial Session state.
-V2 reserves temporary startup credit before Carrier sockets open. DNS and
-socket startup run outside the shared Peer mutex; cancellation or failure
-releases the temporary reservation and partial socket resources.
+V2 prepays a serial-dial owner before allocating a wrapper or opening Carrier
+sockets. DNS and socket startup run outside the shared Peer mutex. The same
+credit survives pre-installation path fallback and stays charged until failed
+construction or Session cleanup has joined all owned socket activity.
 
 Existing v1 Datagram remains supported. Linux also supports explicit v2
 Datagram with `transport.mtu_discovery: fixed`,
@@ -180,6 +181,9 @@ without blocking or starting per-packet workers.
 | V1 Listener accept | `limits.receive_queue_capacity` | Close/release newest Session |
 | V2 Listener accept | `limits.max_pending_accepts` | Reject admission without reserved capacity |
 | Session delivery | `limits.delivery_queue_capacity` | Drop newest Datagram and release ownership |
+| V2 Peer send workers | `limits.max_send_workers` | Leave work in bounded controller storage |
+| V2 completion per worker | 1 | Retain the result until owner consumption |
+| V2 Peer cleanup worker | 1 | Retain waiting ownership in bounded Session records |
 
 Slow application consumption cannot create unbounded queues or block transport
 callbacks. Dropping a Datagram does not enable retransmission or stream
@@ -192,19 +196,25 @@ capacity and Endpoint TTL. V2's independent terminal windows, queue backing,
 FEC output, receive state and pending deliveries use Session/Peer credits.
 Disposal clears storage before returning credit; global byte pressure can
 reject admission before the configured Session count is reached.
-The synchronous v2 controller prepays one sealed FEC output and one packet
-assembly allowance before handshake completion. Accepted originals cannot
+The v2 controller prepays one sealed FEC output and bounded packet assembly
+slots before handshake completion. Accepted originals cannot
 consume this [send progress workspace](design/v2-send-workspace.md), including
 when their retained prefixes fill the remaining Session or Peer credit.
 Credits measure reserved obligations and Peer/Session-owned storage, not
 process RSS. Go allocator/GC retention and shared codec lookup tables are
 outside these ownership counters.
 
-The current v2 dispatcher is serial and uses bounded synchronous socket
-attempts with a 20ms context per attempt. Encoding or sending for one Session
-can delay another. There is no per-packet goroutine or unbounded wait queue.
-`max_send_workers` and path-queue settings do not promise an implemented
-parallel worker pool. Current path selection/rate limits are not the complete
+The v2 dispatcher serializes protocol state and encoding. Established control
+and DATA sends run on a fixed Peer-wide pool of `max_send_workers`, outside its
+state mutex, with an independent 20ms context per invocation. One packet per
+logical path can remain admitted through terminal completion; waiting group
+descriptors have no path allocation. The effective packet budget must fit
+`max_path_queued_bytes`, and configured packet/byte ceilings remain enforced.
+Queue residence is limited to 100ms before invocation. Bootstrap and best-effort
+CLOSE emission remain synchronous bounded attempts. Encoding can still delay
+other Sessions, and inbound sends share the listener socket's write mutex.
+See [worker ownership](design/v2-send-workers.md). Current path selection/rate
+limits are not the complete
 #22 scheduler or fast health detector, and do not establish #16 throughput
 acceptance. Repair, MTU probing/migration, KCP and smux remain unavailable.
 
@@ -221,6 +231,11 @@ wakes waiters. V1 uses a bounded one-second close context; v2 socket attempts
 use 20ms contexts. Close joins owned background network activity. Authenticated
 remote CLOSE also releases the public Session and its initiator Carriers.
 V2 Session and Listener closure cancel their associated in-flight sends.
+V2 cleanup runs on a fixed worker outside the protocol mutex. Receive storage
+and the Session slot remain charged through construction, active-send results
+and Carrier cleanup; repeated Close waits for the same final result. A slow
+cleanup can delay other cleanup and retain admission capacity, while protocol
+work continues. This does not add a timeout around arbitrary custom Close code.
 
 `Peer.Errors()` is a capacity-one diagnostic channel. Producers never block
 and drop the newest diagnostic when full. Text exposes stable operation

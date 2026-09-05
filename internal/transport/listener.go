@@ -45,7 +45,7 @@ type Listener struct {
 	statistics        *Counters
 
 	mu        sync.RWMutex
-	writeMu   sync.Mutex
+	writeMu   writeGate
 	active    sync.WaitGroup
 	closed    bool
 	closeDone chan struct{}
@@ -287,7 +287,9 @@ func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, rem
 	}
 	queuedAt := l.statistics.start()
 	pathQueuedAt := statistics.start()
-	l.writeMu.Lock()
+	if err := l.writeMu.acquire(ctx); err != nil {
+		return err
+	}
 	var acquired time.Time
 	if !queuedAt.IsZero() || !pathQueuedAt.IsZero() {
 		acquired = time.Now()

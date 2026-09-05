@@ -127,6 +127,7 @@ def matrix(args):
                 case.update(mpudp_profile=profile, wire_version="v1" if profile == "v1" else "v2",
                             max_original_bytes=datagram_limit(args, profile))
                 if profile != "v1":
+                    case["v2_max_send_workers"] = args.v2_max_send_workers
                     case["case_id"] += "-" + profile
             if case["message_bytes"] < 64 or case["message_bytes"] * flows > 64 * 1024 * 1024:
                 raise ValueError("message and flow sizes exceed probe memory bounds")
@@ -151,7 +152,8 @@ def mpudp_config(args, topology, case, side, secret):
         cfg["transport"].update(max_receive_udp_payload=args.udp_budget,
                                 mtu_discovery="fixed", budget_strategy="session")
         cfg["limits"].update(max_datagram_size=datagram_limit(args, profile),
-                             max_fragments_per_datagram=V2_MAX_FRAGMENTS)
+                             max_fragments_per_datagram=V2_MAX_FRAGMENTS,
+                             max_send_workers=args.v2_max_send_workers)
         cfg["aggregation"] = {"enabled": profile == "v2-aggregation",
                               "max_delay": f"{args.v2_aggregation_max_delay_us}us",
                               "max_records": args.v2_aggregation_max_records,
@@ -353,6 +355,14 @@ def verify_mpudp_config(metadata, case, side, parameters):
     aggregation = {"enabled": profile == "v2-aggregation"}
     scheduler = {"outbound_path_rates_bps": {}, "inbound_path_rates_bps": {}}
     if version == "v2":
+        # Old archives did not select a worker limit; their runtime concurrency
+        # cannot be inferred from a configuration default in endpoint metadata.
+        if hasattr(parameters, "v2_max_send_workers") or "v2_max_send_workers" in case:
+            workers = getattr(parameters, "v2_max_send_workers", None)
+            if (type(workers) is not int or not 1 <= workers <= 32 or
+                    type(case.get("v2_max_send_workers")) is not int or case["v2_max_send_workers"] != workers or
+                    type(cfg["limits"].get("MaxSendWorkers")) is not int or cfg["limits"]["MaxSendWorkers"] != workers):
+                raise ValueError("MPUDP v2 send worker limit differs from requested configuration")
         aggregation.update(max_delay_ns=parameters.v2_aggregation_max_delay_us * 1000,
                            max_records=parameters.v2_aggregation_max_records,
                            max_queued_datagrams=V2_QUEUE_DATAGRAMS, max_queued_bytes=V2_QUEUE_BYTES,
@@ -786,6 +796,8 @@ def parse_args(argv=None):
                         help="additional v2 original Datagram ceiling (64..1048576)")
     parser.add_argument("--v2-path-rate-bps", type=int, default=100000000,
                         help="explicit configured rate for each selected v2 path; not a measured rate")
+    parser.add_argument("--v2-max-send-workers", type=int, default=8,
+                        help="explicit v2 send worker limit per endpoint Peer (1..32); not probe process count")
     parser.add_argument("--v2-aggregation-max-delay-us", type=int, default=250)
     parser.add_argument("--v2-aggregation-max-records", type=int, default=32)
     parser.add_argument("--stream-max-payload", type=int, default=65536)
@@ -817,6 +829,8 @@ def parse_args(argv=None):
         parser.error("v2 original, path rate or aggregation setting outside bounded range")
     if len(set(args.mpudp_profiles)) != len(args.mpudp_profiles):
         parser.error("MPUDP profiles must not contain duplicates")
+    if not 1 <= args.v2_max_send_workers <= 32:
+        parser.error("v2 send worker limit must be within 1..32")
     if any(protocol in MPUDP for protocol in args.protocols) and any(profile != "v1" for profile in args.mpudp_profiles):
         if args.udp_budget < 512:
             parser.error("v2 requires UDP send and receive budgets of at least 512 bytes")
