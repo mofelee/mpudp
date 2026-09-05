@@ -54,15 +54,25 @@ func (r *v2Peer) newWrapper(inbound bool) *v2Session {
 	ctx, cancel := context.WithCancel(parent)
 	s := &v2Session{owner: r, ctx: ctx, cancel: cancel, inbound: inbound,
 		delivery: make(chan *reassemblyv2.Datagram, r.peer.config.Limits.DeliveryQueueCapacity),
-		done:     make(chan struct{}), changed: make(chan struct{}), cleanupDone: make(chan struct{})}
+		done:     make(chan struct{}), cleanupDone: make(chan struct{})}
 	r.sessions[s] = struct{}{}
 	r.linkSendSession(s)
 	return s
 }
 
 func (s *v2Session) notify() {
-	close(s.changed)
-	s.changed = make(chan struct{})
+	if s.changed != nil {
+		close(s.changed)
+		s.changed = nil
+	}
+}
+
+// The owner mutex covers both waiter registration and notification.
+func (s *v2Session) waitChange() <-chan struct{} {
+	if s.changed == nil {
+		s.changed = make(chan struct{})
+	}
+	return s.changed
 }
 
 func (s *v2Session) WritePacket(payload []byte) error {
@@ -124,7 +134,7 @@ func (s *v2Session) ReadPacket() ([]byte, error) {
 			return payload, nil
 		default:
 		}
-		changed := s.changed
+		changed := s.waitChange()
 		r.mu.Unlock()
 		select {
 		case <-s.ctx.Done():
@@ -154,7 +164,7 @@ func (s *v2Session) waitFence(ctx context.Context, frontier uint64) error {
 			r.mu.Unlock()
 			return failure
 		}
-		changed := s.changed
+		changed := s.waitChange()
 		r.mu.Unlock()
 		select {
 		case <-ctx.Done():
