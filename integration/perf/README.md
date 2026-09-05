@@ -133,3 +133,79 @@ See [the performance contract](../../docs/PERFORMANCE.md) for topology,
 calibration, formal repetitions, MTU scenarios, artifact requirements, and
 remaining issue #17 acceptance gates. A successful loopback test is functional
 evidence and is not a throughput acceptance result.
+
+## Isolated Linux RX Comparison
+
+`cmd/rxprobe` compares native scalar UDP receive with the existing perf module's
+`x/net/ipv4.ReadBatch`. It does not change production transport or dependencies.
+The initial fixture covers one unconnected IPv4 loopback socket, with a separate
+sender process and at most 32 prequeued datagrams per burst. Every receive uses
+an owned payload copy and independent local/remote address snapshots. Sequence,
+length, body and sender endpoint checks fail the run on any integrity mismatch.
+
+```sh
+go test -race ./cmd/rxprobe
+go build -ldflags "-X main.sourceSHA=$(git rev-parse HEAD)" -o /tmp/mpudp-rxprobe ./cmd/rxprobe
+/tmp/mpudp-rxprobe -mode scalar -payload 551 -burst 32
+/tmp/mpudp-rxprobe -mode batch -batch 1 -payload 551 -burst 32
+/tmp/mpudp-rxprobe -mode batch -batch 8 -payload 551 -burst 32
+/tmp/mpudp-rxprobe -mode batch -batch 32 -payload 551 -burst 32
+```
+
+Repeat and alternate scalar/batch order during a quiet CPU window. Defaults are
+1,024 warmup and 262,144 measured packets. `-burst 1` checks sparse traffic;
+`-packets 37 -burst 8` checks a partial final burst. Packet count, payload, burst
+size and timeout are bounded. The child is joined on success, receive failure,
+sender failure and cancellation. A receive error fails the whole fixture; this
+is not a proposed production policy for partially returned batches.
+
+Each JSON summary reports packet counts, receive API calls and occupancy,
+allocation totals, receiver user/system CPU, and two rates. `active_receive_pps`
+includes read, owned copies, address snapshots and bounded collection/validation,
+but excludes sender preparation and pipe coordination. `wall_pps` includes that
+coordination. Receiver CPU and allocation deltas cover the whole measured phase,
+including coordination and collection, but exclude child CPU and allocation.
+The reported socket receive buffer is the actual `SO_RCVBUF` value after a
+256 KiB request, including Linux's accounting multiplier/cap behavior.
+
+Prequeued batches measure idealized drain cost. They do not measure live batch
+occupancy, production authentication/FEC, Peer ingress drops, connected Carrier
+receive, IPv6, or application throughput/latency. In particular, Carrier scalar
+`Read` currently avoids source-address parsing that `ReadBatch` would add.
+Those surfaces require separate evidence before adopting receive batching.
+
+### Receiver Syscall Counts
+
+Normal summaries explicitly report `syscall_count_available: false`: API call
+counts are not kernel-entry counts. In pinned `x/net v0.47.0`, `ReadBatch` calls
+`internal/socket.Conn.recvMsgs`, then `syscaller.recvmmsg` through `RawConn.Read`.
+Each callback performs one `recvmmsg`, but `EAGAIN` and netpoll retries can make
+one API call perform multiple syscalls. Scalar `UDPConn.ReadFrom` likewise may
+retry `recvfrom`. A full batch therefore establishes packets/API-call only.
+
+The optional stdlib-only Python helper records actual kernel entries in a
+uniquely owned tracefs instance, without installed tracing binaries or global
+tracer changes. It requires root-equivalent tracefs access and the receive
+syscall tracepoints. Run it separately from performance timing:
+
+```sh
+python3 scripts/rx-tracefs-count.py --output /tmp/rx-scalar-count -- \
+  /tmp/mpudp-rxprobe -mode scalar -packets 4096 -ready
+python3 scripts/rx-tracefs-count.py --output /tmp/rx-batch-count -- \
+  /tmp/mpudp-rxprobe -mode batch -batch 32 -packets 4096 -ready
+```
+
+The ready barrier occurs after warmup. The helper stops the receiver, seeds all
+its thread IDs, enables event-fork tracking for new threads, then releases the
+barrier. Sender threads remain excluded. Histogram entry/exit counts include
+errors and retries from barrier release through receiver exit; no additional UDP
+reads are scheduled after the measured phase. Successful datagrams must match
+the fixture count, histogram drops must be zero, and entry/exit totals and
+socket FDs must agree. Failure leaves `valid: false` with its reason. Cleanup
+removes the owned instance on both success and failure. Trace runs perturb CPU
+and timing and must never be used as performance samples.
+
+The [recorded prototype results](../../docs/performance/rx-prototype-20260905.md)
+include both queued-burst gains and sparse-traffic regressions, with curated raw
+samples and separate receiver-only syscall evidence. Scalar remains the fixture
+default; no production receive path is changed.
