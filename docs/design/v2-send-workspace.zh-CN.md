@@ -2,6 +2,8 @@
 
 [English](v2-send-workspace.md)
 
+控制器的显式适配模式参见[发送意图所有权](v2-owned-send-intents.zh-CN.md)。
+
 同步固定预算 Datagram controller 在握手额度提升前，为一个已封闭的 FEC 组和一次
 报文组装预留额度。此前，已接纳的原报文可能占满 Session 或 Peer 的全部剩余字节，
 而编码需要随后再次申请输出额度。原报文未消费就无法释放额度，重复重试也无法打破

@@ -85,6 +85,10 @@ func newPairWithCreditLimits(t testing.TB, paths, bootstrap int, aggregate bool,
 }
 
 func newPairWithProfiles(t testing.TB, client, server negotiationv2.Profile, bootstrap int, aggregate bool, adjust func(negotiationv2.Role, Config, *creditv2.Limits)) *pair {
+	return newPairWithConfig(t, client, server, bootstrap, aggregate, nil, adjust)
+}
+
+func newPairWithConfig(t testing.TB, client, server negotiationv2.Profile, bootstrap int, aggregate bool, configure func(*Config), adjust func(negotiationv2.Role, Config, *creditv2.Limits)) *pair {
 	t.Helper()
 	_, contract, err := negotiationv2.Select(negotiationv2.Advertisement{Profile: client, BootstrapPathID: uint16(bootstrap)}, server)
 	if err != nil {
@@ -98,6 +102,9 @@ func newPairWithProfiles(t testing.TB, client, server negotiationv2.Profile, boo
 			t.Fatal(err)
 		}
 		cfg := configFor(local, aggregate)
+		if configure != nil {
+			configure(&cfg)
+		}
 		binding := clientBinding(bootstrap)
 		if role == negotiationv2.Responder {
 			binding = opposite(binding, true)
@@ -167,6 +174,11 @@ func newPairWithProfiles(t testing.TB, client, server negotiationv2.Profile, boo
 func (p *pair) pump(t testing.TB, done func() bool) {
 	t.Helper()
 	for step := 0; step < 20000; step++ {
+		for _, e := range []*endpoint{p.client, p.server} {
+			if e.controller.cfg.OwnedSends {
+				p.sendOwned(t, e)
+			}
+		}
 		for _, toServer := range []bool{true, false} {
 			from, to := p.client, p.server
 			if !toServer {

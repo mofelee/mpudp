@@ -15,9 +15,12 @@ import (
 )
 
 type controlFrame struct {
-	packet [512]byte
-	length int
-	queued bool
+	packet     [512]byte
+	length     int
+	queued     bool
+	version    uint64
+	queuedAt   time.Time
+	dispatched bool
 }
 
 func (f *controlFrame) set(packet []byte) error {
@@ -35,16 +38,20 @@ type controlRetry struct {
 	deadline, next time.Time
 	sends          int
 	pending        bool
+	id             uint64
+	inflight       int
 }
 
 type pathJoin struct {
 	controlRetry
-	kind           wirev2.PacketType
-	client, server wirev2.Nonce
-	binding        handshakev2.Binding
-	sender         transport.ReplyPath
-	generation     uint64
-	committed      bool
+	kind                wirev2.PacketType
+	client, server      wirev2.Nonce
+	binding             handshakev2.Binding
+	sender              transport.ReplyPath
+	generation          uint64
+	committed           bool
+	transportGeneration uint64
+	nativeTiming        bool
 }
 
 type oldRoute struct {
@@ -75,6 +82,11 @@ type pathState struct {
 	replies                   [2]controlFrame
 	pacedAt                   time.Time
 	rate                      uint64
+	transportGeneration       uint64
+	nativeTiming              bool
+	sendToken                 SendToken
+	queuedPackets             int
+	queuedBytes               uint64
 }
 
 func (p *pathState) route() wirev2.Route {
@@ -111,7 +123,7 @@ func (c *Controller) randomNonce() (wirev2.Nonce, error) {
 	return wirev2.Nonce{}, ErrEntropy
 }
 
-func (c *Controller) joinFrame(p *pathState, kind wirev2.PacketType) error {
+func (c *Controller) joinFrame(p *pathState, kind wirev2.PacketType, now time.Time) error {
 	var body [440]byte
 	copy(body[:16], p.join.client[:])
 	copy(body[16:32], p.join.server[:])
@@ -120,7 +132,7 @@ func (c *Controller) joinFrame(p *pathState, kind wirev2.PacketType) error {
 		return err
 	}
 	p.join.kind = kind
-	return p.join.frame.set(packet)
+	return c.frameSet(&p.join.frame, packet, now)
 }
 
 func (c *Controller) startJoin(carrier Carrier, now time.Time) error {
@@ -132,9 +144,20 @@ func (c *Controller) startJoin(carrier Carrier, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	retry, err := c.newControlRetry(now)
+	if err != nil {
+		return err
+	}
+	sender, generation, native := carrier.Sender, uint64(0), false
+	if c.cfg.OwnedSends {
+		sender, generation, native, err = captureBoundSender(carrier.Binding, sender)
+		if err != nil {
+			return err
+		}
+	}
 	p.floor++
-	p.join = pathJoin{controlRetry: controlRetry{pending: true, deadline: now.Add(ControlLifetime), next: now}, client: nonce, binding: carrier.Binding, sender: carrier.Sender, generation: p.floor}
-	return c.joinFrame(p, wirev2.TypePathJoin)
+	p.join = pathJoin{controlRetry: retry, client: nonce, binding: carrier.Binding, sender: sender, generation: p.floor, transportGeneration: generation, nativeTiming: native}
+	return c.joinFrame(p, wirev2.TypePathJoin, now)
 }
 
 // Join revalidates one configured Carrier with a fresh monotonic generation.
@@ -169,6 +192,7 @@ func (c *Controller) commitPath(p *pathState, now time.Time, result *Result) err
 		p.old[slot] = oldRoute{binding: p.binding, sender: p.sender, generation: p.generation, epoch: p.receiveEpoch, budget: p.receiveBudget, until: now.Add(time.Duration(c.setup.Contract.Epochs.GraceMS) * time.Millisecond)}
 	}
 	p.active, p.generation, p.binding, p.sender = true, p.join.generation, p.join.binding, p.join.sender
+	p.transportGeneration, p.nativeTiming = p.join.transportGeneration, p.join.nativeTiming
 	p.sendBudget, p.receiveBudget, p.sendEpoch, p.receiveEpoch = 512, 512, 1, 1
 	p.oldBudget, p.oldEpoch, p.oldUntil = 0, 0, time.Time{}
 	p.budgetPeerDeadline = time.Time{}
@@ -205,9 +229,20 @@ func (c *Controller) receiveJoin(p *pathState, now time.Time, binding handshakev
 		if err != nil {
 			return err
 		}
+		retry, err := c.newControlRetry(now)
+		if err != nil {
+			return err
+		}
+		generation, native := uint64(0), false
+		if c.cfg.OwnedSends {
+			reply, generation, native, err = captureBoundSender(binding, reply)
+			if err != nil {
+				return err
+			}
+		}
 		p.floor = message.Route.Generation
-		p.join = pathJoin{controlRetry: controlRetry{pending: true, deadline: now.Add(ControlLifetime), next: now}, client: client, server: nonce, binding: binding, sender: reply, generation: p.floor}
-		return c.joinFrame(p, wirev2.TypePathChallenge)
+		p.join = pathJoin{controlRetry: retry, client: client, server: nonce, binding: binding, sender: reply, generation: p.floor, transportGeneration: generation, nativeTiming: native}
+		return c.joinFrame(p, wirev2.TypePathChallenge, now)
 	}
 	if message.Header.Type == wirev2.TypePathReady && p.join.committed && p.join.binding == binding && p.join.generation == message.Route.Generation && p.join.client == client && p.join.server == server {
 		return nil
@@ -230,7 +265,7 @@ func (c *Controller) receiveJoin(p *pathState, now time.Time, binding handshakev
 			return ErrProtocol
 		}
 		p.join.server, p.join.next = server, now
-		return c.joinFrame(p, wirev2.TypePathConfirm)
+		return c.joinFrame(p, wirev2.TypePathConfirm, now)
 	case wirev2.TypePathConfirm:
 		if c.setup.Role != negotiationv2.Responder || p.join.server != server {
 			return ErrProtocol
@@ -240,7 +275,7 @@ func (c *Controller) receiveJoin(p *pathState, now time.Time, binding handshakev
 				return err
 			}
 			p.join.next = now
-			return c.joinFrame(p, wirev2.TypePathReady)
+			return c.joinFrame(p, wirev2.TypePathReady, now)
 		}
 		return nil
 	case wirev2.TypePathReady:
@@ -288,16 +323,19 @@ func (c *Controller) startBudget(p *pathState, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	p.budget = controlRetry{pending: true, next: now, deadline: now.Add(ControlLifetime)}
-	return p.budget.frame.set(packet)
+	p.budget, err = c.newControlRetry(now)
+	if err != nil {
+		return err
+	}
+	return c.frameSet(&p.budget.frame, packet, now)
 }
 
-func (c *Controller) queueReply(p *pathState, slot int, kind wirev2.PacketType, body []byte) error {
+func (c *Controller) queueReply(p *pathState, slot int, kind wirev2.PacketType, body []byte, now time.Time) error {
 	packet, err := wirev2.AppendEstablished(nil, wirev2.Header{Type: kind, SessionID: c.setup.ID}, p.route(), body, c.sendKey)
 	if err != nil {
 		return err
 	}
-	return p.replies[slot].set(packet)
+	return c.frameSet(&p.replies[slot], packet, now)
 }
 
 func (c *Controller) receiveBudget(p *pathState, now time.Time, message wirev2.Established) error {
@@ -320,7 +358,7 @@ func (c *Controller) receiveBudget(p *pathState, now time.Time, message wirev2.E
 			p.budgetPeerDeadline = now.Add(ControlLifetime)
 			p.receiveBudget, p.receiveEpoch = budget, 2
 		}
-		return c.queueReply(p, 0, wirev2.TypePathBudgetAck, body)
+		return c.queueReply(p, 0, wirev2.TypePathBudgetAck, body, now)
 	}
 	if body[0] != c.sendDirection() || budget != c.cfg.FixedPayloadBudget {
 		return ErrProtocol
@@ -347,10 +385,13 @@ func (c *Controller) startEncoding(p *pathState, now time.Time) error {
 		return err
 	}
 	if !c.context.pending {
-		c.context = controlRetry{pending: true, deadline: now.Add(ControlLifetime)}
+		c.context, err = c.newControlRetry(now)
+		if err != nil {
+			return err
+		}
 	}
 	c.contextPath, c.context.next = p.id, now
-	return c.context.frame.set(packet)
+	return c.frameSet(&c.context.frame, packet, now)
 }
 
 func (c *Controller) receiveEncoding(p *pathState, now time.Time, envelope wirev2.AuthenticatedEnvelope) error {
@@ -396,7 +437,7 @@ func (c *Controller) receiveEncoding(p *pathState, now time.Time, envelope wirev
 	if err != nil {
 		return err
 	}
-	return p.replies[1].set(packet)
+	return c.frameSet(&p.replies[1], packet, now)
 }
 
 func allZero(data []byte) bool {
@@ -439,6 +480,9 @@ func (c *Controller) sendRetry(p *pathState, retry *controlRetry, sender transpo
 }
 
 func (c *Controller) driveControl(now time.Time, result *Result) {
+	if c.cfg.OwnedSends {
+		return
+	}
 	if c.context.pending && c.context.sends > 0 && !now.Before(c.context.next) && now.Before(c.context.deadline) {
 		for offset := 0; offset < len(c.paths); offset++ {
 			p := &c.paths[(int(c.contextPath)+offset)%len(c.paths)]
@@ -487,6 +531,9 @@ func (c *Controller) expireControl(now time.Time) error {
 		}
 		if p.budget.pending && !now.Before(p.budget.deadline) {
 			p.active, p.budget.pending = false, false
+			if c.cfg.OwnedSends {
+				p.replies = [2]controlFrame{}
+			}
 			if p.id == c.contextPath && !c.contextAcknowledged {
 				c.contextPath = 0
 			}
@@ -514,6 +561,13 @@ func (c *Controller) expireControl(now time.Time) error {
 }
 
 func (c *Controller) NextDeadline() time.Time {
+	return c.NextDeadlineWithSendCapacity(true)
+}
+
+// NextDeadlineWithSendCapacity retains maintenance deadlines while allowing an
+// owned-send adapter to suppress dispatch readiness when all its workers are
+// busy. Legacy synchronous mode ignores sendCapacity.
+func (c *Controller) NextDeadlineWithSendCapacity(sendCapacity bool) time.Time {
 	if c == nil || c.closed || !c.started {
 		return time.Time{}
 	}
@@ -526,6 +580,21 @@ func (c *Controller) NextDeadline() time.Time {
 	retry := func(p *pathState, state *controlRetry, limit int) {
 		if state.pending {
 			include(state.deadline)
+			if c.cfg.OwnedSends {
+				if state.sends+state.inflight < limit && !state.frame.dispatched {
+					if state.frame.queued {
+						include(state.frame.queuedAt.Add(c.cfg.MaxQueueResidence))
+					} else if state.next.After(c.last) {
+						include(state.next)
+					} else {
+						include(state.next.Add(c.cfg.MaxQueueResidence))
+					}
+					if sendCapacity && p.sendToken == 0 && c.freeSendSlot() != nil {
+						include(later(state.next, p.pacedAt))
+					}
+				}
+				return
+			}
 			if state.sends < limit {
 				include(later(state.next, p.pacedAt))
 			}
@@ -547,6 +616,15 @@ func (c *Controller) NextDeadline() time.Time {
 		}
 		for _, frame := range p.replies {
 			if frame.queued {
+				if c.cfg.OwnedSends {
+					if !frame.dispatched {
+						include(frame.queuedAt.Add(c.cfg.MaxQueueResidence))
+						if sendCapacity && p.sendToken == 0 && c.freeSendSlot() != nil {
+							include(later(c.last, p.pacedAt))
+						}
+					}
+					continue
+				}
 				include(later(c.last, p.pacedAt))
 			}
 		}
@@ -566,10 +644,15 @@ func (c *Controller) NextDeadline() time.Time {
 	if c.originals != nil {
 		include(c.originals.NextDeadline())
 	}
+	if c.cfg.OwnedSends && c.out != nil {
+		include(c.ownedDataDeadline(sendCapacity))
+	}
 	if c.ready() {
 		if c.out != nil {
-			p := &c.paths[c.outPaths[c.outNext]-1]
-			include(later(later(c.last, p.pacedAt), c.retryStorage))
+			if !c.cfg.OwnedSends {
+				p := &c.paths[c.outPaths[c.outNext]-1]
+				include(later(later(c.last, p.pacedAt), c.retryStorage))
+			}
 		} else if q := c.queue.Snapshot(); q.QueuedDatagrams > 0 {
 			due := q.OldestDeadline
 			if c.forced > c.completed {
