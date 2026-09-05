@@ -30,9 +30,13 @@ func (r *v2Peer) enqueue(event v2Ingress) {
 
 func (r *v2Peer) nextDeadline() time.Time {
 	next := r.engine.NextDeadline()
+	canSend := false
+	for i := range r.sendSlots {
+		canSend = canSend || !r.sendSlots[i].busy
+	}
 	for s := range r.sessions {
 		if s.controller != nil && !s.closed {
-			candidate := s.controller.NextDeadline()
+			candidate := s.controller.NextDeadlineWithSendCapacity(canSend)
 			if !candidate.IsZero() && (next.IsZero() || candidate.Before(next)) {
 				next = candidate
 			}
@@ -48,8 +52,17 @@ func (r *v2Peer) run() {
 		<-timer.Channel()
 	}
 	defer timer.Stop()
+	ctxDone := r.peer.ctx.Done()
 	for {
 		r.mu.Lock()
+		r.consumeSendCompletions()
+		r.consumeCleanupCompletion()
+		r.dispatchCleanup()
+		r.dispatchSends()
+		if r.closed && len(r.sessions) == 0 && (r.listener == nil || r.listener.cleanupComplete) {
+			r.mu.Unlock()
+			return
+		}
 		deadline := r.nextDeadline()
 		r.mu.Unlock()
 		var timerC <-chan time.Time
@@ -58,8 +71,11 @@ func (r *v2Peer) run() {
 			timerC = timer.Channel()
 		}
 		select {
-		case <-r.peer.ctx.Done():
-			return
+		case <-ctxDone:
+			ctxDone = nil
+			r.mu.Lock()
+			r.beginShutdown()
+			r.mu.Unlock()
 		case err := <-r.peer.listenerFailure:
 			r.mu.Lock()
 			r.report("MPUDP v2 listener failed", err)
@@ -72,6 +88,7 @@ func (r *v2Peer) run() {
 			}
 			r.mu.Unlock()
 		case <-r.peer.wake:
+		case <-r.sendWake:
 		case <-timerC:
 			r.mu.Lock()
 			if !r.closed {
@@ -150,7 +167,8 @@ func (r *v2Peer) failCarrier(s *v2Session, socketID uint64) {
 		if path.Binding.SocketID != socketID {
 			continue
 		}
-		_ = s.carriers[i].Close()
+		s.carrierRetiring[i] = true
+		r.peer.wakeDriver()
 		if s.controller != nil {
 			result, err := s.controller.FailPath(time.Now(), path.Binding)
 			r.handleSession(s, result, err)
@@ -179,12 +197,15 @@ func (r *v2Peer) closeSession(s *v2Session) {
 		result, err := r.engine.CancelDial(time.Now(), s.dial)
 		r.handleHandshake(result)
 		r.report("MPUDP v2 cancellation failed", err)
+	} else if s.prepared != nil {
+		r.report("MPUDP v2 preparation abort failed", r.engine.AbortPreparedDial(time.Now(), s.prepared))
 	}
 	r.dispose(s)
 }
 
 func (r *v2Peer) dispose(s *v2Session) {
 	if s.closed {
+		r.queueSessionCleanup(s)
 		return
 	}
 	s.closed = true
@@ -193,29 +214,12 @@ func (r *v2Peer) dispose(s *v2Session) {
 	s.notify()
 	if s.controller != nil {
 		r.retiredReceive.Add(s.controller.ReceiveStatistics().ReceiveCounters)
-		s.controller.Close()
+		s.controller.BeginClose()
 	}
 	for len(s.delivery) > 0 {
 		(<-s.delivery).Release()
 	}
 	s.delivery = nil
-	var failures []error
-	for _, carrier := range s.carriers {
-		if err := carrier.Close(); err != nil {
-			failures = append(failures, err)
-		}
-	}
-	s.closeErr = mapV2Error(errors.Join(failures...))
-	for _, path := range s.paths {
-		delete(r.sockets, path.Binding.SocketID)
-	}
-	s.carriers, s.paths = nil, nil
-	if s.startupScope != nil {
-		s.startupScope.Close()
-		s.startupLease.Release()
-		s.startupScope, s.startupLease = nil, nil
-	}
-	delete(r.sessions, s)
 	delete(r.established, s.id)
 	delete(r.dials, s.dial)
 	for id, route := range r.routes {
@@ -236,6 +240,7 @@ func (r *v2Peer) dispose(s *v2Session) {
 			}
 		}
 	}
+	r.queueSessionCleanup(s)
 }
 
 func (r *v2Peer) closeListener() error {
@@ -249,11 +254,9 @@ func (r *v2Peer) closeListener() error {
 	l.closed = true
 	l.cancel()
 	close(l.done)
-	var failures []error
 	for s := range r.sessions {
 		if s.inbound {
 			r.closeSession(s)
-			failures = append(failures, s.closeErr)
 		}
 	}
 	for id, route := range r.routes {
@@ -263,12 +266,21 @@ func (r *v2Peer) closeListener() error {
 			r.report("MPUDP v2 pending listener close failed", err)
 		}
 	}
-	if r.peer.listenerSocket != nil {
-		failures = append(failures, r.peer.listenerSocket.Close())
-	}
-	l.accept = nil
-	l.closeErr = mapV2Error(errors.Join(failures...))
+	r.peer.wakeDriver()
 	return l.closeErr
+}
+
+func (r *v2Peer) beginShutdown() {
+	if r.closed {
+		return
+	}
+	r.closed = true
+	_, err := r.engine.Close(time.Now())
+	r.shutdownErr = err
+	for s := range r.sessions {
+		r.dispose(s)
+	}
+	r.closeListener()
 }
 
 func (r *v2Peer) closePeer() {
@@ -278,29 +290,36 @@ func (r *v2Peer) closePeer() {
 	p.mu.Unlock()
 	p.cancel()
 	r.mu.Lock()
-	r.closed = true
-	var failures []error
-	sessions := make([]*v2Session, 0, len(r.sessions))
-	for s := range r.sessions {
-		sessions = append(sessions, s)
-	}
-	_, err := r.engine.Close(time.Now())
-	failures = append(failures, err)
-	for _, s := range sessions {
-		r.dispose(s)
-		failures = append(failures, s.closeErr)
-	}
-	failures = append(failures, r.closeListener())
-	r.credits.Close()
-	clear(r.routes)
+	r.beginShutdown()
 	r.mu.Unlock()
 	r.constructing.Wait()
 	<-p.workerDone
+	for {
+		r.mu.Lock()
+		r.consumeSendCompletions()
+		r.consumeCleanupCompletion()
+		r.dispatchCleanup()
+		done := len(r.sessions) == 0 && (r.listener == nil || r.listener.cleanupComplete)
+		r.mu.Unlock()
+		if done {
+			break
+		}
+		<-r.sendWake
+	}
+	r.joinSendWorkers()
+	r.joinCleanupWorker()
+	r.mu.Lock()
+	r.credits.Close()
+	clear(r.routes)
 	for len(r.ingress) > 0 {
 		<-r.ingress
 	}
 	r.ingress = nil
-	p.closeErr = mapV2Error(errors.Join(failures...))
+	if r.listener != nil {
+		r.shutdownErr = errors.Join(r.shutdownErr, r.listener.closeErr)
+	}
+	p.closeErr = mapV2Error(r.shutdownErr)
+	r.mu.Unlock()
 	close(p.closeDone)
 }
 
@@ -323,14 +342,17 @@ func (r *v2Peer) string() string {
 }
 
 type v2Listener struct {
-	owner    *v2Peer
-	ctx      context.Context
-	cancel   context.CancelFunc
-	accept   chan *v2Session
-	done     chan struct{}
-	changed  chan struct{}
-	closed   bool
-	closeErr error
+	owner           *v2Peer
+	ctx             context.Context
+	cancel          context.CancelFunc
+	accept          chan *v2Session
+	done            chan struct{}
+	changed         chan struct{}
+	closed          bool
+	closeErr        error
+	cleanupActive   bool
+	cleanupComplete bool
+	cleanupDone     chan struct{}
 }
 
 func (l *v2Listener) Accept(ctx context.Context) (Session, error) {
@@ -376,8 +398,12 @@ func (l *v2Listener) Accept(ctx context.Context) (Session, error) {
 func (l *v2Listener) Close() error {
 	l.cancel()
 	l.owner.mu.Lock()
+	l.owner.closeListener()
+	l.owner.mu.Unlock()
+	<-l.cleanupDone
+	l.owner.mu.Lock()
 	defer l.owner.mu.Unlock()
-	return l.owner.closeListener()
+	return l.closeErr
 }
 
 func (l *v2Listener) String() string {

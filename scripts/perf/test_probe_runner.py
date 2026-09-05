@@ -48,6 +48,7 @@ def config_metadata_fixture(case, side, args=None):
     if version == "v2":
         group_bytes = min(1048576, args.data_shards * (args.udp_budget - 94))
         cfg["limits"].update(MaxFragmentsPerDatagram=256,
+                             MaxSendWorkers=args.v2_max_send_workers,
                              MaxDatagramSize=min(args.max_datagram_size, args.v2_max_original_bytes,
                                                  256 * (group_bytes - 24)))
         cfg["transport"].update(MaxReceiveUDPPayload=args.udp_budget, MTUDiscovery="fixed", BudgetStrategy="session")
@@ -413,6 +414,25 @@ class MatrixTests(unittest.TestCase):
             "carriers": ["10.206.1.2:29000"]})
         self.assertEqual(runner.mpudp_config_bytes(cfg), json.dumps(cfg).encode())
 
+    def test_v2_send_workers_are_explicit_and_separate_from_probe_processes(self):
+        self.assertEqual(arguments(self.directory).v2_max_send_workers, 8)
+        topology = {"server_addresses": [f"10.206.{index}.2" for index in range(1, 6)]}
+        for workers in (1, 8, 32):
+            args = arguments(self.directory, "--protocols", "mpudp", "kcp-mpudp", "tcp", "--paths", "5",
+                             "--mpudp-profiles", "v1", "v2", "v2-aggregation", "--v2-max-send-workers", str(workers))
+            for case in runner.matrix(args):
+                if case.get("mpudp_profile", "v1") == "v1":
+                    self.assertNotIn("v2_max_send_workers", case)
+                    continue
+                self.assertEqual(case["v2_max_send_workers"], workers)
+                self.assertEqual(case["workers"], 1)
+                self.assertEqual(case["total_flows"], 1)
+                for side in ("client", "server"):
+                    cfg = runner.mpudp_config(args, topology, case, side, "private")
+                    encoded = yaml.safe_load(runner.mpudp_config_bytes(cfg))
+                    self.assertEqual(encoded["limits"]["max_send_workers"], workers)
+                    self.assertIs(type(encoded["limits"]["max_send_workers"]), int)
+
     def test_generated_v2_yaml_passes_actual_strict_go_configuration_parser(self):
         args = arguments(self.directory, "--protocols", "mpudp", "kcp-mpudp", "--paths", "1", "2", "3", "5",
                          "--mpudp-profiles", "v1", "v2", "v2-aggregation")
@@ -461,6 +481,8 @@ func main() {
     def test_v2_profiles_reject_unusable_settings_before_remote_work(self):
         for extra in (("--udp-budget", "511"), ("--v2-max-original-bytes", "1048577"),
                       ("--v2-path-rate-bps", "999"), ("--v2-path-rate-bps", "1000000000001"),
+                      ("--v2-max-send-workers", "0"), ("--v2-max-send-workers", "33"),
+                      ("--v2-max-send-workers", "1.5"),
                       ("--v2-aggregation-max-delay-us", "0"), ("--v2-aggregation-max-delay-us", "10001"),
                       ("--v2-aggregation-max-records", "0"), ("--v2-aggregation-max-records", "257"),
                       ("--source-sha", runner.calibrate.BASELINE_SHA),
@@ -571,6 +593,8 @@ class EvidenceTests(unittest.TestCase):
         self.case["candidate_paths"] = 5
         for profile in ("v1", "v2", "v2-aggregation"):
             self.case["mpudp_profile"] = profile
+            if profile != "v1":
+                self.case["v2_max_send_workers"] = self.args.v2_max_send_workers
             self.rows = pair_records(self.case, self.worker_id)
             self.verify()
             for side in ("client", "server"):
@@ -592,6 +616,7 @@ class EvidenceTests(unittest.TestCase):
                             ("aggregation", "max_queued_bytes", 1), ("aggregation", "max_group_bytes", 1),
                             ("transport", "MTUDiscovery", "plpmtud"), ("transport", "BudgetStrategy", "per_carrier"),
                             ("limits", "MaxFragmentsPerDatagram", 1),
+                            ("limits", "MaxSendWorkers", 1), ("limits", "MaxSendWorkers", True),
                             ("scheduler", "default_path_rate_bps", 1),
                             ("scheduler", "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps", {})):
                         with self.subTest(profile=profile, side=side, section=section, field=field):
@@ -599,6 +624,23 @@ class EvidenceTests(unittest.TestCase):
                             self.rows[side][0]["config"][section][field] = wrong
                             with self.assertRaisesRegex(ValueError, "MPUDP"):
                                 self.verify()
+
+    def test_v2_send_worker_metadata_is_required_on_both_endpoints(self):
+        self.args = arguments(self.directory, "--mpudp-profiles", "v2", "--v2-max-send-workers", "1")
+        self.case, = runner.matrix(self.args)
+        self.worker_id = self.case["case_id"] + "-w0"
+        for side in ("client", "server"):
+            for wrong in (None, True, "1", 0, 8, 33):
+                with self.subTest(side=side, wrong=wrong):
+                    self.rows = pair_records(self.case, self.worker_id, self.args)
+                    self.verify()
+                    limits = self.rows[side][0]["config"]["limits"]
+                    if wrong is None:
+                        del limits["MaxSendWorkers"]
+                    else:
+                        limits["MaxSendWorkers"] = wrong
+                    with self.assertRaisesRegex(ValueError, "send worker limit"):
+                        self.verify()
 
     def test_native_protocols_cannot_claim_mpudp_configuration(self):
         self.case["protocol"] = "kcp"
@@ -610,6 +652,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_bounded_admission_policy_and_successful_local_drain_are_required(self):
         self.case["mpudp_profile"] = "v2-aggregation"
+        self.case["v2_max_send_workers"] = self.args.v2_max_send_workers
         for side in ("client", "server"):
             for key in runner.ADMISSION_POLICY:
                 with self.subTest(side=side, policy=key):
@@ -758,6 +801,7 @@ class PrivacyTests(unittest.TestCase):
             matrices.append((output / "matrix.json").read_bytes())
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["parameters"]["mpudp_profiles"], ["v1", "v2", "v2-aggregation"])
+            self.assertEqual(manifest["parameters"]["v2_max_send_workers"], 8)
             self.assertEqual(manifest["data_shard_overhead_by_profile"], {"v1": 71, "v2": 94, "v2-aggregation": 94})
             self.assertEqual(manifest["v2_fragment_manifest_overhead"], 24)
             self.assertEqual(manifest["admission_policy"], runner.ADMISSION_POLICY)
@@ -876,6 +920,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_v2_deploys_private_yaml_without_changing_go_probe_flags(self):
         self.case["mpudp_profile"] = "v2-aggregation"
+        self.case["v2_max_send_workers"] = self.args.v2_max_send_workers
         self.case["case_id"] += "-v2-aggregation"
         summary = self.probe.case(self.case)
         self.assertEqual(summary["pairs"][0]["receiver"]["local_drain"]["completed_sessions"], 1)

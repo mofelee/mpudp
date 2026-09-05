@@ -66,10 +66,14 @@ and destination-address-bound replies; inability to configure them fails startup
 
 The parser also recognizes the shared and future protocol settings below.
 Successful parsing does not allocate their maximum resources or activate an
-unsupported feature. The current v2 Peer dispatcher is serial, with a 20ms
-context for each synchronous socket attempt. Encoding/sending for one Session
-can delay others. `max_send_workers` is not an implemented parallel pool, and
-path-queue configuration does not imply the full #22 scheduling/health policy.
+unsupported feature. V2 uses a fixed Peer-wide `max_send_workers` pool for
+established control and DATA sends, with a 20ms invocation context outside the
+protocol mutex. One admitted packet per path remains owned through completion;
+the effective packet budget must fit `max_path_queued_bytes`. Waiting descriptors
+are bounded at group level, and invocation must begin within 100ms of queueing.
+Protocol/encoding and bounded bootstrap emission remain serialized. Inbound
+sends share the listener socket write lock. The worker pool does not implement
+the remaining #22 scheduling/health policy.
 Operator-supplied rates are not measured bandwidth or #16 performance evidence.
 
 ## Shared V2 Settings

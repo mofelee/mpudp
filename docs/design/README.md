@@ -29,6 +29,9 @@ performance acceptance remain pending.
 | [FEC group codec foundation](fecv2-group-codec.md) | Logical manifest and equal-size RS recovery used by the fixed Datagram runtime |
 | [Terminal receive windows](v2-receive-window.md) | Independent bounded Datagram/Group Completed and Expired histories; repair/migration integration pending |
 | [Original Datagram reassembly](v2-datagram-reassembly.md) | Atomic decoded-group admission, owned completions and immutable original deadlines, with public Datagram delivery |
+| [Owned send intents](v2-owned-send-intents.md) | Bounded packet ownership, terminal completions and native/custom pacing |
+| [Prepared serial dial](v2-prepared-serial-dial.md) | One prepaid owner across construction, fallback and deferred cleanup |
+| [Peer send workers](v2-send-workers.md) | Fixed send/cleanup workers, reliable completion slots and public Close joins |
 
 The dependency evidence includes exact upstream SHAs, patches, fixture source,
 commands, results and limitations. Fixtures use `.go.txt` so the root module
@@ -38,6 +41,6 @@ The patches are review artifacts, not maintained dependency forks.
 The parser, authenticated handshake, selected contract, credit ledger, FEC
 groups, aggregation and reassembly now compose the fixed Linux Datagram path.
 The individual components remain socket-free. CI also runs bounded fuzz smoke
-and independent vector regeneration. The serial dispatcher and bounded sends
+and independent vector regeneration. The protocol dispatcher and fixed send workers
 do not complete measured performance/latency, health, repair/migration or the
 remaining platform/mode matrices in the linked issues.

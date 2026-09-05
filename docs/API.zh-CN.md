@@ -37,8 +37,9 @@ if cfg.ListenerEnabled() {
 Peer 级 dispatcher。initiator-only 不绑定 listener；每次 `NewSession` 为每个配置的
 Carrier 打开一个长期 UDP socket，并立即发起认证 HELLO。任一 Carrier 打开失败时，本次
 调用已经打开的 socket 会全部关闭，且不会保留半初始化 Session。
-v2 在打开 Carrier socket 前预留临时启动额度。DNS 和 socket 启动不持有共享 Peer
-mutex；取消或失败会释放临时预留和已创建的 socket 资源。
+v2 在分配包装对象及打开 Carrier socket 前预付串行拨号所有者。DNS 和 socket 启动
+不持有共享 Peer mutex。同一额度跨安装前的路径回退保留，直到构造失败或 Session
+清理等待全部所属 socket 活动结束后才释放。
 
 保留既有 v1 Datagram；Linux 还支持显式 `wire.version: v2` 的 Datagram，要求
 `transport.mtu_discovery: fixed`、`transport.budget_strategy: session` 和关闭 repair。
@@ -160,6 +161,9 @@ FEC、Close 或 goroutine 创建。
 | v1 Listener accept | `limits.receive_queue_capacity` | close/release newest Session |
 | v2 Listener accept | `limits.max_pending_accepts` | 握手接纳时预留；不足时拒绝新接纳 |
 | 每 Session delivery | `limits.delivery_queue_capacity` | drop newest Datagram |
+| v2 Peer 发送 worker | `limits.max_send_workers` | 工作保留在有界控制器存储中 |
+| 每个 v2 worker 的完成通知 | 1 | 保留结果直到所有者消费 |
+| v2 Peer 清理 worker | 1 | 待清理所有权保留在有界 Session 记录中 |
 
 因此一个慢 `Accept`/`ReadPacket` 消费者不会阻塞 transport callback 或无限增加
 内存。drop 策略不会产生 DATA 重传或把 Datagram 降级成字节流。listener 的 terminal socket
@@ -173,16 +177,20 @@ error 使用独立的一次性 latch，不会因 packet ingress 已满而丢失�
 - v2 的原 Datagram 和编码组各用独立有界终态窗口；ring、接收状态、FEC 输出和待交付
   payload 由 Session/Peer 额度计费，失败或关闭先清理存储再释放额度。
 
-同步 v2 controller 在握手完成前预留一个已封闭 FEC 组的输出额度和一次报文组装额度。
+v2 controller 在握手完成前预留一个已封闭 FEC 组的输出额度和有界报文组装槽位。
 已接纳的原报文不能占用这个[发送进度工作区](design/v2-send-workspace.zh-CN.md)，即使
 尚未消费的原报文及其已消费前缀已占满剩余 Session 或 Peer 额度。
 
 额度计量已预留义务和 Peer/Session 拥有的存储，不是进程 RSS。Go allocator/GC 保留的
 内存及 codec 共享查找表不包含在这些 ownership 计数中。
 
-v2 当前使用串行 dispatcher 和有界的同步 socket 尝试，每次使用 20ms context。
-同一 Peer 的编码或发送工作可能延迟其他 Session；没有每报文 goroutine 或无界等待队列。
-`limits.max_send_workers` 和 path queue 配置不是已实现的并行发送池保证。当前路径选择/
+v2 dispatcher 串行处理协议状态和编码。已建立的控制包及 DATA 发送通过 Peer 级固定
+`limits.max_send_workers` 池在状态锁外执行，每次调用使用独立的 20ms context。
+每条逻辑路径最多保留一个已接纳数据包直到终态完成；等待中的分组描述符尚未分配路径。
+有效数据包预算必须适配 `max_path_queued_bytes`，并遵守配置的包数/字节上限。
+调用前排队期限为 100ms；bootstrap 与尽力发送的 CLOSE 仍使用有界同步尝试。
+编码仍可能延迟其他 Session，入站发送仍共享 listener socket 的写锁。
+详见[worker 所有权](design/v2-send-workers.zh-CN.md)。当前路径选择/
 速率限制不代表完整 #22 scheduler、快速健康检测或性能验收；尚未交付 repair、MTU 探测/
 迁移、KCP 或 smux，也不声称达到 #16 的吞吐目标。
 
@@ -200,6 +208,9 @@ FEC/Endpoint/timer 状态、唤醒阻塞调用，并等待 receive loop、callba
 Close 返回后不再有属于该对象的后台网络活动。收到认证的远端 CLOSE 也会释放对应公共
 Session 和 initiator Carrier。
 v2 Session 和 Listener 关闭会取消各自关联的在途发送。
+v2 由固定 worker 在协议锁外清理。接收存储和 Session 槽位持续计费，覆盖构造、
+在途发送结果及 Carrier 清理；重复 Close 等待同一个最终结果。慢速清理可能延迟
+其他清理并占用接纳容量，但协议处理可以继续；本实现不会为任意自定义 Close 添加超时。
 
 `Peer.Errors()` 返回容量为一的异步诊断 channel。运行时生产者不会阻塞；channel 已满时
 丢弃最新诊断。错误文本只给出稳定操作类别，底层 cause 仍可用 `errors.Is`/`errors.As`

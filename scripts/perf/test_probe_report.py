@@ -161,13 +161,16 @@ class AccountingTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
-    def artifacts(self, root, direction="upload"):
+    def artifacts(self, root, direction="upload", send_workers=8, historical=False):
         args = arguments(root, "--mpudp-profiles", "v2-aggregation", "--directions", direction,
-                         "--warmup", "2", "--seconds", "5")
+                         "--warmup", "2", "--seconds", "5", "--v2-max-send-workers", str(send_workers))
         case = reporter.runner.matrix(args)[0]
         case_dir = root / case["case_id"]
         case_dir.mkdir()
         rows = pair_records(case, case["case_id"] + "-w0", args)
+        if historical:
+            delattr(args, "v2_max_send_workers")
+            del case["v2_max_send_workers"]
         for side in ("client", "server"):
             for row in rows[side]:
                 if row["type"] == "sample":
@@ -211,6 +214,47 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(case["workers"][0]["verified_bytes"], 120)
                 self.assertEqual(case["receiver_results"][0]["echo_rtt"]["p95_ms"], 1)
                 self.assertAlmostEqual(case["workers"][0]["sender"]["cpu_core_percent"], 30)
+
+    def test_configured_send_workers_are_reported_without_changing_process_count(self):
+        for workers in (1, 8, 32):
+            with self.subTest(workers=workers), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.artifacts(root, send_workers=workers)
+                case = reporter.report(root)["cases"][0]
+                self.assertEqual(case["configured_v2_max_send_workers"], workers)
+                self.assertEqual(case["case"]["v2_max_send_workers"], workers)
+                self.assertEqual(case["case"]["workers"], 1)
+                self.assertEqual(len(case["workers"]), 1)
+
+    def test_historical_worker_concurrency_remains_unknown_despite_config_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = self.artifacts(root, historical=True)
+            metadata = json.loads((root / case["case_id"] / "client-0.jsonl").read_text().splitlines()[0])
+            self.assertEqual(metadata["config"]["limits"]["MaxSendWorkers"], 8)
+            report = reporter.report(root)["cases"][0]
+            self.assertIsNone(report["configured_v2_max_send_workers"])
+            self.assertNotIn("v2_max_send_workers", report["case"])
+
+    def test_send_worker_case_and_manifest_must_agree(self):
+        for target in ("case", "manifest"):
+            for wrong in (None, True, "8", 1, 0, 33):
+                with self.subTest(target=target, wrong=wrong), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    case = self.artifacts(root)
+                    path = root / ("manifest.json" if target == "manifest" else "matrix.json")
+                    value = json.loads(path.read_text())
+                    settings = value["parameters"] if target == "manifest" else value[0]
+                    if wrong is None:
+                        del settings["v2_max_send_workers"]
+                    else:
+                        settings["v2_max_send_workers"] = wrong
+                    path.write_text(json.dumps(value))
+                    if target == "case":
+                        (root / case["case_id"] / "case.json").write_text(json.dumps(settings))
+                    self.index(root)
+                    with self.assertRaisesRegex(ValueError, "send worker limit"):
+                        reporter.report(root)
 
     def test_complete_v2_artifact_reports_optional_receive_statistics(self):
         with tempfile.TemporaryDirectory() as directory:

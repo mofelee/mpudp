@@ -12,8 +12,9 @@ KCP, repair, PLPMTUD, per-Carrier budgets and v2 on other platforms still return
 `ErrProtocolUnavailable` before runtime side effects. The optional public
 `DatagramSession` adds local Flush and graceful-close fences. Reliable APIs,
 full scheduler/health behavior, MTU migration and performance acceptance below
-remain proposed or pending. The serial v2 dispatcher makes bounded synchronous
-socket attempts; it is not the proposed parallel send-worker implementation. The
+remain proposed or pending. V2 established sends now use fixed Peer workers
+with retained packet/completion ownership; protocol state and bootstrap emission
+remain serialized. See [worker ownership](v2-send-workers.md). The
 maintained [configuration](../CONFIGURATION.md) and [API](../API.md) describe
 the implemented parser/runtime boundary. Wire values are assigned in the
 [registry](v2-registry.md); behavior and capacity are in the

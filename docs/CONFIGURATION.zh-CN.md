@@ -67,9 +67,11 @@ KCP、`repair.enabled: true`、`mtu_discovery: plpmtud`、`budget_strategy: per_
 共享 v2 transport、scheduler、资源上限、接收超时、aggregation、repair、KCP tuning 和 mux
 配置已经支持严格解析。配置上限验证不表示已经分配资源或启用数据面。
 
-v2 当前串行处理 Peer 的协议事件与有界 socket 尝试（每次使用 20ms context）。它没有实现
-`limits.max_send_workers` 并行池或完整 path queue/快速健康检测策略；一个 Session 的
-编码或发送工作可能延迟其他 Session。方向速率是操作员提供的配置，不是带宽测量或
+v2 使用 Peer 级固定 `limits.max_send_workers` 池，在协议锁外发送已建立的控制包及 DATA，
+每次调用使用 20ms context。每条路径最多保留一个已接纳包直到完成，有效数据包预算必须
+适配 `max_path_queued_bytes`。等待描述符在分组层有界，必须在入队后 100ms 内开始调用。
+协议、编码与有界 bootstrap 发送仍串行处理，入站发送共享 listener socket 写锁。
+发送池尚未实现其余 #22 调度/健康策略。方向速率是操作员提供的配置，不是带宽测量或
 #22/#16 调度/性能验收结果。
 
 ### V2 共享配置

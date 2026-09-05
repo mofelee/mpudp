@@ -3,8 +3,9 @@
 [中文版](v2-owned-send-intents.zh-CN.md)
 
 `Config.OwnedSends` opts into explicit send ownership. The default remains
-synchronous `Config.Emit`; this increment enables no public runtime workers and
-makes no throughput claim. The controller owns no goroutines, timers or sockets.
+synchronous `Config.Emit`; the Linux public runtime opts in through its
+[fixed send workers](v2-send-workers.md). The controller owns no goroutines,
+timers or sockets and makes no independent throughput claim.
 Its owner serializes all calls except an intent's worker-side `Release`.
 
 ## Admission And Ownership
