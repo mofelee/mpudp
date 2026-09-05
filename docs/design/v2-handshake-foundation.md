@@ -63,6 +63,11 @@ its leases. Components may release copied prepaid handles after clearing their
 storage; engine release is idempotent. Additional adapter leases belong to its disposer. Closing the
 shared Peer ledger stops new reservations; `Advance` retires closed scopes.
 
+An optional [`InstallDeferred` callback](v2-deferred-disposal.md) transfers the
+initial-credit release to an adapter whose cleanup finishes later. It reserves
+an additional 512 bytes and one lease before HELLO/CHALLENGE. The public runtime
+still uses synchronous `Install`; this prerequisite does not enable send workers.
+
 ## Identity And Deadlines
 
 An attempt binds a random SessionID, nonces, exact transcript, configured
