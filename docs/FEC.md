@@ -1,7 +1,7 @@
 # MPUDP v0.1 FEC 设计与边界
 
 `internal/fec` 实现一个上层 Datagram 对应一个 Reed-Solomon block。它只负责有界的
-shard 编码、恢复和短期去重，不感知 Carrier 或网络路径。
+shard 编码、恢复和固定接收窗口去重，不感知 Carrier 或网络路径。
 
 ## 实现选择
 
@@ -76,6 +76,10 @@ allocation，不修改或引用调用方的 payload；不足整除的 data shard
 成功使用一次，之后所有编码都返回 `ErrPacketIDExhausted`，绝不回绕到 0。反方向必须
 使用另一个 `Encoder`，因此两个方向各自维护独立序列。
 
+编码后到 socket 发送之间允许并发，较早取得 PacketID 的调用可能暂停，较新的 Datagram
+先到达接收端。接收端不等待较小 ID；一个尚无 shard 被接纳的旧 ID 若落到下述窗口外，
+即使发送方随后恢复，也会被丢弃。
+
 ## 解码、超时与去重
 
 调用方只能把完整解析且认证成功的 DATA_SHARD 交给 `AddVerifiedShard`。FEC 包不执行
@@ -91,11 +95,32 @@ payload 会立即复制，之后调用方可以复用接收 buffer。
 - 第 `k` 个不同 shard 到达的同一次调用同步执行 `ReconstructData`、去除 padding，并且
   返回唯一一次 `OutcomeComplete`，不等待慢 shard、timer tick 或较小 PacketID。
 
-完成后立即释放 shard state，只在 completion cache 中保留 key。TTL 从完成时固定计算，
-duplicate 不刷新 TTL。cache 达到容量时先移除最早到期的 key；到期时间相同时按
-SessionID、PacketID 的字典序确定，因而行为可重复。TTL 到期或容量淘汰后，旧 shard
-可以再次形成新 block，甚至再次交付；completion cache 提供的是明确受限的短期去重
-窗口，不是永久的 exactly-once 存储。
+生产 Session 的每个接收方向独立启用 `DecoderConfig.ReplayWindow`，绑定完整 SessionID，
+并使用固定 `W = 65536` 个 ID 的 bitmap。设 `H` 为该 decoder 成功接纳过的最高新
+PacketID，允许新 key 的范围是 `[max(0, H-W+1), H]`，更高 ID 在接纳后推进 `H`。
+“接纳”要求鉴权、格式、协商参数和 Endpoint 检查通过，且新 block 实际取得 pending 槽。
+无效报文、其他 SessionID 和 decoder-full 拒绝不能推进窗口。PacketID 的比较和推进不会
+在 `MaxUint64` 处回绕；大跳最多清理整个固定 bitmap，不逐 ID 遍历跳过的跨度。
+
+完成后立即释放 shard state，在窗口内保留完成 bit；时间流逝不清除 bit。窗口外且没有
+既存 pending state 的 ID 返回 `OutcomeTooOld`，不分配 shard/map/heap state，也不学习
+或刷新 Endpoint。它可能是已完成 ID 的晚到 shard，也可能是此前从未抵达的 Datagram，
+因此 `TooOldShards` 与已知完成 ID 的 `LateShards` 分开计数。已经接纳的 pending block
+即使后来落到窗口外，也继续使用原有槽和首个 shard 确定的 deadline；它仍可恢复并交付
+一次。完成或超时后，单调前移的窗口下界阻止它再次打开。未完成且仍在窗口内的 key
+超时后可以重新接纳，但不会重复交付已经完成的 key。
+
+这是 v1 新增的有限乱序接收策略，不改变 wire layout，也不增加 ACK、repair、epoch 或
+重传承诺。无限乱序接收、同一 Session 生命周期内永久去重与有界内存不能同时满足；本实现
+选择固定 ID 跨度，因而窗口外未曾接纳的数据可能被丢弃。它不提供可靠传输或 exactly-once。
+去重保证只限于同一存活 Session 的一个接收方向；`Close` 释放窗口。v1 原有 HELLO 重放若
+能重新创建相同 SessionID，新的 Session 不继承旧窗口，不能据此声称跨 Session 重建的永久
+去重。后续 #20 需单独定义协商、握手重放边界和 repair 可支持的最大 outstanding ID 跨度。
+
+内部 `ReplayWindow=nil` 保留旧 completion-cache 模式，仅用于既有通用 decoder 契约和
+修复前后对照。该模式允许多 SessionID，受 `MaxCompletedBlocks` 和 `CompletionTTL` 约束：
+完成时固定 TTL，duplicate 不刷新；容量满时按最早 deadline 和 key 顺序淘汰。淘汰或
+到期后旧 shard 可能重新打开 block、重复交付。生产 Session 不选择此模式。
 
 未完成 block 的 deadline 在第一个 shard 到达时固定，后续 shard 不刷新。调用方应
 周期性调用 `Sweep`；每次合法 `AddVerifiedShard` 也会先进行 opportunistic sweep。
@@ -109,10 +134,15 @@ deadline 小于或等于当前 clock 时间即过期，block 会直接丢弃，�
 未完成 block 最多保留 `k-1` 个 payload，每个 payload 最多 `ShardCapacity` bytes，另有
 固定的 `n` 个 slice slot 和 heap/map bookkeeping。
 
-`MaxCompletedBlocks` 和 `CompletionTTL` 同时约束 completion cache；cache 只保存 key 和
-deadline，不保存已恢复 Datagram。pending 与 completion 各使用带索引的 expiry heap，
-所有 map 和 heap 都有对应容量边界。`Stats` 可查询精确的 pending block、shard、byte
-和 completion key 数量。
+生产模式每个 Session 接收方向分配 8 KiB 完成 bitmap，以及固定的最高 ID、计数和绑定
+SessionID 状态；不再分配 completed map 或 expiry heap。窗口跨度独立于 pending 容量，
+不能通过增加 `max_pending_fec_blocks` 扩大。多个 Session 的 bitmap 预算按存活 Session 数
+线性累加。pending 使用带索引的 expiry heap，并继续受 `MaxPendingBlocks` 硬限制。
+`Stats.CompletedBlocks` 在此模式表示窗口内当前保留的完成 bit 数，最多 65536；公共累计
+`FEC.CompletedBlocks` 仍表示生命周期内完成事件，二者含义不同。
+
+旧内部模式的 completed map/expiry heap 仍受 `MaxCompletedBlocks` 和 `CompletionTTL`
+约束；这些参数不影响生产窗口。`Stats` 同时提供精确的 pending block、shard、byte 数量。
 
 `Decoder` 不创建后台 goroutine 或 timer。`AddVerifiedShard`、`Sweep`、`Stats` 和
 `Close` 可并发调用；`Close` 幂等并立即清空所有状态，之后 `AddVerifiedShard` 始终返回
@@ -127,7 +157,10 @@ deadline，不保存已恢复 Datagram。pending 与 completion 各使用带索�
 ## 测试与 benchmark
 
 单元测试覆盖 RS(5,3) 的全部 0/1/2 shard 丢失组合、并发到达、大小边界、固定超时、
-容量和 completion cache 淘汰。代表性 encode/recovery benchmark 会报告吞吐和分配，
+容量、旧 completion cache 淘汰，以及固定窗口的 ID 边界、大跳、长期延迟、pending
+跨窗口完成/超时、并发 `WritePacket`、Session/方向隔离和零分配旧 ID 丢弃。
+相同 delayed-parity workload 在旧缓存与生产窗口下的对照见 [API 诊断](API.md#sessionid-与诊断)。
+代表性 encode/recovery benchmark 会报告吞吐和分配，
 但不设置依赖机器的绝对性能门槛：
 
 ```bash

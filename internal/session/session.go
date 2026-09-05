@@ -283,6 +283,10 @@ func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket
 			err = decodeErr
 			break
 		}
+		if decoded.Outcome == fec.OutcomeTooOld {
+			s.mu.Unlock()
+			return result, nil
+		}
 		result.EndpointAdded, result.EndpointRefreshed, err = s.learnEndpointLocked(key, packet.Reply, now)
 		if err == nil && decoded.Outcome == fec.OutcomeComplete {
 			result.Datagram = decoded.Datagram
@@ -545,7 +549,8 @@ func (s *Session) establishLocked(handshake wire.Handshake, now time.Time) error
 		Params: s.settings.params, Budget: budget, DecodeTimeout: s.settings.decodeTimeout,
 		CompletionTTL: s.settings.completionTTL, MaxPendingBlocks: s.settings.maxPendingFECBlocks,
 		MaxCompletedBlocks: s.settings.maxCompletedFECBlocks, Clock: s.settings.clock,
-		Statistics: s.settings.fecStatistics,
+		Statistics:   s.settings.fecStatistics,
+		ReplayWindow: &fec.ReplayWindowConfig{SessionID: [16]byte(s.id)},
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrHandshakeIncompatible, err)

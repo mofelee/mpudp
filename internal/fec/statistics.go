@@ -13,6 +13,7 @@ type Counters struct {
 	ExpiredBlocks              atomic.Uint64
 	DecoderFull                atomic.Uint64
 	LateShards                 atomic.Uint64
+	TooOldShards               atomic.Uint64
 	DuplicateShards            atomic.Uint64
 	PendingBlocks              atomic.Int64
 	PendingShards              atomic.Int64
