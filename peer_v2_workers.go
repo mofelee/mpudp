@@ -131,6 +131,9 @@ func (r *v2Peer) dispatchSends() {
 			slot.jobs <- v2SendJob{session: s, intent: intent}
 			break
 		}
+		if !slot.busy {
+			return
+		}
 	}
 }
 
