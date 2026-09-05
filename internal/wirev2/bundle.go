@@ -94,6 +94,10 @@ func duplicateGroup(records []FECRecord, groupID uint64) bool {
 // caller-validated current send budget for this route, within512..65507.
 // This does not admit groups, reserve credits, or mutate context/ACK state.
 func AppendFECBundle(dst []byte, bundle FECBundle, lookup ContextLookup, key Key, maxPayload int) ([]byte, error) {
+	return appendFECBundle(dst, bundle, lookup, key, maxPayload, nil)
+}
+
+func appendFECBundle(dst []byte, bundle FECBundle, lookup ContextLookup, key Key, maxPayload int, authenticator *Authenticator) ([]byte, error) {
 	if bundle.Header.Type != TypeFECBundle {
 		return dst, ErrUnknownPacketType
 	}
@@ -153,7 +157,7 @@ func AppendFECBundle(dst []byte, bundle FECBundle, lookup ContextLookup, key Key
 		copy(body[offset+FECRecordHeaderSize:], record.Payload)
 		offset += FECRecordHeaderSize + len(record.Payload)
 	}
-	return AppendEnvelope(dst, bundle.Header, body, key)
+	return appendEnvelope(dst, bundle.Header, body, key, authenticator)
 }
 
 // DecodeFECBundle requires an immutable authenticated packet and the actual
