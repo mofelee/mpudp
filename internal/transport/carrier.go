@@ -225,10 +225,18 @@ func (c *Carrier) Rebuild(ctx context.Context) error {
 }
 
 func (c *Carrier) Send(ctx context.Context, payload []byte) error {
-	return c.sendOnGeneration(ctx, 0, payload)
+	return c.sendOnGeneration(ctx, 0, payload, nil)
 }
 
-func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload []byte) error {
+// SendWithAttempt is Send with the connection-write timestamp described by
+// the package-level SendWithAttempt helper.
+func (c *Carrier) SendWithAttempt(ctx context.Context, payload []byte) (time.Time, error) {
+	var started time.Time
+	err := c.sendOnGeneration(ctx, 0, payload, &started)
+	return started, err
+}
+
+func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload []byte, attempt *time.Time) error {
 	if ctx == nil {
 		return invalidArgument("nil send context")
 	}
@@ -253,7 +261,7 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 	if len(payload) > c.maxPayload {
 		return &PayloadSizeError{Size: len(payload), Limit: c.maxPayload}
 	}
-	if err := writeConnected(ctx, generation, payload, c.statistics); err != nil {
+	if err := writeConnected(ctx, generation, payload, c.statistics, attempt); err != nil {
 		if isPathMTUError(err) {
 			err = errors.Join(ErrPathMTUExceeded, err)
 		}
@@ -262,7 +270,7 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 	return nil
 }
 
-func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte, statistics *Counters) error {
+func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte, statistics *Counters, attempt *time.Time) error {
 	queuedAt := statistics.start()
 	generation.writeMu.Lock()
 	var acquired time.Time
@@ -287,6 +295,9 @@ func writeConnected(ctx context.Context, generation *carrierGeneration, payload 
 	var writeStarted time.Time
 	if !queuedAt.IsZero() {
 		writeStarted = time.Now()
+	}
+	if attempt != nil {
+		*attempt = time.Now()
 	}
 	n, err := generation.conn.Write(payload)
 	statistics.wrote(n, err == nil && n == len(payload), err, writeStarted)
@@ -450,7 +461,12 @@ func (r carrierReplyPath) Available() bool {
 	return r.carrier.Available() && r.carrier.Generation() == r.generation
 }
 func (r carrierReplyPath) Send(ctx context.Context, payload []byte) error {
-	return r.carrier.sendOnGeneration(ctx, r.generation, payload)
+	return r.carrier.sendOnGeneration(ctx, r.generation, payload, nil)
+}
+func (r carrierReplyPath) SendWithAttempt(ctx context.Context, payload []byte) (time.Time, error) {
+	var started time.Time
+	err := r.carrier.sendOnGeneration(ctx, r.generation, payload, &started)
+	return started, err
 }
 
 func isTemporary(err error) bool {

@@ -48,14 +48,14 @@ func (e *Engine) receiveHello(now time.Time, binding Binding, packet []byte, env
 		return *result, err
 	}
 	policy := *e.config.Listener
-	scope, receiveLease, packetLease, initial, err := e.reserve(policy)
+	scope, receiveLease, packetLease, initial, retirement, err := e.reserve(policy)
 	if err != nil {
 		e.reject(now, binding, packet, 4, result)
 		return *result, err
 	}
 	a = &attempt{
 		setup: Setup{ID: message.Header.SessionID, Role: negotiationv2.Responder, PathID: contract.BootstrapPathID, Binding: binding, Contract: contract, Scope: scope, Receive: policy.Receive, Initial: initial},
-		state: waitFinish, policy: policy, hello: hello, deadline: now.Add(Lifetime), packets: new(packets), receiveLease: receiveLease, packetLease: packetLease,
+		state: waitFinish, policy: policy, hello: hello, deadline: now.Add(Lifetime), packets: new(packets), receiveLease: receiveLease, packetLease: packetLease, retirement: retirement,
 	}
 	copy(a.packets.hello[:], packet)
 	challenge := wirev2.Handshake{Header: wirev2.Header{Type: wirev2.TypeChallenge, SessionID: a.setup.ID}, ClientNonce: message.ClientNonce}
@@ -121,6 +121,24 @@ func (e *Engine) install(a *attempt, result *Result) error {
 	if err := a.setup.Scope.Promote(); err != nil {
 		return err
 	}
+	if e.config.InstallDeferred != nil {
+		dispose, err := e.config.InstallDeferred(cloneSetup(a.setup))
+		// Failure follows the same ownership handoff as successful retirement.
+		// failAttempt closes the scope and invokes this disposer exactly once.
+		a.disposeDeferred = dispose
+		if err != nil || dispose == nil || a.setup.Scope.Snapshot().Closed {
+			return ErrInstallation
+		}
+	} else if err := e.installSynchronous(a); err != nil {
+		return err
+	}
+	a.state = established
+	e.pending--
+	result.Established = append(result.Established, cloneSetup(a.setup))
+	return nil
+}
+
+func (e *Engine) installSynchronous(a *attempt) error {
 	dispose, err := e.config.Install(cloneSetup(a.setup))
 	if err != nil {
 		if dispose != nil {
@@ -136,8 +154,5 @@ func (e *Engine) install(a *attempt, result *Result) error {
 		return ErrInstallation
 	}
 	a.dispose = dispose
-	a.state = established
-	e.pending--
-	result.Established = append(result.Established, cloneSetup(a.setup))
 	return nil
 }
