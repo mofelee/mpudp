@@ -254,6 +254,10 @@ func (c *Carrier) sendOnGeneration(ctx context.Context, expected uint64, payload
 func writeConnected(ctx context.Context, generation *carrierGeneration, payload []byte, statistics *Counters) error {
 	queuedAt := statistics.start()
 	generation.writeMu.Lock()
+	var acquired time.Time
+	if !queuedAt.IsZero() {
+		acquired = time.Now()
+	}
 	defer generation.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -272,10 +276,12 @@ func writeConnected(ctx context.Context, generation *carrierGeneration, payload 
 	var writeStarted time.Time
 	if !queuedAt.IsZero() {
 		writeStarted = time.Now()
-		statistics.WriteQueue.Observe(writeStarted.Sub(queuedAt))
 	}
 	n, err := generation.conn.Write(payload)
 	statistics.wrote(n, err == nil && n == len(payload), err, writeStarted)
+	if !queuedAt.IsZero() {
+		statistics.WriteQueue.Observe(acquired.Sub(queuedAt))
+	}
 	if !stop() {
 		<-callbackDone
 	}

@@ -41,9 +41,8 @@ type FECStatistics struct {
 	PendingBytesHighWater      uint64 `json:"pending_bytes_high_water"`
 }
 
-// PathStatistics aggregates sockets at one configured Carrier index across
-// Sessions. The listener row aggregates its single shared socket. Path contains
-// only "carrier-N" or "listener", never a remote address or Session ID.
+// PathStatistics counts UDP traffic for an anonymous path or socket aggregate.
+// Path never contains a remote address or Session ID.
 type PathStatistics struct {
 	Path                 string               `json:"path"`
 	SentPackets          uint64               `json:"sent_packets"`
@@ -78,6 +77,11 @@ type Statistics struct {
 	SendLatency        LatencyStatistics `json:"send_latency"`
 	FEC                FECStatistics     `json:"fec"`
 	Paths              []PathStatistics  `json:"paths"`
+	// ListenerPaths counts authenticated, protocol-accepted traffic in at most
+	// 256 lifetime slots plus listener-overflow. Paths retains the raw socket
+	// aggregate, including rejected packets. An accepted CLOSE is attributed
+	// only when its source is already an Endpoint of that Session.
+	ListenerPaths []PathStatistics `json:"listener_paths"`
 }
 
 type peerCounters struct {
@@ -95,6 +99,7 @@ type peerCounters struct {
 	fec               fec.Counters
 	carriers          []*transport.Counters
 	listener          *transport.Counters
+	listenerPaths     *transport.ListenerPathCounters
 }
 
 func (p *Peer) initStatistics() {
@@ -104,6 +109,7 @@ func (p *Peer) initStatistics() {
 	}
 	if p.config.ListenerEnabled() {
 		p.statistics.listener = &transport.Counters{DiagnosticsEnabled: &p.statistics.enabled}
+		p.statistics.listenerPaths = transport.NewListenerPathCounters(&p.statistics.enabled)
 	}
 }
 
@@ -142,6 +148,14 @@ func (p *Peer) Statistics() Statistics {
 	}
 	if c.listener != nil {
 		s.Paths = append(s.Paths, pathStatistics("listener", c.listener))
+	}
+	paths, overflow := c.listenerPaths.Snapshot()
+	s.ListenerPaths = make([]PathStatistics, 0, len(paths)+1)
+	for i, counters := range paths {
+		s.ListenerPaths = append(s.ListenerPaths, pathStatistics(fmt.Sprintf("listener-path-%d", i), counters))
+	}
+	if overflow != nil {
+		s.ListenerPaths = append(s.ListenerPaths, pathStatistics("listener-overflow", overflow))
 	}
 	return s
 }

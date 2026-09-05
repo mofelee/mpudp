@@ -6,6 +6,7 @@ import (
 
 	runtimeconfig "github.com/mofelee/mpudp/config"
 	"github.com/mofelee/mpudp/internal/fec"
+	"github.com/mofelee/mpudp/internal/transport"
 	"github.com/mofelee/mpudp/internal/wire"
 )
 
@@ -32,6 +33,7 @@ type settings struct {
 	handshakeJitterLimit   time.Duration
 	clock                  Clock
 	fecStatistics          *fec.Counters
+	listenerPathStatistics *transport.ListenerPathCounters
 }
 
 func normalizeConfig(config Config) (*settings, error) {
@@ -94,6 +96,7 @@ func normalizeConfig(config Config) (*settings, error) {
 		handshakeJitterLimit:   jitter,
 		clock:                  clock,
 		fecStatistics:          config.FECStatistics,
+		listenerPathStatistics: config.ListenerPathStatistics,
 	}, nil
 }
 

@@ -178,13 +178,27 @@ buffer，因此该情况另计 `ReceiveOversizeDrops`。`SentBytes` 只累计 so
 的已写入字节，`SentPackets` 仅计完整成功的 socket write，`SendErrors` 计 socket write
 错误或 short write；写前校验、设置 deadline 失败和内核/qdisc 后续丢弃不在其中。
 
+`ListenerPaths` 单独统计监听端已认证且协议语义接受的 Endpoint 流量，路径名称按首次
+接受顺序分配为 `listener-path-N`。Peer 生命周期内最多保留 256 个匿名路径槽，之后
+的新路径合并至 `listener-overflow`，不再保留新地址索引。身份包含监听 socket generation
+和本地/远端 Endpoint，不含 SessionID；同一路径跨 Session、Endpoint TTL 到期后仍复用
+已有槽，计数不会清零，也不回收槽。统计快照不输出地址或身份哈希。
+
+无效认证、未知 Session 非 HELLO、不兼容握手、Endpoint/Session/decoder 容量拒绝和
+不匹配的 PONG 不分配槽，也不增加路径接收计数；已接受的 duplicate/late shard 仍计入。
+CLOSE 只归入该 Session 已有的源 Endpoint，不为未知源分配槽。发送包含该路径上的
+HELLO_ACK、PONG、keepalive、DATA 和 CLOSE 的实际 socket 写入。因接收范围不同，
+`ListenerPaths` 总和不必等于包含无效/超大报文的 `Paths` 中 `listener` 汇总；路径行的
+`ReceiveOversizeDrops` 为零，超大报文只计入原始 socket 行。
+
 `Peer.SetDiagnosticsEnabled(true)` 打开额外诊断，默认关闭：
 
 - `IngressQueue`：callback enqueue 到 dispatcher 处理之间的队列时间。
 - `SendLatency`：公共 Session 写入通过生命周期检查后，内部 Datagram 写入的总耗时，
   包括编码、调度和 socket send；不是接收确认时间。
-- 每路径 `WriteQueue`：socket 写锁排队到实际 `Write`/`WriteTo` 调用前的耗时；
-  `SocketWrite` 是该 socket 调用及紧随其后的固定计数开销。
+- 每路径 `WriteQueue`：socket 写锁的实际等待时间，不包含 deadline 等写前准备；
+  `SocketWrite` 为实际 socket 调用耗时，不包含写后计数和 deadline 清理。
+  listener socket 汇总与匿名路径使用同一次 socket 调用测量，不计上层 `Send` 包装耗时。
 - 每路径 `SentPacketSizes` / `ReceivedPacketSizes`：完整 UDP payload 长度的固定分桶，
   `UpperBounds` 为包含上界，`Counts` 为各桶独立计数。
 
@@ -194,7 +208,7 @@ buffer，因此该情况另计 `ReceiveOversizeDrops`。`SentBytes` 只累计 so
 `go test -run '^$' -bench BenchmarkIngressDiagnostics -benchmem .` 可比较 ingress 局部
 开销，不代替完整负载下的开启/关闭实验。
 
-这些统计不声称覆盖监听端每个远端、socket receive overflow、qdisc drop、KCP
+这些统计不声称在 256 个槽以外逐一覆盖监听端远端、socket receive overflow、qdisc drop、KCP
 RTT/RTO/重传、业务 ACK 返回排队、per-Carrier MTU epoch/probe/padding 等指标。它们需要
 基准工具的相应内核/上层采样或后续协议实现，不能以零值替代缺失证据。
 

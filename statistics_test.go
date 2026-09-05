@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mofelee/mpudp/internal/fec"
+	"github.com/mofelee/mpudp/internal/transport"
+	"github.com/mofelee/mpudp/internal/wire"
 )
 
 func TestStatisticsCountQueueDropsAndDeliveredPayload(t *testing.T) {
@@ -90,6 +94,21 @@ func TestStatisticsLoopbackAndRetention(t *testing.T) {
 		if len(stats.Paths) != 1 {
 			t.Fatalf("path count = %d", len(stats.Paths))
 		}
+		if peer == server {
+			if len(stats.ListenerPaths) != 1 {
+				t.Fatalf("listener path count = %d", len(stats.ListenerPaths))
+			}
+			path := stats.ListenerPaths[0]
+			if path.Path != "listener-path-0" || path.SentPackets < 2 || path.ReceivedPackets < 2 || path.WriteQueue.Count == 0 || path.SocketWrite.Count == 0 {
+				t.Fatalf("listener path statistics = %+v", path)
+			}
+			stats.ListenerPaths[0].Path = "mutated"
+			if peer.Statistics().ListenerPaths[0].Path == "mutated" {
+				t.Fatal("listener snapshot aliases retained storage")
+			}
+		} else if len(stats.ListenerPaths) != 0 {
+			t.Fatal("initiator retained listener path slots")
+		}
 		path := stats.Paths[0]
 		if path.SentPackets < 1 || path.ReceivedPackets < 1 || path.SentBytes <= uint64(len(payload)) || path.ReceivedBytes <= uint64(len(payload)) {
 			t.Fatalf("socket counts = %+v", path)
@@ -125,6 +144,113 @@ func TestStatisticsLoopbackAndRetention(t *testing.T) {
 			after.FEC.PendingBytesHighWater != before.FEC.PendingBytesHighWater {
 			t.Fatalf("close changed retained-state diagnostics: before=%+v after=%+v", before.FEC, after.FEC)
 		}
+	}
+}
+
+func TestStatisticsListenerMultipleRemotePathsAndRawRejections(t *testing.T) {
+	cfg := runtimeTestConfig()
+	cfg.Listen = reserveUDPAddress(t)
+	p, err := NewPeer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	p.SetDiagnosticsEnabled(true)
+	remote, err := net.ResolveUDPAddr("udp", cfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id wire.SessionID
+	id[0] = 1
+	hello, err := wire.NewHello(id, uint8(cfg.FEC.DataShards), uint8(cfg.FEC.ParityShards), uint16(cfg.Transport.MaxUDPPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := wire.AppendAuthenticated(nil, hello, cfg.PSK.Bytes(), cfg.Transport.MaxUDPPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var privateAddresses []string
+	for i := range 2 {
+		conn, err := net.DialUDP("udp", nil, remote)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		privateAddresses = append(privateAddresses, conn.LocalAddr().String())
+		if err := conn.SetDeadline(time.Now().Add(runtimeTestTimeout)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte("invalid-authentication")); err != nil {
+			t.Fatal(err)
+		}
+		waitForCondition(t, func() bool { return p.Statistics().Paths[0].ReceivedPackets >= uint64(2*i+1) }, "raw invalid packet count")
+		if got := len(p.Statistics().ListenerPaths); got != i {
+			t.Fatalf("invalid packet allocated slot: %d", got)
+		}
+		if _, err := conn.Write(packet); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, cfg.Transport.MaxUDPPayload)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ack, err := wire.DecodeAuthenticated(buf[:n], cfg.PSK.Bytes(), cfg.Transport.MaxUDPPayload)
+		if err != nil || ack.Header.Type != wire.TypeHelloAck {
+			t.Fatalf("handshake response = %+v, %v", ack, err)
+		}
+	}
+	waitForCondition(t, func() bool {
+		stats := p.Statistics()
+		return len(stats.ListenerPaths) == 2 && stats.ListenerPaths[1].SentPackets == 1
+	}, "accepted listener path counters")
+	stats := p.Statistics()
+	if stats.Paths[0].ReceivedPackets != 4 || stats.Paths[0].SentPackets != 2 {
+		t.Fatalf("raw listener counts = %+v", stats.Paths[0])
+	}
+	for i, path := range stats.ListenerPaths {
+		if path.Path != fmt.Sprintf("listener-path-%d", i) || path.ReceivedPackets != 1 || path.SentPackets != 1 || path.ReceivedBytes != uint64(len(packet)) || path.SocketWrite.Count != 1 || path.WriteQueue.Count != 1 {
+			t.Fatalf("accepted path = %+v", path)
+		}
+	}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range privateAddresses {
+		if strings.Contains(string(encoded), address) {
+			t.Fatal("listener path snapshot exposed a remote endpoint")
+		}
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Statistics(); len(got.ListenerPaths) != 2 || got.ListenerPaths[0].ReceivedPackets != 1 || got.ListenerPaths[1].ReceivedPackets != 1 {
+		t.Fatal("Peer close discarded listener path statistics")
+	}
+}
+
+func TestStatisticsListenerOverflowSnapshotIsBoundedAndAnonymous(t *testing.T) {
+	p := &Peer{}
+	p.statistics.listenerPaths = transport.NewListenerPathCounters(&p.statistics.enabled)
+	for i := range transport.MaxListenerStatisticsPaths + 100 {
+		p.statistics.listenerPaths.Learn(fmt.Sprintf("private-remote-%d", i)).ReceiveAccepted(100)
+	}
+	stats := p.Statistics()
+	if len(stats.ListenerPaths) != transport.MaxListenerStatisticsPaths+1 {
+		t.Fatalf("listener path rows = %d", len(stats.ListenerPaths))
+	}
+	overflow := stats.ListenerPaths[len(stats.ListenerPaths)-1]
+	if overflow.Path != "listener-overflow" || overflow.ReceivedPackets != 100 || overflow.ReceivedBytes != 10000 {
+		t.Fatalf("overflow snapshot = %+v", overflow)
+	}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "private-remote") {
+		t.Fatal("overflow snapshot exposed private identities")
 	}
 }
 
@@ -204,12 +330,14 @@ func BenchmarkIngressDiagnostics(b *testing.B) {
 
 func TestStatisticsConcurrentSnapshotsAndToggle(t *testing.T) {
 	p := &Peer{ctx: context.Background(), ingress: make(chan ingressEvent, 1)}
+	p.statistics.listenerPaths = transport.NewListenerPathCounters(&p.statistics.enabled)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 1000; i++ {
 			p.enqueue(ingressEvent{})
 			p.handleIngress(<-p.ingress)
+			p.statistics.listenerPaths.Learn(fmt.Sprintf("private-source-%d", i%300)).ReceiveAccepted(100)
 		}
 	}()
 	for i := 0; i < 1000; i++ {

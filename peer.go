@@ -132,6 +132,7 @@ func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config
 	if cfg.ListenerEnabled() {
 		stateConfig := mapSessionConfig(cfg)
 		stateConfig.FECStatistics = &p.statistics.fec
+		stateConfig.ListenerPathStatistics = p.statistics.listenerPaths
 		state, err := internalsession.NewListener(internalsession.ListenerConfig{
 			Session:     stateConfig,
 			MaxSessions: cfg.Limits.MaxSessions,
