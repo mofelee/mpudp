@@ -204,3 +204,8 @@ the fixture count, histogram drops must be zero, and entry/exit totals and
 socket FDs must agree. Failure leaves `valid: false` with its reason. Cleanup
 removes the owned instance on both success and failure. Trace runs perturb CPU
 and timing and must never be used as performance samples.
+
+The [recorded prototype results](../../docs/performance/rx-prototype-20260905.md)
+include both queued-burst gains and sparse-traffic regressions, with curated raw
+samples and separate receiver-only syscall evidence. Scalar remains the fixture
+default; no production receive path is changed.
