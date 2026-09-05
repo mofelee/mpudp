@@ -2,6 +2,9 @@
 
 [English](v2-measurement.md)
 
+首次[受控诊断报告](v2-diagnostics-20260905.zh-CN.md)记录了严重的 v2 上传性能问题；
+功能可运行不代表吞吐验收通过。
+
 运行器可比较 Linux 公共 v2 Datagram 与 v1，继续按接收端校验后的唯一业务字节
 计量，每条业务流使用一个 Session。工具不会宣告产品验收通过；三轮 300 秒、
 底层容量校准、主机余量及故障/MTU 矩阵仍按[性能契约](../PERFORMANCE.md)单独验收。

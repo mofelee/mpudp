@@ -2,6 +2,9 @@
 
 [中文版](v2-measurement.zh-CN.md)
 
+The first [controlled diagnostic report](v2-diagnostics-20260905.md) records
+severe v2 upload underperformance; functional support is not throughput acceptance.
+
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.
 These tools do not mark product acceptance complete. The three 300-second rounds,
