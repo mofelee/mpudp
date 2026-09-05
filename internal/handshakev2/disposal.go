@@ -12,6 +12,7 @@ type retiredStorage struct {
 	once              sync.Once
 	initial           [MaxInitialReservations]*creditv2.Lease
 	receive, metadata *creditv2.Lease
+	preparedMetadata  *creditv2.Lease
 }
 
 func (s *retiredStorage) release() {
@@ -20,9 +21,10 @@ func (s *retiredStorage) release() {
 			s.initial[i] = nil
 			lease.Release()
 		}
-		receive, metadata := s.receive, s.metadata
-		s.receive, s.metadata = nil, nil
+		receive, metadata, prepared := s.receive, s.metadata, s.preparedMetadata
+		s.receive, s.metadata, s.preparedMetadata = nil, nil, nil
 		receive.Release()
+		prepared.Release()
 		metadata.Release()
 	})
 }

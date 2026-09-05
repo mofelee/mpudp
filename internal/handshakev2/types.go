@@ -27,6 +27,9 @@ const (
 	// DeferredDisposalBytes pays for a fixed lease owner and release callback.
 	// InstallDeferred adds this one reservation before HELLO/CHALLENGE.
 	DeferredDisposalBytes = 512
+	// PreparedDialBytes prepays a serial preparation owner, copied policy and
+	// maximum-size Carrier request. It is separate from Initial component slots.
+	PreparedDialBytes = 32768
 )
 
 var (
@@ -106,6 +109,10 @@ type Config struct {
 
 type DialID uint64
 
+// PreparedDial is one prepaid serial dial admission. Copies share one private
+// lifecycle; the handle cannot expose or release its owned leases directly.
+type PreparedDial struct{ state *preparedDialState }
+
 type DialRequest struct {
 	Policy   Policy
 	Carriers []Carrier
@@ -161,6 +168,8 @@ type Result struct {
 
 type Snapshot struct {
 	Pending, Established, Dials, Rejections int
-	PacketBytes                             uint64
-	Closed                                  bool
+	// Prepared counts admissions whose sockets may still be under construction.
+	Prepared    int
+	PacketBytes uint64
+	Closed      bool
 }
