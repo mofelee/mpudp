@@ -16,12 +16,14 @@ import (
 type DialFunc func(context.Context, string) (net.Conn, error)
 
 type CarrierOptions struct {
-	Dial        DialFunc
-	MaxPayload  int
-	OnPacket    PacketHandler
-	OnError     ErrorHandler
-	RequirePMTU bool
-	Statistics  *Counters
+	Dial       DialFunc
+	MaxPayload int
+	// MaxReceivePayload defaults to MaxPayload when zero, independently of sends.
+	MaxReceivePayload int
+	OnPacket          PacketHandler
+	OnError           ErrorHandler
+	RequirePMTU       bool
+	Statistics        *Counters
 }
 
 type carrierGeneration struct {
@@ -39,12 +41,13 @@ type carrierGeneration struct {
 // Carrier owns a stable identity and at most one current connected UDP socket.
 // Rebuild replaces the socket without changing the Carrier identity.
 type Carrier struct {
-	id         string
-	remote     string
-	dial       DialFunc
-	maxPayload int
-	onPacket   PacketHandler
-	onError    ErrorHandler
+	id                string
+	remote            string
+	dial              DialFunc
+	maxPayload        int
+	maxReceivePayload int
+	onPacket          PacketHandler
+	onError           ErrorHandler
 
 	lifecycleMu sync.Mutex
 	mu          sync.RWMutex
@@ -78,23 +81,31 @@ func OpenCarrier(ctx context.Context, id, remote string, options CarrierOptions)
 	if maxPayload < 1 || maxPayload > MaxUDPPayload {
 		return nil, &PayloadSizeError{Size: maxPayload, Limit: MaxUDPPayload}
 	}
+	maxReceivePayload := options.MaxReceivePayload
+	if maxReceivePayload == 0 {
+		maxReceivePayload = maxPayload
+	}
+	if maxReceivePayload < 1 || maxReceivePayload > MaxUDPPayload {
+		return nil, &PayloadSizeError{Size: maxReceivePayload, Limit: MaxUDPPayload}
+	}
 	dial := options.Dial
 	if dial == nil {
 		dial = dialUDP
 	}
 	lifetime, cancelLife := context.WithCancel(context.Background())
 	c := &Carrier{
-		id:          id,
-		remote:      remote,
-		dial:        dial,
-		maxPayload:  maxPayload,
-		onPacket:    options.OnPacket,
-		onError:     options.OnError,
-		closeDone:   make(chan struct{}),
-		lifetime:    lifetime,
-		cancelLife:  cancelLife,
-		requirePMTU: options.RequirePMTU,
-		statistics:  options.Statistics,
+		id:                id,
+		remote:            remote,
+		dial:              dial,
+		maxPayload:        maxPayload,
+		maxReceivePayload: maxReceivePayload,
+		onPacket:          options.OnPacket,
+		onError:           options.OnError,
+		closeDone:         make(chan struct{}),
+		lifetime:          lifetime,
+		cancelLife:        cancelLife,
+		requirePMTU:       options.RequirePMTU,
+		statistics:        options.Statistics,
 	}
 	if err := c.Rebuild(ctx); err != nil {
 		cancelLife()
@@ -300,7 +311,7 @@ func writeConnected(ctx context.Context, generation *carrierGeneration, payload 
 
 func (c *Carrier) readLoop(generation *carrierGeneration) {
 	defer close(generation.done)
-	buffer := make([]byte, c.maxPayload+1)
+	buffer := make([]byte, c.maxReceivePayload+1)
 	for {
 		n, err := generation.conn.Read(buffer)
 		if err != nil {
@@ -313,11 +324,11 @@ func (c *Carrier) readLoop(generation *carrierGeneration) {
 			}
 			return
 		}
-		c.statistics.receive(n, c.maxPayload)
-		if n > c.maxPayload {
+		c.statistics.receive(n, c.maxReceivePayload)
+		if n > c.maxReceivePayload {
 			c.reportIfCurrent(generation, &PathError{
 				PathID: c.id, Generation: generation.number, Operation: "read",
-				Err: &PayloadSizeError{Size: n, Limit: c.maxPayload},
+				Err: &PayloadSizeError{Size: n, Limit: c.maxReceivePayload},
 			})
 			continue
 		}
