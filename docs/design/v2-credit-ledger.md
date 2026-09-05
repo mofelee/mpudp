@@ -49,6 +49,15 @@ the source. Peer byte/count/reservation totals do not change. A closed source
 may transfer surviving ownership to an open destination. Cross-Peer transfer
 is rejected. Simultaneously retained copies require separate reservations.
 
+`Session.BindBytes(lease, required)` dedicates a live byte-only lease to one
+storage owner after promotion. It atomically verifies the same Session, an
+adequate byte charge, and no previous binding, without changing usage. Failed
+binding leaves the lease unchanged. Copies cannot bind the same charge twice,
+and bound leases cannot transfer to another Session. This permits constructors
+to consume dedicated handshake reservations even when all capacity is already
+reserved. The returned handle shares Release state with the original: the
+handshake owner must dispose of the component before releasing its own handle.
+
 `Lease.MarkAccepted()` returns only the pending-accept slot when an application
 takes ownership, keeping bytes and business count charged. It is idempotent
 after success; pending-handshake and closed scopes cannot accept. It neither

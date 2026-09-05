@@ -402,6 +402,26 @@ func TestInvalidAdmissionAndConstructionHaveNoCharge(t *testing.T) {
 		if q, err := New(s, l, e); err == nil || q != nil || p.Snapshot() != before {
 			t.Fatal("invalid construction retained charge")
 		}
+		if l != testLimits() {
+			if bytes, err := RequiredInitialBytes(l); err == nil || bytes != 0 {
+				t.Fatal("invalid limits produced an initial byte requirement")
+			}
+		}
+		ringBytes, _ := RequiredInitialBytes(testLimits())
+		prepaid, err := s.Reserve(creditv2.Claim{Bytes: ringBytes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, beforeLease := p.Snapshot(), prepaid.Snapshot()
+		if q, err := NewPrepaid(s, l, e, prepaid); err == nil || q != nil || p.Snapshot() != before || prepaid.Snapshot() != beforeLease {
+			t.Fatal("invalid prepaid construction changed caller ownership")
+		}
+		q, err := NewPrepaid(s, testLimits(), testEpoch(), prepaid)
+		if err != nil {
+			t.Fatalf("invalid prepaid construction bound the caller lease: %v", err)
+		}
+		q.Close()
+		prepaid.Release()
 	}
 	l := testLimits()
 	l.MaxQueuedDatagrams = 65536

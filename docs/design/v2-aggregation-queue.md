@@ -16,6 +16,13 @@ for the typed ring backing, including slots used by empty Datagrams; it is
 not an allocator-overhead or exact-RSS estimate. Limits are ceilings, so a
 large configured ring can fail against global byte credits at construction.
 
+`RequiredInitialBytes(limits)` validates limits and computes that ring charge
+without allocation. Handshake setup can reserve a dedicated byte-only lease
+before promotion and install with `NewPrepaid(session, limits, epoch, lease)`
+after promotion, without reserving the same ring again. Invalid parameters or
+an unavailable lease leave caller ownership unchanged. Successful installation
+binds the lease to this queue until Close clears its ring and releases it.
+
 The charged storage is ring backing, copied payloads, encoded data/parity
 backing and the shard-slice array. Fixed codec state and small queue/output
 wrapper metadata are not measured byte for byte by the ledger. Returned
