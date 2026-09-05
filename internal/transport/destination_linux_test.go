@@ -82,7 +82,11 @@ func TestRequiredDestinationWildcardRepliesAndOwnership(t *testing.T) {
 				if packet.Payload[0] != byte(i) {
 					t.Fatal("later read overwrote retained payload")
 				}
-				reply := transport.WithReplyStatistics(packet.Reply, pathCounters)
+				reply, native, captureErr := transport.CaptureSendPath(transport.WithReplyStatistics(packet.Reply, pathCounters))
+				if captureErr != nil || !native || reply.Generation() != packet.Generation ||
+					reply.LocalAddr().String() != expectedLocal || reply.RemoteAddr().String() != expectedRemote {
+					t.Fatalf("source-aware capture native=%t err=%v", native, captureErr)
+				}
 				var sendErr error
 				if i == 0 {
 					sendErr = reply.Send(context.Background(), []byte("response"))
