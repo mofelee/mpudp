@@ -132,6 +132,10 @@ func (e *Engine) install(a *attempt, result *Result) error {
 	} else if err := e.installSynchronous(a); err != nil {
 		return err
 	}
+	if a.prepared != nil {
+		a.prepared.clearStorage()
+		a.prepared = nil
+	}
 	a.state = established
 	e.pending--
 	result.Established = append(result.Established, cloneSetup(a.setup))

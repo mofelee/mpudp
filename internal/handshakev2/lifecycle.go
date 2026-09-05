@@ -42,20 +42,31 @@ func (e *Engine) NextDeadline() time.Time {
 	return next
 }
 
-func (e *Engine) releasePackets(a *attempt) {
-	if a.packets != nil {
-		clear(a.packets.hello[:])
-		clear(a.packets.challenge[:])
-		clear(a.packets.finish[:])
-		clear(a.packets.ready[:])
-		a.packets = nil
+func clearPackets(p *packets) {
+	if p != nil {
+		clear(p.hello[:])
+		clear(p.challenge[:])
+		clear(p.finish[:])
+		clear(p.ready[:])
 	}
+}
+
+func (e *Engine) releasePackets(a *attempt) {
+	clearPackets(a.packets)
+	a.packets = nil
 	a.packetLease.Release()
 	a.packetLease = nil
 	a.transcript = wirev2.Transcript{}
 }
 
 func (e *Engine) disposeAttempt(a *attempt) {
+	if a.prepared != nil {
+		prepared, dispose := a.prepared, a.disposeDeferred
+		delete(e.dials, a.setup.DialID)
+		clearPreparedAttempt(a)
+		prepared.retire(dispose)
+		return
+	}
 	a.setup.Scope.Close()
 	if a.dispose != nil {
 		dispose := a.dispose
@@ -127,7 +138,9 @@ func (e *Engine) failAttempt(a *attempt, cause error, now time.Time, result *Res
 		}
 		result.Failures = append(result.Failures, Failure{ID: a.setup.ID, DialID: a.setup.DialID, Err: cause})
 	}
-	e.disposeAttempt(a)
+	if !e.recyclePreparedAttempt(a, now) {
+		e.disposeAttempt(a)
+	}
 }
 
 func (e *Engine) receiveClose(now time.Time, a *attempt, envelope wirev2.AuthenticatedEnvelope, result *Result) (Result, error) {
@@ -263,6 +276,11 @@ func (e *Engine) Close(now time.Time) (Result, error) {
 		return result, nil
 	}
 	e.closed = true
+	for prepared := range e.preparations {
+		delete(e.preparations, prepared)
+		prepared.phase = preparationAborted
+		prepared.retire(nil)
+	}
 	clear(e.dials)
 	for _, id := range e.orderedIDs() {
 		e.failAttempt(e.sessions[id], ErrCancelled, now, &result, true)
