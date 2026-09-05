@@ -40,12 +40,14 @@ type attempt struct {
 	disposeDeferred           func(func())
 	retirement                *retiredStorage
 	closeSent                 bool
+	prepared                  *preparedDialState
 }
 
 type dial struct {
 	id            DialID
 	request       DialRequest
 	next, running int
+	prepared      *preparedDialState
 }
 
 type rejected struct {
@@ -60,6 +62,8 @@ type Engine struct {
 	handshakeKey          wirev2.Key
 	sessions              map[wirev2.SessionID]*attempt
 	dials                 map[DialID]*dial
+	preparations          map[*preparedDialState]struct{}
+	preparationIdentity   *preparedEngineIdentity
 	rejections            [MaxRejections]rejected
 	pending               int
 	nextDial              DialID
@@ -68,7 +72,7 @@ type Engine struct {
 }
 
 // New copies PSK and listener policy. No credits or protocol objects are
-// admitted until BeginDial or a valid authenticated compatible HELLO.
+// admitted until PrepareDial, BeginDial or a valid authenticated compatible HELLO.
 func New(psk []byte, config Config) (*Engine, error) {
 	if config.Credits == nil || config.Credits.Snapshot().Closed || config.Entropy == nil || config.Emit == nil || (config.Install == nil) == (config.InstallDeferred == nil) {
 		return nil, ErrInvalid
@@ -172,7 +176,7 @@ func (e *Engine) newID() (wirev2.SessionID, error) {
 }
 
 func (e *Engine) reserve(policy Policy) (*creditv2.Session, *creditv2.Lease, *creditv2.Lease, []*creditv2.Lease, *retiredStorage, error) {
-	if e.pending >= MaxPending {
+	if e.pending+len(e.preparations) >= MaxPending {
 		return nil, nil, nil, nil, nil, creditv2.ErrResourceLimit
 	}
 	scope, receive, err := e.config.Credits.BeginHandshake(policy.Receive)
@@ -415,7 +419,8 @@ func (e *Engine) Snapshot() Snapshot {
 	if e == nil {
 		return Snapshot{Closed: true}
 	}
-	result := Snapshot{Pending: e.pending, Dials: len(e.dials), Closed: e.closed}
+	result := Snapshot{Pending: e.pending, Prepared: len(e.preparations), Dials: len(e.dials), Closed: e.closed,
+		PacketBytes: uint64(len(e.preparations)) * PacketReservationBytes}
 	for _, a := range e.sessions {
 		if a.state == established {
 			result.Established++

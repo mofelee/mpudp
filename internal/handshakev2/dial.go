@@ -76,15 +76,31 @@ func (e *Engine) startAttempt(now time.Time, d *dial, carrier Carrier, result *R
 	if err != nil {
 		return err
 	}
-	scope, receiveLease, packetLease, initial, retirement, err := e.reserve(policy)
-	if err != nil {
-		return err
+	var a *attempt
+	if prepared := d.prepared; prepared != nil {
+		if prepared.scope == nil || prepared.scope.Snapshot().Closed {
+			return ErrClosed
+		}
+		if prepared.packets == nil {
+			prepared.packets = new(packets)
+		}
+		a = &attempt{setup: Setup{Scope: prepared.scope, Receive: policy.Receive, Initial: prepared.initial},
+			receiveLease: prepared.receive, packetLease: prepared.packet, retirement: prepared.storage,
+			packets: prepared.packets, prepared: prepared}
+	} else {
+		scope, receiveLease, packetLease, initial, retirement, err := e.reserve(policy)
+		if err != nil {
+			return err
+		}
+		a = &attempt{setup: Setup{Scope: scope, Receive: policy.Receive, Initial: initial},
+			receiveLease: receiveLease, packetLease: packetLease, retirement: retirement, packets: new(packets)}
 	}
 	deadline := now.Add(Lifetime)
 	if !d.request.Deadline.IsZero() && d.request.Deadline.Before(deadline) {
 		deadline = d.request.Deadline
 	}
-	a := &attempt{setup: Setup{ID: id, DialID: d.id, Role: negotiationv2.Initiator, PathID: carrier.PathID, Binding: carrier.Binding, Scope: scope, Receive: policy.Receive, Initial: initial}, state: waitChallenge, policy: policy, hello: hello, deadline: deadline, packets: new(packets), receiveLease: receiveLease, packetLease: packetLease, retirement: retirement}
+	a.setup.ID, a.setup.DialID, a.setup.Role, a.setup.PathID, a.setup.Binding = id, d.id, negotiationv2.Initiator, carrier.PathID, carrier.Binding
+	a.state, a.policy, a.hello, a.deadline = waitChallenge, policy, hello, deadline
 	message := wirev2.Handshake{Header: wirev2.Header{Type: wirev2.TypeHello, SessionID: id}, ClientNonce: nonce, TLVs: tlvs}
 	if err := encode(&a.packets.hello, message, e.handshakeKey); err != nil {
 		e.disposeAttempt(a)
@@ -121,6 +137,9 @@ func (e *Engine) fillDials(now time.Time, result *Result) {
 		err := e.fillDial(now, d, result)
 		if d.running == 0 {
 			delete(e.dials, id)
+			if d.prepared != nil {
+				d.prepared.retire(nil)
+			}
 			if err != nil {
 				result.Failures = append(result.Failures, Failure{DialID: id, Err: err})
 			}
