@@ -20,8 +20,10 @@ type PacketSizeStatistics metrics.PacketSizeSnapshot
 
 // FECStatistics contains cumulative decoder events and retained-state gauges.
 // Recovered counts require parity reconstruction of missing data shards.
-// LateShards only counts blocks still in the completed cache. Capacity evictions
-// exclude TTL expiry. Neither event alone proves network loss or state reopening.
+// LateShards counts known completed blocks within the replay window. TooOldShards
+// counts unknown or previously completed IDs below its floor, excluding admitted
+// pending blocks. Neither event alone proves network loss. Capacity evictions
+// apply only to legacy internal decoder caches, excluding their TTL expiry.
 // Pending gauges aggregate all live decoders; bytes count owned shard payloads,
 // excluding map/codec overhead. High-water marks persist after state is released.
 type FECStatistics struct {
@@ -32,6 +34,7 @@ type FECStatistics struct {
 	ExpiredBlocks              uint64 `json:"expired_blocks"`
 	DecoderFull                uint64 `json:"decoder_full"`
 	LateShards                 uint64 `json:"late_shards"`
+	TooOldShards               uint64 `json:"too_old_shards"`
 	DuplicateShards            uint64 `json:"duplicate_shards"`
 	PendingBlocks              int64  `json:"pending_blocks"`
 	PendingShards              int64  `json:"pending_shards"`
@@ -136,6 +139,7 @@ func (p *Peer) Statistics() Statistics {
 			CompletedCapacityEvictions: c.fec.CompletedCapacityEvictions.Load(),
 			RecoveredShards:            c.fec.RecoveredShards.Load(), ExpiredBlocks: c.fec.ExpiredBlocks.Load(),
 			DecoderFull: c.fec.DecoderFull.Load(), LateShards: c.fec.LateShards.Load(),
+			TooOldShards:    c.fec.TooOldShards.Load(),
 			DuplicateShards: c.fec.DuplicateShards.Load(),
 			PendingBlocks:   c.fec.PendingBlocks.Load(), PendingShards: c.fec.PendingShards.Load(),
 			PendingBytes: c.fec.PendingBytes.Load(), PendingBlocksHighWater: c.fec.PendingBlocksHighWater.Load(),

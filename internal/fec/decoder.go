@@ -36,6 +36,9 @@ const (
 	OutcomeDuplicate
 	// OutcomeComplete means Datagram contains the one recovered delivery.
 	OutcomeComplete
+	// OutcomeTooOld means a valid new key was below the fixed replay window.
+	// It does not prove that this Datagram was previously received or delivered.
+	OutcomeTooOld
 )
 
 // Result is returned for every valid shard. Datagram is set only for
@@ -59,11 +62,12 @@ type DecoderConfig struct {
 	Params             Params
 	Budget             Budget
 	DecodeTimeout      time.Duration
-	CompletionTTL      time.Duration
+	CompletionTTL      time.Duration // Legacy cache only; ignored with ReplayWindow.
 	MaxPendingBlocks   int
-	MaxCompletedBlocks int
+	MaxCompletedBlocks int // Legacy cache only; ignored with ReplayWindow.
 	Clock              Clock
 	Statistics         *Counters
+	ReplayWindow       *ReplayWindowConfig
 }
 
 // Stats reports retained state; it does not mutate or expire entries.
@@ -71,7 +75,7 @@ type Stats struct {
 	PendingBlocks   int
 	PendingShards   int
 	PendingBytes    int
-	CompletedBlocks int
+	CompletedBlocks int // Retained cache keys or completed bits in the current window.
 }
 
 // ExpireStats reports entries removed by one Sweep or opportunistic sweep.
@@ -110,6 +114,7 @@ type Decoder struct {
 	pendingBytes       int
 	closed             bool
 	statistics         *Counters
+	replay             *replayWindow
 }
 
 // NewDecoder constructs an empty bounded Decoder.
@@ -121,13 +126,13 @@ func NewDecoder(config DecoderConfig) (*Decoder, error) {
 	if config.DecodeTimeout <= 0 {
 		return nil, fmt.Errorf("%w: decode timeout must be greater than zero", ErrInvalidDecoderConfig)
 	}
-	if config.CompletionTTL <= 0 {
+	if config.ReplayWindow == nil && config.CompletionTTL <= 0 {
 		return nil, fmt.Errorf("%w: completion TTL must be greater than zero", ErrInvalidDecoderConfig)
 	}
 	if config.MaxPendingBlocks <= 0 {
 		return nil, fmt.Errorf("%w: max pending blocks must be greater than zero", ErrInvalidDecoderConfig)
 	}
-	if config.MaxCompletedBlocks <= 0 {
+	if config.ReplayWindow == nil && config.MaxCompletedBlocks <= 0 {
 		return nil, fmt.Errorf("%w: max completed blocks must be greater than zero", ErrInvalidDecoderConfig)
 	}
 	codec, total, err := newCodec(config.Params)
@@ -138,7 +143,7 @@ func NewDecoder(config DecoderConfig) (*Decoder, error) {
 	if clock == nil {
 		clock = realClock{}
 	}
-	return &Decoder{
+	decoder := &Decoder{
 		params:             config.Params,
 		limits:             limits,
 		codec:              codec,
@@ -149,9 +154,14 @@ func NewDecoder(config DecoderConfig) (*Decoder, error) {
 		maxPendingBlocks:   config.MaxPendingBlocks,
 		maxCompletedBlocks: config.MaxCompletedBlocks,
 		pending:            make(map[BlockKey]*pendingBlock, config.MaxPendingBlocks),
-		completed:          make(map[BlockKey]*expiryEntry, config.MaxCompletedBlocks),
 		statistics:         config.Statistics,
-	}, nil
+	}
+	if config.ReplayWindow != nil {
+		decoder.replay = &replayWindow{sessionID: config.ReplayWindow.SessionID}
+	} else {
+		decoder.completed = make(map[BlockKey]*expiryEntry, config.MaxCompletedBlocks)
+	}
+	return decoder, nil
 }
 
 // Limits returns the immutable, checked limits used by this Decoder.
@@ -173,15 +183,21 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 	}
 	now := d.clock.Now()
 	d.sweepLocked(now)
-	if _, ok := d.completed[input.Key]; ok {
-		if d.statistics != nil {
-			d.statistics.LateShards.Add(1)
-		}
-		return Result{Outcome: OutcomeDuplicate}, nil
-	}
-
 	block := d.pending[input.Key]
 	if block == nil {
+		if d.replay != nil && d.replay.tooOld(input.Key.PacketID) {
+			if d.statistics != nil {
+				d.statistics.TooOldShards.Add(1)
+			}
+			return Result{Outcome: OutcomeTooOld}, nil
+		}
+		_, completed := d.completed[input.Key]
+		if completed || (d.replay != nil && d.replay.contains(input.Key.PacketID)) {
+			if d.statistics != nil {
+				d.statistics.LateShards.Add(1)
+			}
+			return Result{Outcome: OutcomeDuplicate}, nil
+		}
 		if len(d.pending) >= d.maxPendingBlocks {
 			if d.statistics != nil {
 				d.statistics.DecoderFull.Add(1)
@@ -198,6 +214,9 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 		d.pending[input.Key] = block
 		heap.Push(&d.pendingExpiry, expiry)
 		d.statistics.changePending(1, 0, 0)
+		if d.replay != nil {
+			d.replay.admit(input.Key.PacketID)
+		}
 	} else if block.originalLength != input.OriginalLength || block.shardSize != shardSize {
 		return Result{}, ErrInconsistentBlock
 	}
@@ -261,6 +280,9 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 }
 
 func (d *Decoder) validateShard(input IncomingShard) (int, error) {
+	if d.replay != nil && input.Key.SessionID != d.replay.sessionID {
+		return 0, fmt.Errorf("%w: Session ID does not match the replay window", ErrInvalidShard)
+	}
 	if input.Params != d.params {
 		return 0, fmt.Errorf("%w: Reed-Solomon parameters do not match the decoder", ErrInvalidShard)
 	}
@@ -327,6 +349,10 @@ func (d *Decoder) removePendingLocked(key BlockKey, block *pendingBlock) {
 }
 
 func (d *Decoder) rememberCompletedLocked(key BlockKey, now time.Time) {
+	if d.replay != nil {
+		d.replay.complete(key.PacketID)
+		return
+	}
 	if len(d.completed) >= d.maxCompletedBlocks {
 		oldest := heap.Pop(&d.completedExpiry).(*expiryEntry)
 		delete(d.completed, oldest.key)
@@ -343,11 +369,15 @@ func (d *Decoder) rememberCompletedLocked(key BlockKey, now time.Time) {
 func (d *Decoder) Stats() Stats {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	completed := len(d.completed)
+	if d.replay != nil {
+		completed = d.replay.count
+	}
 	return Stats{
 		PendingBlocks:   len(d.pending),
 		PendingShards:   d.pendingShards,
 		PendingBytes:    d.pendingBytes,
-		CompletedBlocks: len(d.completed),
+		CompletedBlocks: completed,
 	}
 }
 
@@ -362,6 +392,7 @@ func (d *Decoder) Close() error {
 	d.statistics.changePending(-int64(len(d.pending)), -int64(d.pendingShards), -int64(d.pendingBytes))
 	clear(d.pending)
 	clear(d.completed)
+	d.replay = nil
 	for index := range d.pendingExpiry {
 		d.pendingExpiry[index] = nil
 	}

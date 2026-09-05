@@ -7,6 +7,7 @@ the performance targets have passed.
 
 Initial evidence: [native five-path capacity smoke](performance/native-capacity-smoke-20260905.md).
 Updated diagnostic evidence: [five-path counters, profiles and complete network snapshots](performance/diagnostics-20260905.md).
+FEC correctness comparison: [fixed receive window and same-workload smoke](performance/fec-replay-window-20260905.md).
 
 ## Reference Environment
 

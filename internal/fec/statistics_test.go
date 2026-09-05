@@ -113,20 +113,23 @@ func TestCapacityEvictionsExcludeCompletionTTLExpiry(t *testing.T) {
 }
 
 type delayedParityResult struct {
-	Evictions, LateShards, Full uint64
-	Pending                     Stats
-	NewBlockRejected            bool
+	Evictions, LateShards, TooOldShards, Full uint64
+	Pending                                   Stats
+	NewBlockRejected                          bool
 }
 
-// This intentionally characterizes the v1 defect; it is not the #18 fix.
 // All delayed keys are known to have completed before parity is released.
-func delayedParityWorkload(tb testing.TB, capacity int) delayedParityResult {
+// The legacy cache and production replay window receive the identical workload.
+func delayedParityWorkload(tb testing.TB, capacity int, window bool) delayedParityResult {
 	tb.Helper()
 	clock := newDecoderTestClock()
 	cfg := decoderTestConfig(clock)
 	cfg.MaxPendingBlocks = 16
 	cfg.MaxCompletedBlocks = capacity
 	cfg.Statistics = &Counters{}
+	if window {
+		cfg.ReplayWindow = &ReplayWindowConfig{}
+	}
 	d, err := NewDecoder(cfg)
 	if err != nil {
 		tb.Fatal(err)
@@ -176,6 +179,7 @@ func delayedParityWorkload(tb testing.TB, capacity int) delayedParityResult {
 		tb.Fatal(err)
 	}
 	result.LateShards, result.Full = cfg.Statistics.LateShards.Load(), cfg.Statistics.DecoderFull.Load()
+	result.TooOldShards = cfg.Statistics.TooOldShards.Load()
 	clock.Advance(cfg.DecodeTimeout)
 	d.Sweep()
 	if cfg.Statistics.PendingBlocks.Load() != 0 || cfg.Statistics.PendingShards.Load() != 0 || cfg.Statistics.PendingBytes.Load() != 0 {
@@ -191,7 +195,7 @@ func TestDelayedParityCapacityDiagnostics(t *testing.T) {
 		full     uint64
 	}{{8, 16, 17}, {16, 16, 1}, {32, 0, 0}} {
 		t.Run(fmt.Sprintf("completed_capacity_%d", tc.capacity), func(t *testing.T) {
-			got := delayedParityWorkload(t, tc.capacity)
+			got := delayedParityWorkload(t, tc.capacity, false)
 			if got.Evictions != uint64(32-tc.capacity) || got.Pending.PendingBlocks != tc.pending ||
 				got.Pending.PendingShards != tc.pending*2 || got.Pending.PendingBytes != tc.pending*800 ||
 				got.Full != tc.full || got.LateShards != uint64(tc.capacity*2) || got.NewBlockRejected != (tc.pending == 16) {
@@ -202,4 +206,52 @@ func TestDelayedParityCapacityDiagnostics(t *testing.T) {
 				got.Pending.PendingBytes, got.Full, got.NewBlockRejected)
 		})
 	}
+}
+
+func TestDelayedParityWindowDiagnostics(t *testing.T) {
+	for _, capacity := range []int{8, 16, 32} {
+		t.Run(fmt.Sprintf("legacy_capacity_%d", capacity), func(t *testing.T) {
+			got := delayedParityWorkload(t, capacity, true)
+			if got.Evictions != 0 || got.Pending.PendingBlocks != 0 || got.Pending.PendingShards != 0 ||
+				got.Pending.PendingBytes != 0 || got.Full != 0 || got.LateShards != 64 || got.TooOldShards != 0 || got.NewBlockRejected {
+				t.Fatalf("window delayed parity evidence = %+v", got)
+			}
+			t.Logf("window=%d legacy_capacity=%d evictions=%d reopened_pending=%d late=%d too_old=%d full=%d new_block_rejected=%t",
+				ReplayWindowIDs, capacity, got.Evictions, got.Pending.PendingBlocks, got.LateShards, got.TooOldShards, got.Full, got.NewBlockRejected)
+		})
+	}
+}
+
+func TestReplayWindowHighBlockRateDelayedParityDoesNotReopen(t *testing.T) {
+	cfg := windowDecoderTestConfig(newDecoderTestClock())
+	cfg.MaxCompletedBlocks = 8
+	cfg.MaxPendingBlocks = 16
+	d := newDecoderForTest(t, cfg)
+	block := encodeDecoderTestBlock(t, cfg.Params, bytes.Repeat([]byte{0x5a}, 1200))
+	const blocks = ReplayWindowIDs + 32
+	for id := uint64(0); id < blocks; id++ {
+		completeWindowBlock(t, d, cfg, block, id)
+	}
+	for id := uint64(0); id < blocks; id++ {
+		for shard := cfg.Params.DataShards; shard < len(block.Shards); shard++ {
+			result, err := d.AddVerifiedShard(windowShard(block, cfg, id, shard))
+			want := OutcomeDuplicate
+			if id < 32 {
+				want = OutcomeTooOld
+			}
+			if err != nil || result.Outcome != want {
+				t.Fatalf("late high-rate parity %d: %+v %v", id, result, err)
+			}
+		}
+	}
+	if got := d.Stats(); got.PendingBlocks != 0 || got.PendingBytes != 0 || got.CompletedBlocks != ReplayWindowIDs {
+		t.Fatalf("high-rate late parity reopened state: %+v", got)
+	}
+	if cfg.Statistics.CompletedBlocks.Load() != blocks || cfg.Statistics.DecoderFull.Load() != 0 || cfg.Statistics.CompletedCapacityEvictions.Load() != 0 ||
+		cfg.Statistics.LateShards.Load() != ReplayWindowIDs*2 || cfg.Statistics.TooOldShards.Load() != 64 {
+		t.Fatal("high-rate late parity changed completions or mislabeled drop reasons")
+	}
+	completeWindowBlock(t, d, cfg, block, blocks)
+	t.Logf("completed=%d late=%d too_old=%d pending=%d full=%d", blocks,
+		cfg.Statistics.LateShards.Load(), cfg.Statistics.TooOldShards.Load(), d.Stats().PendingBlocks, cfg.Statistics.DecoderFull.Load())
 }

@@ -309,6 +309,41 @@ func TestStatisticsFECStateAndCapacityEvictions(t *testing.T) {
 	}
 }
 
+func TestStatisticsDistinguishWindowOldAndCompletedLateShards(t *testing.T) {
+	p := &Peer{}
+	params := fec.Params{DataShards: 3, ParityShards: 2}
+	d, err := fec.NewDecoder(fec.DecoderConfig{
+		Params: params, Budget: fec.Budget{MaxUDPPayload: 1200, DataShardWireOverhead: wire.DataShardOverhead, MaxDatagramSize: 4096},
+		DecodeTimeout: time.Second, MaxPendingBlocks: 1, Statistics: &p.statistics.fec,
+		ReplayWindow: &fec.ReplayWindowConfig{SessionID: [16]byte{1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	shard := fec.IncomingShard{
+		Key:    fec.BlockKey{SessionID: [16]byte{1}, PacketID: fec.ReplayWindowIDs},
+		Params: params, OriginalLength: 3, Payload: []byte{1},
+	}
+	for index := range params.DataShards {
+		shard.Index = index
+		if _, err := d.AddVerifiedShard(shard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.AddVerifiedShard(shard); err != nil {
+		t.Fatal(err)
+	}
+	shard.Key.PacketID = 0
+	if _, err := d.AddVerifiedShard(shard); err != nil {
+		t.Fatal(err)
+	}
+	stats := p.Statistics().FEC
+	if stats.CompletedBlocks != 1 || stats.LateShards != 1 || stats.TooOldShards != 1 || stats.PendingBlocks != 0 || stats.CompletedCapacityEvictions != 0 || stats.DecoderFull != 0 {
+		t.Fatalf("replay-window diagnostics = %+v", stats)
+	}
+}
+
 func BenchmarkIngressDiagnostics(b *testing.B) {
 	for _, enabled := range []bool{false, true} {
 		name := "disabled"
