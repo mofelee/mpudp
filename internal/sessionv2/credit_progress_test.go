@@ -19,19 +19,27 @@ func creditProgressReceiver(t *testing.T, context wirev2.EncodingContext, groups
 	t.Helper()
 	n := uint64(context.DataShards + context.ParityShards)
 	peak := 2*n*uint64(context.ShardBytes) + uint64(context.MaxLogicalBytes) + 2*n*uint64(unsafe.Sizeof([]byte{})) + uint64(context.MaxDescriptors)*uint64(unsafe.Sizeof(fecv2.Fragment{})) + uint64(unsafe.Sizeof(pendingGroup{})) + 64
-	packetScratch := uint64(94+context.ShardBytes) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
+	packetScratch := uint64(max(512, 94+int(context.ShardBytes))) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
 	limits := reassemblyv2.Limits{MaxDatagrams: 256, MaxDatagramBytes: 65536, MaxFragments: 256, Span: 512, Timeout: 10 * time.Second}
 	initial, err := reassemblyv2.RequiredInitialBytes(limits)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial += 16 // Group terminal-window backing storage.
-	limit := initial + uint64(groups)*peak + packetScratch + 1000
+	initial += 16 + packetScratch // Group window and serialized receive scratch.
+	limit := initial + uint64(groups)*peak + 1000
 	peer, err := creditv2.New(creditv2.Limits{MaxPeerBytes: limit, MaxSessionBytes: limit, MaxSessions: 1, MaxPendingHandshakes: 1, MaxPendingAccepts: 1, MaxStreamsPerSession: 1, MaxPeerStreams: 1, MaxReservations: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
 	scope, windowLease, err := peer.BeginSession(creditv2.Claim{Bytes: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch, err := scope.Reserve(creditv2.Claim{Bytes: packetScratch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch, err = scope.BindBytes(scratch, packetScratch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +52,7 @@ func creditProgressReceiver(t *testing.T, context wirev2.EncodingContext, groups
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &Controller{cfg: Config{MaxPendingGroups: groups, GroupTimeout: 10 * time.Second}, setup: handshakev2.Setup{Scope: scope}, receiveContext: context, receiveAckSent: true, receiveCodec: codec, groups: make(map[uint64]*pendingGroup), groupWindow: window, groupWindowLease: windowLease, originals: originals}
+	c := &Controller{cfg: Config{MaxPendingGroups: groups, GroupTimeout: 10 * time.Second}, setup: handshakev2.Setup{Scope: scope}, receiveContext: context, receiveAckSent: true, receiveCodec: codec, groups: make(map[uint64]*pendingGroup), groupWindow: window, groupWindowLease: windowLease, controlLease: scratch, originals: originals}
 	t.Cleanup(func() {
 		c.Close()
 		scope.Close()
@@ -57,7 +65,7 @@ func creditProgressReceiver(t *testing.T, context wirev2.EncodingContext, groups
 
 func receiveEncodedShard(t *testing.T, c *Controller, at time.Time, id uint64, group fecv2.Group, shard int) Result {
 	t.Helper()
-	budget := 94 + int(c.receiveContext.ShardBytes)
+	budget := max(512, 94+int(c.receiveContext.ShardBytes))
 	bundle := wirev2.FECBundle{
 		Header: wirev2.Header{Type: wirev2.TypeFECBundle, SessionID: wirev2.SessionID{1}},
 		Route:  wirev2.Route{PathID: 1, Generation: 1, BudgetEpoch: 1},
@@ -77,7 +85,7 @@ func receiveEncodedShard(t *testing.T, c *Controller, at time.Time, id uint64, g
 		t.Fatal(err)
 	}
 	var result Result
-	if err := c.receiveBundle(at, authenticated, budget, false, len(packet), &result); err != nil {
+	if err := c.receiveBundle(at, authenticated, budget, false, &result); err != nil {
 		t.Fatal(err)
 	}
 	for _, delivery := range result.Deliveries {
@@ -105,8 +113,7 @@ func TestDecodeReturnsWorkspaceCreditBeforeOriginalAdmission(t *testing.T) {
 	if got := scope.Snapshot().Bytes; got != base.Bytes+32*peak {
 		t.Fatalf("decode peak reservation = %d, want %d", got, base.Bytes+32*peak)
 	}
-	packetScratch := uint64(1200) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
-	if free := limit - scope.Snapshot().Bytes - packetScratch; free != 1000 {
+	if free := limit - scope.Snapshot().Bytes; free != 1000 {
 		t.Fatalf("expected 1000 bytes free during decode, got %d", free)
 	}
 	at := start.Add(time.Millisecond)

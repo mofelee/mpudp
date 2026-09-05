@@ -137,6 +137,59 @@ def duration_fixture(count=0):
             "buckets": [count, *([0] * 24)]}
 
 
+def v2_receive_fixture(counter=0, gauge=0):
+    return {**{key: counter for key in runner.V2_RECEIVE_COUNTERS},
+            **{key: gauge for key in runner.V2_RECEIVE_GAUGES}}
+
+
+class V2ReceiveTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        self.case = {"protocol": "mpudp", "mpudp_profile": "v2", "diagnostics": False, "flows_per_worker": 1}
+
+    def test_legacy_absence_and_valid_current_fields_are_accepted(self):
+        for profile in ("v2", "v2-aggregation"):
+            self.case["mpudp_profile"] = profile
+            value = telemetry_fixture(self.case)
+            runner.verify_telemetry(value, self.case, SOURCE_SHA)
+            value["mpudp"]["v2_receive"] = v2_receive_fixture(100, 4)
+            runner.verify_telemetry(value, self.case, SOURCE_SHA)
+
+    def test_v1_native_and_unavailable_statistics_cannot_claim_v2_receive(self):
+        for protocol, profile in (("mpudp", "v1"), ("kcp-mpudp", "v1"), ("tcp", "v2"), ("udp", "v2"), ("kcp", "v2")):
+            with self.subTest(protocol=protocol, profile=profile):
+                self.case.update(protocol=protocol, mpudp_profile=profile)
+                value = telemetry_fixture(self.case)
+                value.setdefault("mpudp", {})["v2_receive"] = v2_receive_fixture()
+                with self.assertRaisesRegex(ValueError, "v2 receive"):
+                    runner.verify_telemetry(value, self.case, SOURCE_SHA)
+        self.case.update(protocol="mpudp", mpudp_profile="v2")
+        value = telemetry_fixture(self.case)
+        value["mpudp_statistics_available"] = False
+        value["mpudp"]["v2_receive"] = v2_receive_fixture()
+        with self.assertRaisesRegex(ValueError, "v2 receive"):
+            runner.verify_telemetry(value, self.case, runner.calibrate.BASELINE_SHA)
+
+    def test_present_object_requires_every_nonnegative_integer_field(self):
+        for key in runner.V2_RECEIVE_COUNTERS + runner.V2_RECEIVE_GAUGES:
+            for invalid in (None, True, -1, 1.5, "0"):
+                with self.subTest(key=key, value=invalid):
+                    value = telemetry_fixture(self.case)
+                    value["mpudp"]["v2_receive"] = v2_receive_fixture()
+                    value["mpudp"]["v2_receive"][key] = invalid
+                    with self.assertRaisesRegex(ValueError, "v2 receive"):
+                        runner.verify_telemetry(value, self.case, SOURCE_SHA)
+            value = telemetry_fixture(self.case)
+            value["mpudp"]["v2_receive"] = v2_receive_fixture()
+            del value["mpudp"]["v2_receive"][key]
+            with self.assertRaisesRegex(ValueError, "v2 receive"):
+                runner.verify_telemetry(value, self.case, SOURCE_SHA)
+        for invalid in (None, [], 0):
+            value = telemetry_fixture(self.case)
+            value["mpudp"]["v2_receive"] = invalid
+            with self.assertRaisesRegex(ValueError, "v2 receive"):
+                runner.verify_telemetry(value, self.case, SOURCE_SHA)
+
+
 def correlation_fixture(protocol, flow):
     packet = protocol == "kcp-mpudp"
     value = {key: 0 for key in runner.KCP_CORRELATION_COUNTERS}

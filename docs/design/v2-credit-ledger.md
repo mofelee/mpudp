@@ -59,6 +59,13 @@ to consume dedicated handshake reservations even when all capacity is already
 reserved. The returned handle shares Release state with the original: the
 handshake owner must dispose of the component before releasing its own handle.
 
+The Datagram controller's bound `InitialControl` lease also reserves one
+serialized receive scratch workspace at the local receive hard cap, plus the
+maximum bundle record array. This floor stays charged between receives so
+outbound queue admissions and other Sessions cannot borrow it. Bundle cleanup
+ends each temporary use without returning the standing reservation; controller
+Close disposes its storage before releasing the shared handle.
+
 `Lease.MarkAccepted()` returns only the pending-accept slot when an application
 takes ownership, keeping bytes and business count charged. It is idempotent
 after success; pending-handshake and closed scopes cannot accept. It neither

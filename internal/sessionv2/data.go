@@ -141,17 +141,15 @@ func (c *Controller) insertGroup(id uint64, group *pendingGroup) {
 	c.groups[id] = group
 }
 
-func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, packetBytes int, result *Result) error {
+func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, result *Result) error {
+	c.receiveCounters.ReceivedFECBundles++
 	if !c.receiveAckSent {
 		return ErrNotReady
 	}
-	lease, err := c.setup.Scope.Reserve(creditv2.Claim{Bytes: uint64(packetBytes) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))})
-	if err != nil {
-		return err
-	}
+	// InitialControl covers one receive-hard-cap payload and a full record
+	// array. Receive serializes use; discard both before that workspace is reused.
 	bundle, err := wirev2.DecodeFECBundle(envelope, c.receiveLookup, budget)
 	if err != nil {
-		lease.Release()
 		return err
 	}
 	defer func() {
@@ -159,7 +157,6 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			clear(record.Payload)
 		}
 		bundle.Records = nil
-		lease.Release()
 	}()
 	for _, record := range bundle.Records {
 		group := c.groups[record.GroupID]
@@ -169,14 +166,16 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			}
 			group, err = c.reserveGroup(record, now)
 			if err != nil {
+				if errors.Is(err, creditv2.ErrResourceLimit) {
+					c.receiveCounters.NewGroupRejections++
+				}
 				return err
 			}
 			c.groupWindow.Admit(record.GroupID)
 			c.insertGroup(record.GroupID, group)
 		}
 		if !now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
-			c.groupWindow.Finish(record.GroupID, recvwindow.Expired)
-			c.releaseGroup(record.GroupID, group)
+			c.expireGroup(record.GroupID, group)
 			continue
 		}
 		if group.logical != record.LogicalBytes || group.context.Epoch != record.EncodingEpoch {
@@ -199,10 +198,10 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 		if group.present >= int(group.context.DataShards) {
 			fragments, err := c.receiveCodec.Decode(group.logical, group.shards)
 			if err != nil {
-				c.groupWindow.Finish(record.GroupID, recvwindow.Expired)
-				c.releaseGroup(record.GroupID, group)
+				c.expireGroup(record.GroupID, group)
 				return err
 			}
+			c.receiveCounters.DecodedGroups++
 			for _, shard := range group.shards {
 				clear(shard)
 			}
@@ -213,8 +212,7 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			// workspace and our shards are gone before returning their credit.
 			retained := uint64(group.logical) + uint64(cap(fragments))*uint64(unsafe.Sizeof(fecv2.Fragment{})) + pendingGroupMetadataBytes
 			if err := group.lease.ShrinkBytes(retained); err != nil {
-				c.groupWindow.Finish(record.GroupID, recvwindow.Expired)
-				c.releaseGroup(record.GroupID, group)
+				c.expireGroup(record.GroupID, group)
 				return err
 			}
 			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
@@ -229,15 +227,16 @@ func (c *Controller) admitOriginals(id uint64, group *pendingGroup, now time.Tim
 	deliveries, err := c.originals.AddGroup(now, group.fragments)
 	if err != nil {
 		if errors.Is(err, creditv2.ErrResourceLimit) {
+			c.receiveCounters.OriginalAdmissionRejections++
 			c.retryStorage = now.Add(time.Millisecond)
 			return nil
 		}
-		c.groupWindow.Finish(id, recvwindow.Expired)
-		c.releaseGroup(id, group)
+		c.expireGroup(id, group)
 		return err
 	}
 	result.Deliveries = append(result.Deliveries, deliveries...)
 	c.groupWindow.Finish(id, recvwindow.Completed)
+	c.receiveCounters.CompletedGroups++
 	c.releaseGroup(id, group)
 	return nil
 }
@@ -290,7 +289,12 @@ func (c *Controller) expireGroups(now time.Time) {
 		if now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
 			break
 		}
-		c.groupWindow.Finish(id, recvwindow.Expired)
-		c.releaseGroup(id, group)
+		c.expireGroup(id, group)
 	}
+}
+
+func (c *Controller) expireGroup(id uint64, group *pendingGroup) {
+	c.groupWindow.Finish(id, recvwindow.Expired)
+	c.receiveCounters.ExpiredGroups++
+	c.releaseGroup(id, group)
 }

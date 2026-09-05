@@ -74,6 +74,10 @@ func opposite(binding handshakev2.Binding, toServer bool) handshakev2.Binding {
 }
 
 func newPair(t testing.TB, paths, bootstrap int, aggregate bool, grace uint32) *pair {
+	return newPairWithCreditLimits(t, paths, bootstrap, aggregate, grace, nil)
+}
+
+func newPairWithCreditLimits(t testing.TB, paths, bootstrap int, aggregate bool, grace uint32, adjust func(negotiationv2.Role, Config, *creditv2.Limits)) *pair {
 	t.Helper()
 	p := profile(paths)
 	p.Epochs.GraceMS = grace
@@ -102,7 +106,11 @@ func newPair(t testing.TB, paths, bootstrap int, aggregate bool, grace uint32) *
 			e.out = append(e.out, pk)
 			return nil
 		}
-		e.peer, err = creditv2.New(creditv2.Limits{MaxPeerBytes: 64 << 20, MaxSessionBytes: 64 << 20, MaxSessions: 8, MaxPendingHandshakes: 8, MaxPendingAccepts: 64, MaxStreamsPerSession: 8, MaxPeerStreams: 64, MaxReservations: 1024})
+		limits := creditv2.Limits{MaxPeerBytes: 64 << 20, MaxSessionBytes: 64 << 20, MaxSessions: 8, MaxPendingHandshakes: 8, MaxPendingAccepts: 64, MaxStreamsPerSession: 8, MaxPeerStreams: 64, MaxReservations: 1024}
+		if adjust != nil {
+			adjust(role, cfg, &limits)
+		}
+		e.peer, err = creditv2.New(limits)
 		if err != nil {
 			t.Fatal(err)
 		}

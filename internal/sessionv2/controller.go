@@ -27,6 +27,7 @@ type Controller struct {
 	groups                         map[uint64]*pendingGroup
 	groupHead, groupTail           uint64
 	decodedGroups                  int
+	receiveCounters                ReceiveCounters
 	groupWindow                    *recvwindow.Window
 	groupWindowLease, controlLease *creditv2.Lease
 	sendContext, receiveContext    wirev2.EncodingContext
@@ -96,7 +97,10 @@ func requiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	// Bounded controller/path records include exact retained control frames.
 	// The two codec profiles additionally reserve a conservative matrix budget.
 	stateBytes := uint64(unsafe.Sizeof(Controller{})) + uint64(cfg.LocalProfile.MaxPaths)*uint64(unsafe.Sizeof(pathState{})) + 16*n*n + 512*n + 16384
-	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes}}, nil
+	// Receive calls are serialized. Keep their bounded packet/record workspace
+	// prepaid so outbound admission cannot prevent already-owned group decode.
+	receiveBytes := uint64(cfg.LocalProfile.Payload.ReceiveHardCap) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
+	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes + receiveBytes}}, nil
 }
 
 // New consumes four prepaid initial leases after handshake promotion. It
@@ -503,7 +507,7 @@ func (c *Controller) Receive(now time.Time, binding handshakev2.Binding, reply t
 		case wirev2.TypeEncodingContext, wirev2.TypeEncodingContextAck:
 			err = c.receiveEncoding(p, now, authenticated)
 		case wirev2.TypeFECBundle:
-			err = c.receiveBundle(now, authenticated, int(budget), restricted, len(packet), &result)
+			err = c.receiveBundle(now, authenticated, int(budget), restricted, &result)
 		default:
 			err = ErrUnsupported
 		}

@@ -8,6 +8,8 @@ The [deadline-index comparison](v2-deadlines-20260905.md) publishes the supporti
 profiles and microbenchmarks; the revised network run still fails upload delivery.
 The subsequent [receive-credit comparison](v2-credit-20260905.md) fixes a
 deterministic reservation stall but records continuing network failure.
+The [receive-state diagnostic](v2-receive-20260905.md) adds live credit/group
+evidence and fresh profiles of the remaining upload failure.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.

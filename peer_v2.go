@@ -41,22 +41,23 @@ type v2Bootstrap struct {
 // The mutex serializes the socket-free engines, admission and public fences.
 // Socket callbacks only enqueue; they never acquire this mutex.
 type v2Peer struct {
-	mu           sync.Mutex
-	peer         *Peer
-	credits      *creditv2.Peer
-	creditLimit  creditv2.Limits
-	engine       *handshakev2.Engine
-	ingress      chan v2Ingress
-	listener     *v2Listener
-	sessions     map[*v2Session]struct{}
-	established  map[wirev2.SessionID]*v2Session
-	dials        map[handshakev2.DialID]*v2Session
-	routes       map[wirev2.SessionID]v2Bootstrap
-	sockets      map[uint64]*v2Session
-	nextSocket   uint64
-	constructing sync.WaitGroup
-	current      v2Bootstrap
-	closed       bool
+	mu             sync.Mutex
+	peer           *Peer
+	credits        *creditv2.Peer
+	creditLimit    creditv2.Limits
+	engine         *handshakev2.Engine
+	ingress        chan v2Ingress
+	listener       *v2Listener
+	sessions       map[*v2Session]struct{}
+	established    map[wirev2.SessionID]*v2Session
+	dials          map[handshakev2.DialID]*v2Session
+	routes         map[wirev2.SessionID]v2Bootstrap
+	sockets        map[uint64]*v2Session
+	nextSocket     uint64
+	constructing   sync.WaitGroup
+	current        v2Bootstrap
+	retiredReceive sessionv2.ReceiveCounters
+	closed         bool
 }
 
 func newV2Peer(parent context.Context, cfg config.Config, random io.Reader, deps runtimeDependencies) (*Peer, error) {

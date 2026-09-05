@@ -238,6 +238,37 @@ ingress, delivery, admission and socket counters, but does not yet provide
 equivalent internal FEC/path coverage. Missing evidence must not be inferred
 from zero counters. V2 `SentDatagrams` counts admitted originals.
 
+V2 additionally exposes the optional `v2_receive` object, omitted for v1.
+`received_fec_bundles` counts authenticated, route-accepted FEC handler attempts,
+including body or resource rejection. `packet_scratch_rejections`,
+`new_group_rejections` and `original_admission_rejections` count resource-limit
+failures at those stages; every failed original retry counts as another attempt.
+An implementation that prepays packet scratch during Session admission keeps
+the packet-scratch rejection counter zero. `decoded_groups` counts successful
+FEC decoding, and `completed_groups` counts atomic admission of all decoded
+fragments into original reassembly, which need not deliver a complete original.
+`expired_groups` counts terminal expiry/error events and excludes Close.
+These counters survive Session disposal and Peer closure.
+
+`pending_groups`, `decoded_pending_groups` and `pending_originals` are current
+gauges across live Sessions; decoded-pending groups are included in pending
+groups. `credit_bytes` and `credit_reservations` sample all live Peer ledger
+usage, including pending handshakes, inbound/outbound work and retained application
+deliveries; they are not receive-only credit. Credit
+bytes describe charged obligations, not heap usage or RSS. These gauges can
+decrease and must not be treated as cumulative counters. Sampling acquires the
+v2 owner mutex once and reads scalar controller state plus one credit snapshot;
+receive events do not copy paths or take additional credit snapshots.
+`CapturedAt` is recorded before collection, including any wait for that mutex;
+it does not promise that every field was read at exactly that instant.
+
+The performance runner accepts older v2 archives without `v2_receive`. When
+present, it requires all named counters/gauges to be nonnegative integers and
+rejects the object for v1 or native protocols. The interval report emits
+`counter_deltas` and the separate `end_gauge_snapshot`; counter regression or
+object presence changes between selected boundaries are rejected. Decreasing
+gauges are valid and remain ending snapshots rather than deltas.
+
 V1 tracks delivery/ingress overflow, completed and recovered blocks, missing
 data shards, timeout/full/duplicate events, known late shards and `TooOldShards`.
 Late or too-old shards do not independently measure network loss.
