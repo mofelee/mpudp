@@ -81,13 +81,14 @@ The main source of the original high retransmission rate remains unresolved.
 
 The timing-enabled KCP upload profiles identify concrete #19 investigation
 targets. Percentages below are sampled profile attribution, not independent
-additive shares; cumulative entries include their callees.
+additive shares; cumulative entries include their callees. Allocation totals
+use `alloc_space`, Go's sampling-adjusted estimate of cumulative allocated bytes.
 
 | Profile | Observation |
 | --- | --- |
 | Client CPU | Syscalls 47.1% flat; SHA256 7.6% flat; `writeConnected` 50.8% cumulative |
-| Client allocations | About 1,040 MiB sampled total; authenticated encoding 46.1% cumulative; FEC encoding 18.0%; `context.AfterFunc` 13.2% cumulative; transport write 20.0% cumulative |
-| Server allocations | About 1,414 MiB sampled total; listener read 27.7% cumulative; address cloning 15.0% flat; FEC decoder 23.4% cumulative; HMAC creation 19.8% cumulative |
+| Client allocations | About 1,040 MiB estimated total; authenticated encoding 46.1% cumulative; FEC encoding 18.0%; `context.AfterFunc` 13.2% cumulative; transport write 20.0% cumulative |
+| Server allocations | About 1,414 MiB estimated total; listener read 27.7% cumulative; address cloning 15.0% flat; FEC decoder 23.4% cumulative; HMAC creation 19.8% cumulative |
 | Server allocations | `snapshotSessions` 1.9% flat; this alone does not justify calling the dispatcher the primary bottleneck |
 
 Profiles include process setup, warmup and shutdown around the measured load.
@@ -136,9 +137,10 @@ Existing VMs, bridges and services remain intact.
 The publication allowlist contains 312 original files: 37 calibration records,
 190 protocol records including their original checksum indexes, 80 explicitly
 selected profiles, and five read-only polling records/scripts. Profiles were
-gzip-decoded and protobuf-parsed before publication. Known PSKs, private keys
-and complete application frames were absent from the audited records. Lab
-addresses and machine metadata remain present. Other `.lab` files are excluded.
+gzip-decoded and protobuf-parsed before publication. Neither known PSK matched,
+and no private-key or probe-frame markers were found in the audited records.
+Lab addresses and machine metadata remain present. Other `.lab` files are
+excluded.
 
 [Raw records and profiles](diagnostics-20260905.tar.gz) preserve the original
 indexes and add a top-level `SHA256SUMS` covering all original files and
