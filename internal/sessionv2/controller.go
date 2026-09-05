@@ -26,6 +26,8 @@ type Controller struct {
 	queue                          *aggregationv2.Queue
 	outputWorkspace                *aggregationv2.OutputWorkspace
 	assemblyLease                  *creditv2.Lease
+	sends                          *ownedSendState
+	nextControl                    uint64
 	originals                      *reassemblyv2.Receiver
 	groups                         map[uint64]*pendingGroup
 	groupHead, groupTail           uint64
@@ -48,6 +50,7 @@ type Controller struct {
 	failedFrom                     uint64
 	last, retryStorage             time.Time
 	started, accepting, closed     bool
+	finalized                      bool
 	haveTime, busy                 bool
 	controlCursor                  int
 }
@@ -81,6 +84,9 @@ func validateConfig(cfg Config) error {
 			return ErrInvalid
 		}
 	}
+	if cfg.OwnedSends && (cfg.MaxInFlightSends < 1 || cfg.MaxInFlightSends > 32 || cfg.MaxPathQueuedPackets < 1 || cfg.MaxPathQueuedPackets > 4096 || cfg.MaxPathQueuedBytes < 512 || cfg.MaxPathQueuedBytes > creditv2.MaxRetainedBytes || cfg.MaxQueueResidence <= 0 || cfg.MaxQueueResidence > 100*time.Millisecond) {
+		return ErrInvalid
+	}
 	return nil
 }
 
@@ -110,7 +116,13 @@ func requiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	if err != nil {
 		return nil, err
 	}
-	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes + receiveBytes}, {Bytes: outputBytes}, {Bytes: 2 * uint64(cfg.FixedPayloadBudget)}}, nil
+	assemblyBytes := 2 * uint64(cfg.FixedPayloadBudget)
+	if cfg.OwnedSends {
+		slots := uint64(min(cfg.MaxInFlightSends, int(cfg.LocalProfile.MaxPaths)))
+		stateBytes += uint64(unsafe.Sizeof(ownedSendState{})) + slots*uint64(unsafe.Sizeof(sendSlot{}))
+		assemblyBytes = slots * (assemblyBytes + uint64(unsafe.Sizeof(SendIntent{})) + uint64(unsafe.Sizeof(sendIntentState{})))
+	}
+	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes + receiveBytes}, {Bytes: outputBytes}, {Bytes: assemblyBytes}}, nil
 }
 
 // New consumes six prepaid initial leases after handshake promotion. It
@@ -122,7 +134,7 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 		return nil, err
 	}
 	local, remote, err := setup.Contract.Profiles(setup.Role)
-	if err != nil || local != cfg.LocalProfile || setup.ID == (wirev2.SessionID{}) || setup.PathID != setup.Contract.BootstrapPathID || !validBinding(setup.Binding) || cfg.BootstrapPath == nil || cfg.Emit == nil || cfg.Entropy == nil || len(setup.Initial) != InitialCount || setup.Scope == nil {
+	if err != nil || local != cfg.LocalProfile || setup.ID == (wirev2.SessionID{}) || setup.PathID != setup.Contract.BootstrapPathID || !validBinding(setup.Binding) || cfg.BootstrapPath == nil || (!cfg.OwnedSends && cfg.Emit == nil) || cfg.Entropy == nil || len(setup.Initial) != InitialCount || setup.Scope == nil {
 		return nil, ErrInvalid
 	}
 	pathCount := min(local.MaxPaths, remote.MaxPaths)
@@ -137,6 +149,9 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 		return nil, err
 	}
 	cfg.FixedPayloadBudget = min(cfg.FixedPayloadBudget, direction.MaxUDPPayload)
+	if cfg.OwnedSends && uint64(cfg.FixedPayloadBudget) > cfg.MaxPathQueuedBytes {
+		return nil, ErrInvalid
+	}
 	cfg.Queue.MaxDatagramBytes = min(cfg.Queue.MaxDatagramBytes, direction.Datagram.MaxDatagramBytes)
 	cfg.Queue.MaxFragmentsPerDatagram = min(cfg.Queue.MaxFragmentsPerDatagram, int(direction.Datagram.MaxFragments))
 	maxDescriptors := min(cfg.SendLimits.Datagram.MaxDescriptors, direction.Datagram.MaxDescriptors)
@@ -207,6 +222,9 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 	// Only negotiated PathIDs can acquire state. Initial credit remains sized
 	// for the local offer because it was reserved before the peer was selected.
 	c.paths = make([]pathState, int(pathCount))
+	if cfg.OwnedSends {
+		c.sends = &ownedSendState{slots: make([]sendSlot, min(cfg.MaxInFlightSends, int(pathCount)))}
+	}
 	for i := range c.paths {
 		c.paths[i].id = uint16(i + 1)
 		c.paths[i].rate = cfg.PathRatesBPS[uint16(i+1)]
@@ -220,6 +238,12 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 	p := &c.paths[setup.PathID-1]
 	p.active, p.generation, p.floor = true, 1, 1
 	p.binding, p.sender = setup.Binding, cfg.BootstrapPath
+	if cfg.OwnedSends {
+		p.sender, p.transportGeneration, p.nativeTiming, err = captureBoundSender(p.binding, p.sender)
+		if err != nil {
+			return nil, err
+		}
+	}
 	p.sendBudget, p.receiveBudget, p.sendEpoch, p.receiveEpoch = 512, 512, 1, 1
 	c.cfg.Carriers, c.cfg.PathRatesBPS, c.setup.Initial = nil, nil, nil
 	failed = false
@@ -262,7 +286,7 @@ func (c *Controller) ready() bool {
 }
 
 func (c *Controller) eligible(p *pathState) bool {
-	return p.active && p.sender != nil && p.sender.Available() && p.sendEpoch == 2 && p.sendBudget >= c.sendContext.ShardBytes+94
+	return p.active && p.sender != nil && p.sender.Available() && (!c.cfg.OwnedSends || p.sender.Generation() == p.transportGeneration) && p.sendEpoch == 2 && p.sendBudget >= c.sendContext.ShardBytes+94
 }
 
 func (c *Controller) Start(now time.Time) (result Result, err error) {
@@ -409,14 +433,39 @@ func (c *Controller) StopAdmissions() {
 	}
 }
 
-// Close clears controller-owned storage before releasing its initial handles.
-// Returned deliveries remain independently owned. The handshake owner closes
-// the shared credit scope and emits the Session's one best-effort CLOSE.
+// Close starts cancellation and finalizes immediately when no owned send is
+// outstanding. Owned-send adapters must deliver terminal completions and call
+// FinalizeClose before releasing the deferred handshake storage continuation.
 func (c *Controller) Close() {
+	c.BeginClose()
+	_ = c.FinalizeClose()
+}
+
+// BeginClose stops admission and dispatch without reclaiming live send storage.
+// It never waits for an adapter or takes a transport lock.
+func (c *Controller) BeginClose() {
 	if c == nil || c.closed {
 		return
 	}
 	c.closed, c.accepting = true, false
+	if c.sends != nil {
+		c.sends.closing = true
+	}
+}
+
+// FinalizeClose releases initial storage only after all send owners and scalar
+// completions have returned. Returned deliveries remain independently owned.
+func (c *Controller) FinalizeClose() error {
+	if c == nil || c.finalized {
+		return nil
+	}
+	if !c.closed {
+		return ErrInvalid
+	}
+	if c.PendingSends() != 0 {
+		return ErrSendPending
+	}
+	c.finalized = true
 	if c.queue != nil {
 		c.queue.Close()
 	}
@@ -453,6 +502,8 @@ func (c *Controller) Close() {
 	c.setup = handshakev2.Setup{}
 	c.remote = negotiationv2.Profile{}
 	c.sendContext, c.receiveContext = wirev2.EncodingContext{}, wirev2.EncodingContext{}
+	c.sends = nil
+	return nil
 }
 
 // Completion reports send-fence progress without inspecting paths or deadlines.
@@ -479,6 +530,9 @@ func (c *Controller) Snapshot() Snapshot {
 }
 
 func (c *Controller) drive(now time.Time, result *Result) error {
+	if c.cfg.OwnedSends {
+		return c.driveOwned(now, result)
+	}
 	c.driveControl(now, result)
 	if c.contextAcknowledged && !c.ready() {
 		if !c.pendingPathWork() {

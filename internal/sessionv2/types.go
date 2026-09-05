@@ -69,6 +69,13 @@ type Config struct {
 	// Rates are local outbound operator settings. Missing paths use the
 	// documented100Mbps default; every emitted packet pays full IP+UDP bytes.
 	PathRatesBPS map[uint16]uint64
+	// OwnedSends enables TakeSend/CompleteSend without calling Emit. Packet
+	// slots are admitted only by TakeSend and retained through completion.
+	OwnedSends           bool
+	MaxInFlightSends     int
+	MaxPathQueuedPackets int
+	MaxPathQueuedBytes   uint64
+	MaxQueueResidence    time.Duration
 	// Emit makes one synchronous bounded socket attempt and borrows packet
 	// until return. Queued adapters need separate ownership and completion.
 	Emit func(transport.ReplyPath, []byte) error
@@ -86,7 +93,8 @@ type SendAttempt struct {
 
 // Result transfers owned deliveries to the caller. A caller that cannot queue
 // a delivery must release it. CompletedThrough means every original shard
-// through that admitted DatagramID finished a local socket attempt.
+// through that admitted DatagramID reached a terminal local outcome. SendError
+// and FailedFrom distinguish failures, including expiry before invocation.
 type Result struct {
 	Sends            []SendAttempt
 	Deliveries       []*reassemblyv2.Datagram
@@ -123,9 +131,9 @@ type Snapshot struct {
 // dedicated byte-only claims map to the Initial* indexes above. New consumes
 // matching prepaid handles after handshake promotion, without re-reserving.
 // InitialControl includes one serialized receive workspace at the local hard
-// cap. InitialOutput and InitialAssembly protect one sealed group and one
-// synchronous packet assembly from original admission pressure. These standing
-// obligations remain charged until their owners are disposed at Controller.Close.
+// cap. InitialOutput protects one sealed group; InitialAssembly protects one
+// synchronous packet or the bounded owned-send slots from admission pressure.
+// These standing obligations remain charged until their owners are finalized.
 func RequiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	return requiredInitialClaims(cfg)
 }
