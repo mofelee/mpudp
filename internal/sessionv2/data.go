@@ -21,6 +21,8 @@ type pendingGroup struct {
 	present   int
 	fragments []fecv2.Fragment
 	lease     *creditv2.Lease
+	previous  uint64
+	next      uint64
 }
 
 func (c *Controller) sendLookup(epoch uint32) (wirev2.EncodingContext, bool) {
@@ -124,6 +126,19 @@ func (c *Controller) reserveGroup(record wirev2.FECRecord, now time.Time) (*pend
 	return &pendingGroup{logical: record.LogicalBytes, context: context, admitted: now, shards: make([][]byte, int(n)), lease: lease}, nil
 }
 
+func (c *Controller) insertGroup(id uint64, group *pendingGroup) {
+	// enter enforces monotonic admission times; the fixed timeout preserves
+	// this order for expiry even when GroupIDs arrive out of order.
+	group.previous = c.groupTail
+	if c.groupTail == 0 {
+		c.groupHead = id
+	} else {
+		c.groups[c.groupTail].next = id
+	}
+	c.groupTail = id
+	c.groups[id] = group
+}
+
 func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, packetBytes int, result *Result) error {
 	if !c.receiveAckSent {
 		return ErrNotReady
@@ -155,7 +170,7 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 				return err
 			}
 			c.groupWindow.Admit(record.GroupID)
-			c.groups[record.GroupID] = group
+			c.insertGroup(record.GroupID, group)
 		}
 		if !now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
 			c.groupWindow.Finish(record.GroupID, recvwindow.Expired)
@@ -190,6 +205,7 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 				clear(shard)
 			}
 			group.shards, group.fragments = nil, fragments
+			c.decodedGroups++
 			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
 				return err
 			}
@@ -216,7 +232,7 @@ func (c *Controller) admitOriginals(id uint64, group *pendingGroup, now time.Tim
 }
 
 func (c *Controller) retryGroups(now time.Time, result *Result) error {
-	if now.Before(c.retryStorage) {
+	if c.decodedGroups == 0 || now.Before(c.retryStorage) {
 		return nil
 	}
 	for id, group := range c.groups {
@@ -230,7 +246,21 @@ func (c *Controller) retryGroups(now time.Time, result *Result) error {
 }
 
 func (c *Controller) releaseGroup(id uint64, group *pendingGroup) {
+	if group.previous == 0 {
+		c.groupHead = group.next
+	} else {
+		c.groups[group.previous].next = group.next
+	}
+	if group.next == 0 {
+		c.groupTail = group.previous
+	} else {
+		c.groups[group.next].previous = group.previous
+	}
 	delete(c.groups, id)
+	group.previous, group.next = 0, 0
+	if group.fragments != nil {
+		c.decodedGroups--
+	}
 	for _, shard := range group.shards {
 		clear(shard)
 	}
@@ -243,10 +273,13 @@ func (c *Controller) releaseGroup(id uint64, group *pendingGroup) {
 }
 
 func (c *Controller) expireGroups(now time.Time) {
-	for id, group := range c.groups {
-		if !now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
-			c.groupWindow.Finish(id, recvwindow.Expired)
-			c.releaseGroup(id, group)
+	for c.groupHead != 0 {
+		id := c.groupHead
+		group := c.groups[id]
+		if now.Before(group.admitted.Add(c.cfg.GroupTimeout)) {
+			break
 		}
+		c.groupWindow.Finish(id, recvwindow.Expired)
+		c.releaseGroup(id, group)
 	}
 }

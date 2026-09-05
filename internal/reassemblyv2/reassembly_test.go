@@ -152,8 +152,8 @@ func TestGroupFailureRollsBackAllOriginalsAndCredits(t *testing.T) {
 	add(t, r, start, fragment(1, 4, 0, "ab"))
 	base := r.Snapshot()
 	usage := p.Snapshot()
-	// Each new original needs 4 payload bytes and four 8-byte range slots.
-	pressure, err := s.Reserve(creditv2.Claim{Bytes: (1 << 20) - usage.Bytes - 40})
+	// Leave room for one original's payload, range slots and deadline links.
+	pressure, err := s.Reserve(creditv2.Claim{Bytes: (1 << 20) - usage.Bytes - (40 + deadlineLinkBytes)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +165,7 @@ func TestGroupFailureRollsBackAllOriginalsAndCredits(t *testing.T) {
 	if r.Snapshot() != base || p.Snapshot() != charged || string(r.pending[1].data) != "ab\x00\x00" || !r.last.Equal(start) {
 		t.Fatal("failed group partially committed or leaked reservation")
 	}
+	checkDeadline(t, r)
 	pressure.Release()
 	for _, d := range add(t, r, start.Add(time.Millisecond), batch...) {
 		d.Release()
@@ -172,6 +173,7 @@ func TestGroupFailureRollsBackAllOriginalsAndCredits(t *testing.T) {
 	if r.State(1) != recvwindow.Completed || r.State(2) != recvwindow.Unseen || r.Snapshot().Pending != 2 {
 		t.Fatal("retry did not commit whole group")
 	}
+	checkDeadline(t, r)
 }
 
 func TestDeadlineDuplicatesAndPendingBelowFloor(t *testing.T) {

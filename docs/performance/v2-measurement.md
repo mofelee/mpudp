@@ -4,6 +4,8 @@
 
 The first [controlled diagnostic report](v2-diagnostics-20260905.md) records
 severe v2 upload underperformance; functional support is not throughput acceptance.
+The [deadline-index comparison](v2-deadlines-20260905.md) publishes the supporting
+profiles and microbenchmarks; the revised network run still fails upload delivery.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.

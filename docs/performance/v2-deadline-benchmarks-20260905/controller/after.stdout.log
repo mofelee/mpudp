@@ -1,0 +1,22 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mofelee/mpudp/internal/sessionv2
+cpu: Intel(R) Xeon(R) CPU E3-1245 v5 @ 3.50GHz
+BenchmarkProbePendingGroupScans/groups_0/NextDeadline-6         	  456504	       505.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_0/expireGroups-6         	47368015	         4.866 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_0/retryGroups-6          	34320166	         6.484 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/NextDeadline-6       	  457688	       527.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/expireGroups-6       	 5621101	        47.15 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_128/retryGroups-6        	35020202	         6.343 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/NextDeadline-6       	  455482	       507.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/expireGroups-6       	 5206350	        46.67 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_512/retryGroups-6        	38233339	         6.465 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/NextDeadline-6      	  445800	       525.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/expireGroups-6      	 5246361	        46.88 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_1024/retryGroups-6       	38686165	         6.323 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/NextDeadline-6      	  423482	       568.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/expireGroups-6      	 5190699	        46.06 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbePendingGroupScans/groups_8192/retryGroups-6       	36716779	         6.093 ns/op	       0 B/op	       0 allocs/op
+BenchmarkProbeScopeSnapshot-6                                   	 7675064	        30.50 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mofelee/mpudp/internal/sessionv2	4.129s

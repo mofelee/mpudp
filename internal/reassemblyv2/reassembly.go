@@ -32,6 +32,8 @@ type Limits struct {
 
 type interval struct{ start, end uint32 }
 
+const deadlineLinkBytes = 2 * uint64(unsafe.Sizeof(uint64(0)))
+
 type assembly struct {
 	total    uint32
 	admitted time.Time
@@ -39,6 +41,8 @@ type assembly struct {
 	ranges   []interval
 	received uint32
 	lease    *creditv2.Lease
+	previous uint64
+	next     uint64
 }
 
 // Receiver is serialized by its owner's receive/admission lock. Do not copy
@@ -50,6 +54,7 @@ type Receiver struct {
 	window      *recvwindow.Window
 	windowLease *creditv2.Lease
 	pending     map[uint64]*assembly
+	head, tail  uint64
 	last        time.Time
 	haveTime    bool
 	closed      bool
@@ -193,14 +198,13 @@ func (r *Receiver) AddGroup(now time.Time, fragments []fecv2.Fragment) ([]*Datag
 		return nil, creditv2.ErrResourceLimit
 	}
 
-	// Reserve the entire original payload plus its bounded range table before
-	// copying any payload or moving the terminal floor. Roll back every lease
-	// if any Session/Peer reservation fails.
+	// Reserve payload, range storage and deadline links before changing state.
+	// Roll back every lease if any Session/Peer reservation fails.
 	for i, f := range fragments {
 		if !plan[i].new {
 			continue
 		}
-		charge := uint64(f.TotalBytes) + uint64(r.limits.MaxFragments)*uint64(unsafe.Sizeof(interval{}))
+		charge := uint64(f.TotalBytes) + uint64(r.limits.MaxFragments)*uint64(unsafe.Sizeof(interval{})) + deadlineLinkBytes
 		lease, err := r.scope.Reserve(creditv2.Claim{Bytes: charge})
 		if err != nil {
 			for j := range i {
@@ -233,14 +237,14 @@ func (r *Receiver) AddGroup(now time.Time, fragments []fecv2.Fragment) ([]*Datag
 		a := p.a
 		if p.new {
 			r.window.Admit(f.DatagramID)
-			r.pending[f.DatagramID] = a
+			r.addPending(f.DatagramID, a)
 		}
 		copy(a.data[int(f.Offset):], f.Payload)
 		a.ranges = slices.Insert(a.ranges, p.insert, interval{f.Offset, f.Offset + uint32(len(f.Payload))})
 		a.received += uint32(len(f.Payload))
 		if a.received == a.total {
 			r.window.Finish(f.DatagramID, recvwindow.Completed)
-			delete(r.pending, f.DatagramID)
+			r.removePending(f.DatagramID, a)
 			a.ranges = nil
 			completed = append(completed, &Datagram{state: &datagramState{id: f.DatagramID, data: a.data, lease: a.lease}})
 			a.data, a.lease = nil, nil
@@ -274,11 +278,39 @@ func inspect(a *assembly, f fecv2.Fragment) (int, bool, error) {
 
 func (r *Receiver) expire(id uint64, a *assembly) {
 	r.window.Finish(id, recvwindow.Expired)
-	delete(r.pending, id)
+	r.removePending(id, a)
 	clear(a.data)
 	a.data, a.ranges = nil, nil
 	a.lease.Release()
 	a.lease = nil
+}
+
+// Admissions are monotonic and share one timeout, so arrival order is expiry
+// order even when DatagramIDs arrive out of order. Links live in charged state.
+func (r *Receiver) addPending(id uint64, a *assembly) {
+	a.previous = r.tail
+	if r.tail == 0 {
+		r.head = id
+	} else {
+		r.pending[r.tail].next = id
+	}
+	r.pending[id] = a
+	r.tail = id
+}
+
+func (r *Receiver) removePending(id uint64, a *assembly) {
+	if a.previous == 0 {
+		r.head = a.next
+	} else {
+		r.pending[a.previous].next = a.next
+	}
+	if a.next == 0 {
+		r.tail = a.previous
+	} else {
+		r.pending[a.next].previous = a.previous
+	}
+	a.previous, a.next = 0, 0
+	delete(r.pending, id)
 }
 
 // Expire retires all elapsed pending originals without extending deadlines.
@@ -290,11 +322,14 @@ func (r *Receiver) Expire(now time.Time) ([]uint64, error) {
 	}
 	r.last, r.haveTime = now, true
 	var ids []uint64
-	for id, a := range r.pending {
-		if r.due(a, now) {
-			ids = append(ids, id)
-			r.expire(id, a)
+	for r.head != 0 {
+		id := r.head
+		a := r.pending[id]
+		if !r.due(a, now) {
+			break
 		}
+		ids = append(ids, id)
+		r.expire(id, a)
 	}
 	return ids, nil
 }
@@ -316,17 +351,10 @@ type Snapshot struct {
 // NextDeadline returns the earliest original admission expiry, or zero when
 // no incomplete original remains. The owner serializes this read with writes.
 func (r *Receiver) NextDeadline() time.Time {
-	if r == nil || r.closed {
+	if r == nil || r.closed || r.head == 0 {
 		return time.Time{}
 	}
-	var next time.Time
-	for _, a := range r.pending {
-		deadline := a.admitted.Add(r.limits.Timeout)
-		if next.IsZero() || deadline.Before(next) {
-			next = deadline
-		}
-	}
-	return next
+	return r.pending[r.head].admitted.Add(r.limits.Timeout)
 }
 
 func (r *Receiver) Snapshot() Snapshot {
@@ -343,8 +371,8 @@ func (r *Receiver) Close() {
 		return
 	}
 	r.closed = true
-	for id, a := range r.pending {
-		r.expire(id, a)
+	for r.head != 0 {
+		r.expire(r.head, r.pending[r.head])
 	}
 	r.pending = nil
 	r.window.Close()

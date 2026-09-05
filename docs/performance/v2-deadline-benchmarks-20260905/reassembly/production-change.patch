@@ -1,0 +1,113 @@
+--- a/internal/reassemblyv2/reassembly.go
++++ b/internal/reassemblyv2/reassembly.go
+@@ -34,2 +34,4 @@
+ 
++const deadlineLinkBytes = 2 * uint64(unsafe.Sizeof(uint64(0)))
++
+ type assembly struct {
+@@ -41,2 +43,4 @@
+ 	lease    *creditv2.Lease
++	previous uint64
++	next     uint64
+ }
+@@ -52,2 +56,3 @@
+ 	pending     map[uint64]*assembly
++	head, tail  uint64
+ 	last        time.Time
+@@ -195,5 +200,4 @@
+ 
+-	// Reserve the entire original payload plus its bounded range table before
+-	// copying any payload or moving the terminal floor. Roll back every lease
+-	// if any Session/Peer reservation fails.
++	// Reserve payload, range storage and deadline links before changing state.
++	// Roll back every lease if any Session/Peer reservation fails.
+ 	for i, f := range fragments {
+@@ -202,3 +206,3 @@
+ 		}
+-		charge := uint64(f.TotalBytes) + uint64(r.limits.MaxFragments)*uint64(unsafe.Sizeof(interval{}))
++		charge := uint64(f.TotalBytes) + uint64(r.limits.MaxFragments)*uint64(unsafe.Sizeof(interval{})) + deadlineLinkBytes
+ 		lease, err := r.scope.Reserve(creditv2.Claim{Bytes: charge})
+@@ -235,3 +239,3 @@
+ 			r.window.Admit(f.DatagramID)
+-			r.pending[f.DatagramID] = a
++			r.addPending(f.DatagramID, a)
+ 		}
+@@ -242,3 +246,3 @@
+ 			r.window.Finish(f.DatagramID, recvwindow.Completed)
+-			delete(r.pending, f.DatagramID)
++			r.removePending(f.DatagramID, a)
+ 			a.ranges = nil
+@@ -276,3 +280,3 @@
+ 	r.window.Finish(id, recvwindow.Expired)
+-	delete(r.pending, id)
++	r.removePending(id, a)
+ 	clear(a.data)
+@@ -283,2 +287,30 @@
+ 
++// Admissions are monotonic and share one timeout, so arrival order is expiry
++// order even when DatagramIDs arrive out of order. Links live in charged state.
++func (r *Receiver) addPending(id uint64, a *assembly) {
++	a.previous = r.tail
++	if r.tail == 0 {
++		r.head = id
++	} else {
++		r.pending[r.tail].next = id
++	}
++	r.pending[id] = a
++	r.tail = id
++}
++
++func (r *Receiver) removePending(id uint64, a *assembly) {
++	if a.previous == 0 {
++		r.head = a.next
++	} else {
++		r.pending[a.previous].next = a.next
++	}
++	if a.next == 0 {
++		r.tail = a.previous
++	} else {
++		r.pending[a.next].previous = a.previous
++	}
++	a.previous, a.next = 0, 0
++	delete(r.pending, id)
++}
++
+ // Expire retires all elapsed pending originals without extending deadlines.
+@@ -292,7 +324,10 @@
+ 	var ids []uint64
+-	for id, a := range r.pending {
+-		if r.due(a, now) {
+-			ids = append(ids, id)
+-			r.expire(id, a)
++	for r.head != 0 {
++		id := r.head
++		a := r.pending[id]
++		if !r.due(a, now) {
++			break
+ 		}
++		ids = append(ids, id)
++		r.expire(id, a)
+ 	}
+@@ -318,13 +353,6 @@
+ func (r *Receiver) NextDeadline() time.Time {
+-	if r == nil || r.closed {
++	if r == nil || r.closed || r.head == 0 {
+ 		return time.Time{}
+ 	}
+-	var next time.Time
+-	for _, a := range r.pending {
+-		deadline := a.admitted.Add(r.limits.Timeout)
+-		if next.IsZero() || deadline.Before(next) {
+-			next = deadline
+-		}
+-	}
+-	return next
++	return r.pending[r.head].admitted.Add(r.limits.Timeout)
+ }
+@@ -345,4 +373,4 @@
+ 	r.closed = true
+-	for id, a := range r.pending {
+-		r.expire(id, a)
++	for r.head != 0 {
++		r.expire(r.head, r.pending[r.head])
+ 	}

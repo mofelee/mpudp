@@ -34,8 +34,9 @@ group's original deadline; dropping those fragments and completing the group
 would suppress later repair incorrectly.
 
 Each original owns its total declared byte length plus
-`MaxFragments * sizeof(interval)` bytes for the range table. Empty originals
-still reserve their table, retain an ID and complete exactly once. The bitmap
+`MaxFragments * sizeof(interval)` bytes for the range table and 16 bytes for
+its two expiry-list links. Empty originals still reserve that storage, retain
+an ID and complete exactly once. The bitmap
 storage is separately charged at construction. Metadata outside these tables
 has fixed per-object bounds; this accounting is not exact process RSS.
 At most MaxDatagrams incomplete originals and MaxFragments accepted ranges
@@ -51,14 +52,18 @@ never recreate reassembly state. Already admitted pending originals remain
 eligible until their original timeout even below the advancing ID floor.
 Epoch changes do not reset original identity or history.
 
-`Expire` scans only bounded pending state. A final fragment arriving exactly
-at the original timeout records Expired and cannot complete the original.
-Duplicates do not extend deadlines. Callers schedule expiry explicitly; there
-are no timers or goroutines. Caller times must be nondecreasing.
+Caller times must be nondecreasing. Pending originals form an intrusive list
+in admission order, which is also expiry order under the fixed timeout.
+`NextDeadline` reads the head in constant time, and `Expire` visits only due
+originals. Completion removes its links immediately, so index storage is
+bounded by live pending state. A final fragment arriving exactly at the
+original timeout records Expired and cannot complete the original. Duplicates
+do not extend deadlines. Callers schedule expiry explicitly; there are no
+timers or goroutines.
 
 Successful completions transfer immutable payloads and their independent leases
-to `Datagram` handles. The range-table charge is conservatively retained with
-that handle until release. Copies share release state; the owner finishes all
+to `Datagram` handles. The range-table and expiry-link charges are conservatively
+retained with that handle until release. Copies share release state; the owner finishes all
 borrowed reads before `Release`, which clears payloads before returning credit.
 Receiver Close clears only its own pending data and bitmaps, preserving already
 transferred payloads. The surrounding Session and application queue remain
