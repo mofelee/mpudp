@@ -24,6 +24,7 @@ codec foundations below do not activate v2 or change the runnable
 | [smux evidence](evidence/20260905-smux/README.md) | Pinned unread-tail loss and pre-SYN admission/isolation candidate hooks |
 | [FEC group codec foundation](fecv2-group-codec.md) | Implemented logical manifest and equal-size RS recovery primitives; runtime integration pending |
 | [Terminal receive windows](v2-receive-window.md) | Independent bounded Datagram/Group Completed and Expired histories; runtime admission and repair integration pending |
+| [Original Datagram reassembly](v2-datagram-reassembly.md) | Atomic decoded-group admission, owned completions and immutable original deadlines; socket and repair integration pending |
 
 The dependency evidence includes exact upstream SHAs, patches, fixture source,
 commands, results and limitations. Fixtures use `.go.txt` so the root module
