@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 	"time"
@@ -135,8 +136,19 @@ func (l *Listener) Available() bool {
 func (l *Listener) readLoop() {
 	defer close(l.done)
 	buffer := make([]byte, l.maxPayload+1)
+	// Only native UDP sockets promise the value-based receive path. Injected
+	// connections keep their ReadFrom overrides and address ownership contract.
+	udp, nativeUDP := l.conn.(*net.UDPConn)
 	for {
-		n, remote, err := l.conn.ReadFrom(buffer)
+		var n int
+		var remote net.Addr
+		var remoteValue netip.AddrPort
+		var err error
+		if nativeUDP {
+			n, remoteValue, err = udp.ReadFromUDPAddrPort(buffer)
+		} else {
+			n, remote, err = l.conn.ReadFrom(buffer)
+		}
 		if err != nil {
 			if isTemporary(err) {
 				continue
@@ -154,14 +166,18 @@ func (l *Listener) readLoop() {
 			})
 			continue
 		}
-		if remote == nil {
+		if (nativeUDP && !remoteValue.IsValid()) || (!nativeUDP && remote == nil) {
 			l.reportError(&PathError{PathID: l.id, Generation: l.generation, Operation: "read", Err: invalidArgument("nil remote endpoint")})
 			continue
 		}
 		if l.onPacket == nil {
 			continue
 		}
-		remote = cloneAddr(remote)
+		if nativeUDP {
+			remote = net.UDPAddrFromAddrPort(remoteValue)
+		} else {
+			remote = cloneAddr(remote)
+		}
 		local := cloneAddr(l.conn.LocalAddr())
 		reply := listenerReplyPath{
 			listener:   l,

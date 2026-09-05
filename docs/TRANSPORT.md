@@ -82,6 +82,11 @@ Listener 对每个收到的 packet 保存：
 只有 wire/HMAC 层认证成功后，Session 层才可保存 ReplyPath 或学习 Endpoint。transport
 提供路由事实，但不把未认证输入写入长期 Session 状态。
 
+原生 `*net.UDPConn` Listener 使用 `ReadFromUDPAddrPort`，在长度验证后仅创建一次
+自有 remote address 快照。IPv4-mapped 表示、IPv6 zone、ReplyPath identity 和原 socket
+回复保持不变；每个报文仍拥有独立 payload 与地址快照。注入或包装的 `net.PacketConn`
+继续调用其 `ReadFrom` 并沿用原有地址复制规则，不因实现同名 AddrPort 方法而绕过自定义行为。
+
 ## Block 发送结果
 
 `SendBlock` 对 block 中每个 shard 恰好调用一次选定路径，即使先前 shard 失败也继续。
