@@ -130,7 +130,103 @@ def unique_record(rows, kind):
     return selected[0]
 
 
-def verify_pair(client_path, server_path, case, worker_id, source_sha):
+def require_counters(value, names, label):
+    if not isinstance(value, dict) or any(type(value.get(name)) is not int or value[name] < 0 for name in names):
+        raise ValueError(f"invalid or missing {label} counters")
+
+
+def finite_nonnegative(value):
+    return type(value) in (float, int) and math.isfinite(value) and value >= 0
+
+
+def instant(value):
+    if not isinstance(value, str):
+        raise ValueError("missing telemetry timestamp")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("telemetry timestamp requires timezone")
+    return parsed.timestamp()
+
+
+def verify_telemetry(value, case, source_sha):
+    if not isinstance(value, dict):
+        raise ValueError("missing telemetry")
+    instant(value.get("at_utc"))
+    process = value.get("process")
+    require_counters(process, ("max_rss_kib", "heap_alloc_bytes", "total_alloc_bytes", "mallocs", "gc_count", "goroutines"), "process")
+    if any(not finite_nonnegative(process.get(key)) for key in ("cpu_user_seconds", "cpu_system_seconds")):
+        raise ValueError("missing process CPU telemetry")
+    require_counters(value, ("kcp_timeout_retransmits", "adapter_write_drops"), "transport")
+    available = value.get("mpudp_statistics_available")
+    if type(available) is not bool:
+        raise ValueError("missing MPUDP statistics availability")
+    if case["protocol"] in MPUDP and source_sha != calibrate.BASELINE_SHA and not available:
+        raise ValueError("current MPUDP build is missing statistics")
+    if case["protocol"] not in MPUDP and available:
+        raise ValueError("native protocol unexpectedly reports MPUDP statistics")
+    if available:
+        mpudp = value.get("mpudp")
+        require_counters(mpudp, ("ingress_accepted", "ingress_drops", "delivery_accepted", "delivery_drops",
+                         "delivered_packets", "delivered_bytes", "sent_datagrams", "sent_datagram_bytes"), "MPUDP")
+        if mpudp.get("diagnostics_enabled") is not case["diagnostics"]:
+            raise ValueError("MPUDP telemetry diagnostics differs from requested mode")
+        require_counters(mpudp.get("fec"), ("completed_blocks", "recovered_blocks", "recovered_shards", "expired_blocks",
+                         "decoder_full", "late_shards", "duplicate_shards"), "FEC")
+        if not isinstance(mpudp.get("paths"), list) or not mpudp["paths"]:
+            raise ValueError("missing MPUDP path telemetry")
+        for path in mpudp["paths"]:
+            require_counters(path, ("sent_packets", "sent_bytes", "send_errors", "received_packets",
+                             "received_bytes", "receive_oversize_drops"), "MPUDP path")
+    if case["protocol"] in ("kcp", "kcp-mpudp"):
+        snmp = value.get("kcp_snmp")
+        require_counters(snmp, ("InSegs", "OutSegs", "RetransSegs", "FastRetransSegs", "EarlyRetransSegs", "LostSegs"), "KCP")
+        sessions = value.get("kcp_sessions")
+        if not isinstance(sessions, list) or len(sessions) != case["flows_per_worker"]:
+            raise ValueError("missing per-flow KCP telemetry")
+        for index, session in enumerate(sessions):
+            require_counters(session, ("flow", "srtt_ms", "srtt_variation_ms", "rto_ms"), "KCP session")
+            if session["flow"] != index:
+                raise ValueError("KCP flow telemetry differs from requested flows")
+        if value["kcp_timeout_retransmits"] != snmp["LostSegs"]:
+            raise ValueError("KCP timeout telemetry disagrees with SNMP")
+
+
+def verify_latency(value, case):
+    fields = ("sent", "scheduled", "submitted", "queue_missed", "write_failed", "received", "unanswered",
+              "on_time", "deadline_missed", "deadline_ms", "over_10000_ms", "resolution_ms")
+    require_counters(value, fields, "RTT")
+    scheduled = case["seconds"] * 5 * case["flows_per_worker"]
+    if (value["scheduled"] != scheduled or value["sent"] != value["submitted"] or
+            not value["on_time"] <= value["received"] <= value["submitted"] <= scheduled or
+            value["submitted"] + value["queue_missed"] + value["write_failed"] > scheduled or
+            value["unanswered"] != scheduled - value["received"] or
+            value["deadline_missed"] != scheduled - value["on_time"] or
+            value["over_10000_ms"] > value["received"] or value["deadline_ms"] != 1000 or value["resolution_ms"] != 1):
+        raise ValueError("RTT opportunity accounting is inconsistent")
+    previous = 0
+    for field, rank in (("p50_ms", .5), ("p95_ms", .95), ("p99_ms", .99)):
+        if field not in value:
+            raise ValueError("missing RTT quantile")
+        quantile = value[field]
+        missing = math.ceil(scheduled * rank) > value["received"] - value["over_10000_ms"]
+        if (quantile is None) != missing or (quantile is not None and
+                (not finite_nonnegative(quantile) or not previous <= quantile <= 10000)):
+            raise ValueError("RTT quantile excludes missing opportunities or is invalid")
+        if quantile is not None:
+            previous = quantile
+
+
+def receiver_overlap(pairs, case):
+    starts = [instant(pair["receiver"]["started_utc"]) + case["warmup_seconds"] for pair in pairs]
+    skew = max(starts) - min(starts)
+    # At most one second and five percent of a window may be non-overlapping.
+    allowed = min(1.0, case["seconds"] * .05)
+    if skew > allowed + .000001:
+        raise ValueError("native receiver windows do not have near-complete overlap")
+    return int(max(starts) * 1e9), int((min(starts) + case["seconds"]) * 1e9), skew
+
+
+def verify_pair(client_path, server_path, case, worker_id, source_sha, parameters):
     sides = {"client": records(client_path), "server": records(server_path)}
     summaries = {}
     receiver_side = "server" if case["direction"] == "upload" else "client"
@@ -142,14 +238,30 @@ def verify_pair(client_path, server_path, case, worker_id, source_sha):
         expected = {"run_id": worker_id, "protocol": case["protocol"], "direction": case["direction"],
                     "flows": case["flows_per_worker"], "seconds": case["seconds"],
                     "warmup_seconds": case["warmup_seconds"], "message_bytes": case["message_bytes"]}
-        if any(summary.get(k) != value or metadata.get("options", {}).get(k) != value for k, value in expected.items()):
+        if any(type(summary.get(k)) is not type(value) or summary[k] != value or
+               type(metadata.get("options", {}).get(k)) is not type(value) or metadata["options"][k] != value
+               for k, value in expected.items()):
             raise ValueError("probe output does not match requested measurement")
+        settings = {"diagnostics": case["diagnostics"], "kcp_mtu": parameters.kcp_mtu,
+                    "kcp_window": parameters.kcp_window, "kcp_ack_no_delay": parameters.ack_no_delay,
+                    "offered_mbps_per_flow": parameters.rate_mbps}
+        options = metadata.get("options", {})
+        if any(type(options.get(k)) is not type(v) or options[k] != v for k, v in settings.items() if k != "offered_mbps_per_flow") or \
+                not finite_nonnegative(options.get("offered_mbps_per_flow")) or options["offered_mbps_per_flow"] != parameters.rate_mbps:
+            raise ValueError("probe options differ from requested diagnostics, KCP or offered rate")
         role = "receiver" if side == receiver_side else "sender"
         if summary.get("role") != role or summary.get("side") != side:
             raise ValueError("sender accounting cannot substitute receiver evidence")
         expected_paths = case["candidate_paths"] if case["protocol"] in MPUDP else 1
         if metadata.get("path_count") != expected_paths or summary.get("path_count") != expected_paths:
             raise ValueError("actual configured path count does not match matrix")
+        instant(summary.get("started_utc"))
+        require_counters(summary, ("verified_bytes", "verified_packets", "send_errors", "read_errors", "corrupt_frames", "duplicate_frames", "too_old_frames"), "summary")
+        for key in ("initial", "final"):
+            verify_telemetry(summary.get(key), case, source_sha)
+        for row in rows:
+            if row.get("type") == "sample":
+                verify_telemetry(row.get("telemetry"), case, source_sha)
         summaries[side] = summary
     for side, opposite in (("client", "server"), ("server", "client")):
         if unique_record(sides[side], "remote_summary").get("summary") != summaries[opposite]:
@@ -162,18 +274,30 @@ def verify_pair(client_path, server_path, case, worker_id, source_sha):
         second = index + 1 - case["warmup_seconds"]
         if sample.get("side") != receiver_side or sample.get("second") != second or sample.get("steady") is not (second > 0):
             raise ValueError("receiver sample order or steady-state flag mismatch")
-        for field in ("verified_bytes", "verified_packets"):
-            if type(sample.get(field)) is not int or sample[field] < 0:
-                raise ValueError("invalid verified payload accounting")
+        require_counters(sample, ("verified_bytes", "verified_packets", "corrupt_frames", "duplicate_frames", "too_old_frames"), "receiver sample")
         if sample["verified_bytes"] != sample["verified_packets"] * (case["message_bytes"] - 40):
             raise ValueError("verified bytes include headers or unverified payload")
+        if not finite_nonnegative(sample.get("mbps")) or not math.isclose(sample["mbps"], sample["verified_bytes"] * 8 / 1e6, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError("receiver sample Mbps disagrees with verified bytes")
     steady = samples[case["warmup_seconds"]:]
     verified = sum(r["verified_bytes"] for r in steady)
     mbps = verified * 8 / case["seconds"] / 1e6
-    if receiver.get("verified_bytes") != verified or not isinstance(receiver.get("mbps"), (float, int)) or not math.isclose(receiver["mbps"], mbps, rel_tol=1e-9, abs_tol=1e-12):
+    if receiver.get("verified_bytes") != verified or not finite_nonnegative(receiver.get("mbps")) or not math.isclose(receiver["mbps"], mbps, rel_tol=1e-9, abs_tol=1e-12):
         raise ValueError("receiver summary disagrees with per-second verified bytes")
     if receiver.get("verified_packets") != sum(row["verified_packets"] for row in steady):
         raise ValueError("receiver packet count disagrees with per-second evidence")
+    for field in ("corrupt_frames", "duplicate_frames", "too_old_frames"):
+        if receiver[field] != sum(row[field] for row in steady):
+            raise ValueError("receiver integrity summary disagrees with per-second evidence")
+    compact_fields = ("second", "steady", "mbps", "verified_bytes", "verified_packets", "corrupt_frames", "duplicate_frames", "too_old_frames")
+    if receiver.get("samples") != [{key: row[key] for key in compact_fields} for row in samples]:
+        raise ValueError("receiver compact samples disagree with per-second evidence")
+    worst = min((sum(row["verified_bytes"] for row in steady[i:i + 5]) * 8 / 5e6 for i in range(len(steady) - 4)), default=None)
+    observed = receiver.get("worst_5_second_mbps")
+    if "worst_5_second_mbps" not in receiver or (worst is None and observed is not None) or (worst is not None and
+            (not finite_nonnegative(observed) or not math.isclose(observed, worst, rel_tol=1e-9, abs_tol=1e-12))):
+        raise ValueError("receiver worst five-second throughput disagrees with samples")
+    verify_latency(receiver.get("echo_rtt"), case)
     return {"worker_id": worker_id, "receiver_side": receiver_side, "receiver": receiver,
             "sender": summaries["client" if receiver_side == "server" else "server"]}
 
@@ -318,15 +442,7 @@ class ProbeRunner:
                 monitor = start(host, "sampler", [self.lab.python(host), "-", duration, self.args.host_diagnostics],
                                 name, Path(__file__).with_name("sample-host.py").read_bytes())
                 monitors.append(monitor)
-                until = time.monotonic() + 20
-                while True:
-                    with (output / (name + ".jsonl")).open("rb") as stream:
-                        first_line = stream.readline()
-                    if first_line.endswith(b"\n") and json.loads(first_line).get("kind") == "host":
-                        break
-                    if monitor.poll() is not None or time.monotonic() > until:
-                        raise RuntimeError("host sampler failed to become ready")
-                    time.sleep(.1)
+                calibrate.wait_sampler_ready(monitor, output / (name + ".jsonl"))
             for index in range(case["workers"]):
                 for side in ("server", "client"):
                     host = self.topology[side]
@@ -363,6 +479,13 @@ class ProbeRunner:
             if any(monitor.poll() is not None for monitor in monitors):
                 raise RuntimeError("host sampler stopped before measurement completed")
             time.sleep(1.1)
+            # SIGUSR1 requests a final network snapshot and normal sampler exit.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(lambda item: self.remote(item[0],
+                    ["systemctl", "kill", "--signal=SIGUSR1", "--kill-whom=main", item[1]]), units[:len(hosts)]))
+            for monitor in monitors:
+                if monitor.wait(timeout=30):
+                    raise RuntimeError("host sampler final snapshot failed")
         finally:
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 cleanup = list(executor.map(lambda item: self.stop_unit(*item), units))
@@ -381,12 +504,10 @@ class ProbeRunner:
             if not self.cleanup_verified:
                 raise RuntimeError("owned remote process cleanup could not be verified")
         pairs = [verify_pair(output / f"client-{i}.jsonl", output / f"server-{i}.jsonl", case,
-                             case["case_id"] + f"-w{i}", self.args.source_sha) for i in range(case["workers"])]
-        starts = [datetime.datetime.fromisoformat(pair["receiver"]["started_utc"].replace("Z", "+00:00")).timestamp() + case["warmup_seconds"] for pair in pairs]
-        start_ns, end_ns = int(max(starts) * 1e9), int((min(starts) + case["seconds"]) * 1e9)
-        if end_ns <= start_ns:
-            raise ValueError("native workers had no overlapping steady-state interval")
+                             case["case_id"] + f"-w{i}", self.args.source_sha, self.args) for i in range(case["workers"])]
+        start_ns, end_ns, skew = receiver_overlap(pairs, case)
         headroom = {host: calibrate.host_headroom(output / f"host-{host}.jsonl", start_ns, end_ns) for host in hosts}
+        network = {host: calibrate.verify_network_snapshots(output / f"host-{host}.jsonl", start_ns, end_ns) for host in hosts}
         if case["formal_window"] and any(row["sample_intervals"] < max(1, int((end_ns - start_ns) / 1e9) - 2) for row in headroom.values()):
             raise ValueError("host steady-state sampling is incomplete")
         for host, prefix, name in profiles:
@@ -405,7 +526,9 @@ class ProbeRunner:
         for host, path in configs:
             self.python(host, "from pathlib import Path; import sys; Path(sys.argv[1]).unlink()", path)
         summary = {"case": case, "pairs": pairs, "aggregate_receiver_mbps": sum(p["receiver"]["mbps"] for p in pairs),
-                   "overlap_seconds": (end_ns - start_ns) / 1e9, "hosts": headroom, "product_acceptance": False}
+                   "overlap_seconds": (end_ns - start_ns) / 1e9, "hosts": headroom,
+                   "receiver_start_skew_seconds": skew,
+                   "network_snapshots": network, "product_acceptance": False}
         save(output / "summary.json", summary)
         print(json.dumps({"case_id": case["case_id"], "aggregate_receiver_mbps": summary["aggregate_receiver_mbps"],
                           "single_flow": case["single_flow"], "product_acceptance": False}), flush=True)

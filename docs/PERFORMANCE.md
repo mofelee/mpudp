@@ -81,7 +81,12 @@ iperf3 and benchmark processes, keyed by PID and process start time; command lin
 are excluded. It captures link/qdisc/socket state before and after the
 load; `--diagnostics full` captures these expensive commands every sample and
 must be compared with the default `basic` mode. HTB classes are collected per
-interface. Hypervisor CPU summaries use tick-weighted deltas within the common
+interface. Both modes write explicit `network_snapshot` records; measurement
+starts after the initial snapshot, and a successful run requires a complete final
+snapshot. The protocol runner requests that final snapshot with SIGUSR1 before
+stopping its owned sampler units. Failed commands, malformed output or snapshots
+that do not surround the measured interval fail verification.
+Hypervisor CPU summaries use tick-weighted deltas within the common
 steady interval, excluding warmup and recovery. Clock synchronization and startup
 uncertainty still need inspection in the raw timestamps. A mean idle value alone
 does not prove headroom: inspect endpoints, routers, per-CPU/softirq use, swap,
@@ -130,6 +135,12 @@ and verifies the bytes on disk. It sends secret configuration through SSH stdin
 into mode-0600 files. Original services and configurations are preserved. Every
 case has bounded, individually owned systemd units, receiver-verified per-second
 records, both hosts' exchanged summaries, host samples and cleanup proof. Full
+verification binds both hosts' diagnostic, KCP and offered-rate options and
+requires RTT opportunity accounting, per-second telemetry, integrity counts and
+the independently recomputed worst-five-second throughput. Native parallel
+receiver start times may differ by at most one second or 5% of the steady window,
+whichever is smaller. Their full-window rates are summed; the actual skew and
+common overlap are reported, and host headroom uses that common interval. Full
 host diagnostics are enabled by default; `--host-diagnostics basic` allows a
 collector overhead comparison. Optional `--profiles` stores local private
 profiles under each case's `.lab/profiles`, excluded from the shareable checksum

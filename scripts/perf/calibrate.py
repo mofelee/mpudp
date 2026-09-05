@@ -94,6 +94,50 @@ def listening_endpoints(output):
     return {fields[3] for line in output.splitlines() if len(fields := line.split()) >= 5}
 
 
+def wait_sampler_ready(process, path, timeout=20):
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = [json.loads(line) for line in path.read_bytes().splitlines(keepends=True) if line.endswith(b"\n")]
+        if process.poll() is not None:
+            raise RuntimeError("host sampler exited before load")
+        if any(row.get("kind") == "network_snapshot" and row.get("phase") == "before" for row in rows):
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError("host sampler network snapshot failed to become ready")
+        time.sleep(.1)
+
+
+def verify_network_snapshots(path, start_ns=None, end_ns=None):
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    result = {}
+    for phase in ("before", "after"):
+        snapshots = [row for row in rows if row.get("kind") == "network_snapshot" and row.get("phase") == phase]
+        if len(snapshots) != 1:
+            raise ValueError("host network before/after snapshot is incomplete")
+        snapshot = snapshots[0]
+        commands = [snapshot.get(key, {}) for key in ("qdisc", "sockets", "links")]
+        classes = snapshot.get("classes")
+        if not isinstance(classes, dict) or not classes:
+            raise ValueError("host network class snapshot is incomplete")
+        commands.extend(classes.values())
+        if any(command.get("status") != 0 or not isinstance(command.get("stdout"), str) for command in commands):
+            raise ValueError("host network snapshot command failed")
+        for command in [snapshot["qdisc"], snapshot["links"], *classes.values()]:
+            if not isinstance(json.loads(command["stdout"]), list):
+                raise ValueError("host network snapshot JSON is invalid")
+        started, finished = snapshot.get("started_unix_ns"), snapshot.get("finished_unix_ns")
+        if type(started) is not int or type(finished) is not int or not 0 <= started <= finished:
+            raise ValueError("host network snapshot interval is invalid")
+        result[phase + "_started_unix_ns"] = started
+        result[phase + "_finished_unix_ns"] = finished
+    if result["before_finished_unix_ns"] > result["after_started_unix_ns"]:
+        raise ValueError("host network snapshots are out of order")
+    if (start_ns is not None and result["before_finished_unix_ns"] > start_ns) or \
+            (end_ns is not None and result["after_started_unix_ns"] < end_ns):
+        raise ValueError("host network snapshots do not bracket the measurement")
+    return result
+
+
 def host_headroom(path, start_ns=None, end_ns=None):
     samples = [json.loads(line) for line in path.read_text().splitlines()]
     samples = [s for s in samples if s.get("kind") == "sample"]
@@ -188,6 +232,7 @@ class Lab:
                 monitors.append(process)
                 process.stdin.write((ROOT / "scripts/perf/sample-host.py").read_bytes())
                 process.stdin.close()
+                wait_sampler_ready(process, output / f"host-{host}.jsonl")
             for index, address in enumerate(config["server_addresses"][:paths]):
                 port = 15201 + index
                 handle = (output / f"server-{index + 1}.json").open("w")
@@ -239,9 +284,12 @@ class Lab:
             # startup uncertainty is excluded with one additional second.
             start_ns = max(r["started_unix_ns"] for r in rows) + (warmup + 1) * 1_000_000_000
             end_ns = min(r["started_unix_ns"] for r in rows) + (warmup + seconds) * 1_000_000_000
+            network = {host: verify_network_snapshots(output / f"host-{host}.jsonl", start_ns, end_ns)
+                       for host in [config["client"], config["server"], *config["routers"], config["hypervisor"]]}
             headroom = host_headroom(output / f"host-{config['hypervisor']}.jsonl", start_ns, end_ns)
             summary = {"paths": rows, "aggregate_receiver_mbit_s": sum(r["mbit_s"] for r in rows),
-                       "hypervisor": headroom, "capacity_90_percent_each": all(r["mbit_s"] >= 90 for r in rows),
+                       "hypervisor": headroom, "network_snapshots": network,
+                       "capacity_90_percent_each": all(r["mbit_s"] >= 90 for r in rows),
                        "formal_window": seconds >= 300 and self.args.rounds >= 3,
                        "product_acceptance": False}
             save(output / "summary.json", summary)

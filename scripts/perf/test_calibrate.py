@@ -20,6 +20,53 @@ baseline = importlib.util.module_from_spec(baseline_spec)
 baseline_spec.loader.exec_module(baseline)
 
 
+def network_fixture():
+    return [{"kind": "network_snapshot", "phase": phase,
+             "started_unix_ns": index * 10, "finished_unix_ns": index * 10 + 1,
+             "qdisc": {"status": 0, "stdout": "[]"}, "links": {"status": 0, "stdout": "[]"},
+             "sockets": {"status": 0, "stdout": ""},
+             "classes": {"eth0": {"status": 0, "stdout": "[]"}}}
+            for index, phase in enumerate(("before", "after"))]
+
+
+class NetworkSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "host.jsonl"
+
+    def write(self, rows):
+        self.path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    def test_metadata_alone_does_not_allow_load(self):
+        self.write([{"kind": "host"}])
+        with mock.patch.object(calibrate.time, "monotonic", side_effect=[0, 21]):
+            with self.assertRaisesRegex(RuntimeError, "snapshot"):
+                calibrate.wait_sampler_ready(mock.Mock(poll=lambda: None), self.path)
+
+    def test_before_snapshot_allows_load_but_does_not_finish_evidence(self):
+        self.write(network_fixture()[:1])
+        calibrate.wait_sampler_ready(mock.Mock(poll=lambda: None), self.path)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            calibrate.verify_network_snapshots(self.path)
+
+    def test_complete_snapshots_validate_commands_and_order(self):
+        rows = network_fixture()
+        self.write(rows)
+        self.assertEqual(calibrate.verify_network_snapshots(self.path)["after_started_unix_ns"], 10)
+        with self.assertRaisesRegex(ValueError, "bracket"):
+            calibrate.verify_network_snapshots(self.path, 2, 11)
+        rows[1]["qdisc"]["status"] = 1
+        self.write(rows)
+        with self.assertRaisesRegex(ValueError, "command failed"):
+            calibrate.verify_network_snapshots(self.path)
+        rows = network_fixture()
+        rows[1]["started_unix_ns"] = 0
+        self.write(rows)
+        with self.assertRaisesRegex(ValueError, "out of order"):
+            calibrate.verify_network_snapshots(self.path)
+
+
 def receiver_summary(**updates):
     summary = {"bytes": 100, "seconds": 2, "bits_per_second": 400, "sender": False}
     summary.update(updates)
@@ -217,6 +264,12 @@ class LifecycleTests(unittest.TestCase):
     def popen(self, args, **kwargs):
         command = shlex.split(args[-1])
         server = "iperf3" in command and "-s" in command
+        if "sampler" in command[command.index("--unit") + 1]:
+            snapshots = network_fixture()
+            snapshots[1].update(started_unix_ns=2**63 - 2, finished_unix_ns=2**63 - 1)
+            for row in snapshots:
+                kwargs["stdout"].write(json.dumps(row) + "\n")
+            kwargs["stdout"].flush()
         process = FakeProcess(args, dead=server and self.dead_server,
                               stubborn=self.stubborn, **kwargs)
         self.processes.append(process)

@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from test_calibrate import network_fixture
+
 spec = importlib.util.spec_from_file_location("probe_runner", Path(__file__).with_name("run-probe.py"))
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
@@ -33,8 +35,10 @@ def pair_records(case, worker_id):
                 "warmup_seconds": case["warmup_seconds"], "message_bytes": case["message_bytes"]}
     for side in ("client", "server"):
         paths = case["candidate_paths"] if case["protocol"] in runner.MPUDP else 1
+        options = {**expected, "diagnostics": case["diagnostics"], "kcp_mtu": 1400, "kcp_window": 1024,
+                   "kcp_ack_no_delay": False, "offered_mbps_per_flow": 0}
         metadata = {"type": "metadata", "side": side, "source_sha": SOURCE_SHA,
-                    "path_count": paths, "options": expected.copy()}
+                    "path_count": paths, "options": options}
         role = "receiver" if side == receiver_side else "sender"
         rows[side] = [metadata]
         size = case["message_bytes"] - 40
@@ -42,13 +46,46 @@ def pair_records(case, worker_id):
             for i in range(case["warmup_seconds"] + case["seconds"]):
                 second = i + 1 - case["warmup_seconds"]
                 rows[side].append({"type": "sample", "side": side, "role": role, "second": second,
-                                   "steady": second > 0, "verified_bytes": size, "verified_packets": 1})
+                                   "steady": second > 0, "verified_bytes": size, "verified_packets": 1,
+                                   "mbps": size * 8 / 1e6, "corrupt_frames": 0, "duplicate_frames": 0,
+                                   "too_old_frames": 0, "telemetry": telemetry_fixture(case)})
         summaries[side] = {"type": "summary", **expected, "side": side, "role": role, "path_count": paths,
                            "started_utc": "2026-09-05T00:00:00Z", "verified_bytes": size * case["seconds"],
-                           "verified_packets": case["seconds"], "mbps": size * 8 / 1e6}
+                           "verified_packets": case["seconds"], "mbps": size * 8 / 1e6,
+                           "send_errors": 0, "read_errors": 0, "corrupt_frames": 0, "duplicate_frames": 0,
+                           "too_old_frames": 0, "initial": telemetry_fixture(case), "final": telemetry_fixture(case),
+                           "worst_5_second_mbps": size * 8 / 1e6 if case["seconds"] >= 5 else None}
+        if role == "receiver":
+            summaries[side]["samples"] = [{key: value for key, value in row.items() if key not in ("type", "side", "role", "telemetry")}
+                                           for row in rows[side] if row["type"] == "sample"]
+            scheduled = case["seconds"] * case["flows_per_worker"] * 5
+            summaries[side]["echo_rtt"] = {"sent": scheduled, "scheduled": scheduled, "submitted": scheduled,
+                "queue_missed": 0, "write_failed": 0, "received": scheduled, "unanswered": 0,
+                "on_time": scheduled, "deadline_missed": 0, "deadline_ms": 1000, "over_10000_ms": 0,
+                "p50_ms": 1, "p95_ms": 1, "p99_ms": 1, "resolution_ms": 1}
     for side, opposite in (("client", "server"), ("server", "client")):
         rows[side].extend([copy.deepcopy(summaries[side]), {"type": "remote_summary", "summary": copy.deepcopy(summaries[opposite])}])
     return rows
+
+
+def telemetry_fixture(case):
+    value = {"at_utc": "2026-09-05T00:00:00Z", "process": {key: 0 for key in
+             ("cpu_user_seconds", "cpu_system_seconds", "max_rss_kib", "heap_alloc_bytes", "total_alloc_bytes",
+              "mallocs", "gc_count", "goroutines")}, "mpudp_statistics_available": case["protocol"] in runner.MPUDP,
+             "kcp_timeout_retransmits": 0, "adapter_write_drops": 0}
+    if value["mpudp_statistics_available"]:
+        value["mpudp"] = {key: 0 for key in ("ingress_accepted", "ingress_drops", "delivery_accepted", "delivery_drops",
+                            "delivered_packets", "delivered_bytes", "sent_datagrams", "sent_datagram_bytes")}
+        value["mpudp"].update({"diagnostics_enabled": case["diagnostics"],
+            "fec": {key: 0 for key in ("completed_blocks", "recovered_blocks", "recovered_shards", "expired_blocks",
+                                      "decoder_full", "late_shards", "duplicate_shards")},
+            "paths": [{key: 0 for key in ("sent_packets", "sent_bytes", "send_errors", "received_packets",
+                                         "received_bytes", "receive_oversize_drops")}]})
+    if case["protocol"] in ("kcp", "kcp-mpudp"):
+        value["kcp_snmp"] = {key: 0 for key in ("InSegs", "OutSegs", "RetransSegs", "FastRetransSegs", "EarlyRetransSegs", "LostSegs")}
+        value["kcp_sessions"] = [{"flow": flow, "srtt_ms": 0, "srtt_variation_ms": 0, "rto_ms": 0}
+                                  for flow in range(case["flows_per_worker"])]
+    return value
 
 
 class MatrixTests(unittest.TestCase):
@@ -122,7 +159,11 @@ class EvidenceTests(unittest.TestCase):
         for side in ("client", "server"):
             (self.directory / (side + ".jsonl")).write_text("\n".join(json.dumps(row) for row in self.rows[side]) + "\n")
         return runner.verify_pair(self.directory / "client.jsonl", self.directory / "server.jsonl",
-                                  self.case, self.worker_id, SOURCE_SHA)
+                                  self.case, self.worker_id, SOURCE_SHA, self.args)
+
+    def exchange_summaries(self):
+        for side, opposite in (("client", "server"), ("server", "client")):
+            self.rows[side][-1]["summary"] = copy.deepcopy(self.rows[opposite][-2])
 
     def test_upload_uses_matching_remote_receiver_and_both_side_logs(self):
         verified = self.verify()
@@ -165,6 +206,74 @@ class EvidenceTests(unittest.TestCase):
         self.rows["client"][-1]["summary"] = copy.deepcopy(self.rows["server"][-2])
         with self.assertRaises(ValueError):
             self.verify()
+
+    def test_requested_diagnostics_kcp_and_rate_are_bound_on_both_sides(self):
+        for side in ("client", "server"):
+            for key, wrong in (("diagnostics", True), ("kcp_mtu", 1200), ("kcp_window", 64),
+                               ("kcp_ack_no_delay", True), ("offered_mbps_per_flow", 10)):
+                with self.subTest(side=side, key=key):
+                    self.rows = pair_records(self.case, self.worker_id)
+                    self.rows[side][0]["options"][key] = wrong
+                    with self.assertRaisesRegex(ValueError, "probe options"):
+                        self.verify()
+
+    def test_missing_rtt_or_telemetry_cannot_pass(self):
+        for field in ("echo_rtt", "initial", "final"):
+            self.rows = pair_records(self.case, self.worker_id)
+            del self.rows["server"][-2][field]
+            self.exchange_summaries()
+            with self.assertRaises(ValueError):
+                self.verify()
+        self.rows = pair_records(self.case, self.worker_id)
+        del self.rows["server"][1]["telemetry"]
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_kcp_requires_per_flow_and_timeout_evidence(self):
+        self.case["protocol"] = "kcp"
+        self.rows = pair_records(self.case, self.worker_id)
+        self.verify()
+        self.rows["server"][1]["telemetry"]["kcp_sessions"] = []
+        with self.assertRaisesRegex(ValueError, "per-flow KCP"):
+            self.verify()
+
+    def test_only_original_baseline_can_lack_mpudp_statistics(self):
+        value = telemetry_fixture(self.case)
+        value.pop("mpudp")
+        value["mpudp_statistics_available"] = False
+        runner.verify_telemetry(value, self.case, runner.calibrate.BASELINE_SHA)
+        with self.assertRaisesRegex(ValueError, "missing statistics"):
+            runner.verify_telemetry(value, self.case, SOURCE_SHA)
+
+    def test_quantiles_cannot_ignore_unanswered_opportunities(self):
+        latency = self.rows["server"][-2]["echo_rtt"]
+        latency.update(received=1, unanswered=latency["scheduled"] - 1,
+                       on_time=1, deadline_missed=latency["scheduled"] - 1)
+        self.exchange_summaries()
+        with self.assertRaisesRegex(ValueError, "quantile"):
+            self.verify()
+        latency.update(p50_ms=None, p95_ms=None, p99_ms=None)
+        self.exchange_summaries()
+        self.verify()
+
+    def test_compact_integrity_and_worst_window_must_match(self):
+        for field, wrong in (("corrupt_frames", 1), ("samples", []), ("worst_5_second_mbps", 1)):
+            self.rows = pair_records(self.case, self.worker_id)
+            self.rows["server"][-2][field] = wrong
+            self.exchange_summaries()
+            with self.assertRaises(ValueError):
+                self.verify()
+
+    def test_near_complete_overlap_bounds_parallel_aggregation(self):
+        self.case["seconds"] = 300
+        pairs = [{"receiver": {"started_utc": instant}} for instant in
+                 ("2026-09-05T00:00:00Z", "2026-09-05T00:00:01Z")]
+        start, end, skew = runner.receiver_overlap(pairs, self.case)
+        self.assertEqual((end - start) / 1e9, 299)
+        self.assertEqual(skew, 1)
+        pairs[1]["receiver"]["started_utc"] = "2026-09-05T00:04:59Z"
+        with self.assertRaisesRegex(ValueError, "near-complete"):
+            runner.receiver_overlap(pairs, self.case)
 
 
 class PrivacyTests(unittest.TestCase):
@@ -249,6 +358,8 @@ class LifecycleTests(unittest.TestCase):
         self.processes, self.stops, self.config_data, self.commands = [], [], [], []
         self.ss_calls = 0
         self.occupied = self.bad_cleanup = self.dead_client = self.dead_server = False
+        self.missing_after_snapshot = False
+        self.sampler_stop_requests = []
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(runner.subprocess, "Popen", side_effect=self.popen))
@@ -260,6 +371,9 @@ class LifecycleTests(unittest.TestCase):
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
     def remote(self, host, command, data=None, timeout=30):
+        if command[:2] == ["systemctl", "kill"]:
+            self.sampler_stop_requests.append((host, command))
+            return b""
         self.ss_calls += 1
         if self.occupied or self.ss_calls > 2:
             return f"LISTEN 0 10 192.0.2.2:{self.args.control_port} 0.0.0.0:*\n".encode()
@@ -279,7 +393,10 @@ class LifecycleTests(unittest.TestCase):
         self.commands.append(words)
         label = words[words.index("--unit") + 1]
         if label.endswith("sampler"):
-            rows, dead = [{"kind": "host"}], False
+            snapshots = network_fixture()
+            snapshots[1].update(started_unix_ns=2**63 - 2, finished_unix_ns=2**63 - 1)
+            rows = [{"kind": "host"}, *snapshots[:1 if self.missing_after_snapshot else 2]]
+            dead = False
         else:
             side = words[words.index("-mode") + 1]
             worker_id = words[words.index("-id") + 1]
@@ -294,6 +411,8 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(summary["pairs"][0]["receiver_side"], "server")
         self.assertEqual(len(self.processes), 10)
         self.assertEqual(len(self.stops), 10)
+        self.assertEqual(len(self.sampler_stop_requests), 8)
+        self.assertEqual(len(summary["network_snapshots"]), 8)
         self.assertTrue(all(unit.startswith("mpudp-probe-") for _, unit in self.stops))
         self.assertTrue(all(process.poll() is not None for process in self.processes))
         self.assertEqual(len(self.config_data), 2)
@@ -307,6 +426,13 @@ class LifecycleTests(unittest.TestCase):
             self.probe.case(self.case)
         self.assertEqual(self.processes, [])
         self.assertEqual(self.stops, [])
+
+    def test_missing_after_snapshot_rejects_summary_after_cleanup(self):
+        self.missing_after_snapshot = True
+        with self.assertRaisesRegex(ValueError, "snapshot is incomplete"):
+            self.probe.case(self.case)
+        self.assertEqual(len(self.stops), 10)
+        self.assertFalse((self.args.output / self.case["case_id"] / "summary.json").exists())
 
     def test_client_failure_still_joins_processes_and_verifies_cleanup(self):
         self.dead_client = True
