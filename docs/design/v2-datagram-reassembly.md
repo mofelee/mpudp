@@ -52,10 +52,30 @@ other groups. This is not an unconditional progress guarantee. A larger original
 more descriptors, an exhausted original/lease count, application-held deliveries
 or another Session can still prevent the complete destination reservation;
 the decoded group then retains its reduced lease and unchanged deadline.
-Receiving each bundle also reserves temporary packet/record storage before
-servicing existing groups. If incomplete groups exhaust that scratch capacity,
-even their final shards can remain blocked until some ownership expires or is
-released; this reduction only takes effect after successful decoding.
+
+Temporary bundle decoding uses a separate prepaid obligation within the
+controller's existing `InitialControl` claim. Its size is the local receive
+hard cap plus `MaxFECRecords * sizeof(FECRecord)`, independent of the outbound
+fixed budget and send hard cap. The claim is reserved before handshake
+completion and bound once by `New`; insufficient prepayment rejects installation
+without binding other components. `Receive` is serialized and rejects callback
+reentry. Bundle payloads and record references are discarded before a later
+receive or controller teardown, while the workspace obligation remains charged
+until `Close`. No packet can release or shrink that floor, and receiving a
+bundle requires no new scratch byte or reservation slot.
+
+This prevents outbound queue admission from consuming the scratch capacity
+needed to finish an existing group. The regression fills 32 groups through real
+`Receive` calls, then admits a 1400-byte outbound original: 1968 free bytes fall
+to 568, too little for either a fresh packet reservation or outbound encoding.
+The completing shard still uses prepaid scratch, decodes before expiry and
+releases group credit that unblocks the queued output. A larger multi-record
+completion bundle also fits the same prepaid bound. These guarantees concern
+scratch admission only: a failing new-group record earlier in a mixed bundle
+still stops later records, and new groups, original payloads and outbound output
+continue to require their separate count/byte reservations. At the same total
+limit, prepaying scratch may reject an outbound admission earlier; its caller
+receives resource pressure without a new receipt or retained payload.
 
 Each original owns its total declared byte length plus
 `MaxFragments * sizeof(interval)` bytes for the range table and 16 bytes for
@@ -103,5 +123,7 @@ reordered groups and duplicate repair-shaped inputs without duplicate original
 delivery. Credit regressions cover discarded decode workspace, one and 256
 descriptors retaining complete logical backing, simultaneous source/destination
 copies, reduced-lease expiry and payload-only delivery ownership. These are
-component integration tests, not socket, repair-timer,
-migration-lifecycle or performance acceptance.
+component integration tests. Prepaid-scratch regressions also cover real
+controller receive/write pressure, both hard-cap extremes, asymmetric send and
+receive limits, constructor rollback, reentry and idempotent teardown. No
+socket, repair-timer, migration-lifecycle or performance acceptance is claimed.

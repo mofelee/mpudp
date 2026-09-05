@@ -141,17 +141,14 @@ func (c *Controller) insertGroup(id uint64, group *pendingGroup) {
 	c.groups[id] = group
 }
 
-func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, packetBytes int, result *Result) error {
+func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedEnvelope, budget int, restricted bool, result *Result) error {
 	if !c.receiveAckSent {
 		return ErrNotReady
 	}
-	lease, err := c.setup.Scope.Reserve(creditv2.Claim{Bytes: uint64(packetBytes) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))})
-	if err != nil {
-		return err
-	}
+	// InitialControl covers one receive-hard-cap payload and a full record
+	// array. Receive serializes use; discard both before that workspace is reused.
 	bundle, err := wirev2.DecodeFECBundle(envelope, c.receiveLookup, budget)
 	if err != nil {
-		lease.Release()
 		return err
 	}
 	defer func() {
@@ -159,7 +156,6 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			clear(record.Payload)
 		}
 		bundle.Records = nil
-		lease.Release()
 	}()
 	for _, record := range bundle.Records {
 		group := c.groups[record.GroupID]
