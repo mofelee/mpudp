@@ -6,6 +6,7 @@ multipath performance work. The baseline tooling is delivered incrementally in
 the performance targets have passed.
 
 Initial evidence: [native five-path capacity smoke](performance/native-capacity-smoke-20260905.md).
+Updated diagnostic evidence: [five-path counters, profiles and complete network snapshots](performance/diagnostics-20260905.md).
 
 ## Reference Environment
 
