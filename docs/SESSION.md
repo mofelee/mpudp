@@ -76,6 +76,10 @@ Endpoint identity 包含 transport PathID、socket generation、local address �
 address，记录 generation-bound ReplyPath、最后认证活动时间、health 和最近 RTT。发送
 候选按完整 identity 排序，绝不依赖 Go map iteration 顺序。
 
+Listener 认证后只计算一次报文的 immutable ReplyPath identity，并传给查找到的 Session。
+Session 在处理前再次检查 ReplyPath 当前可用性，避免 registry lookup 期间失效的路径
+刷新 Endpoint；直接调用 Session 时仍自行验证并计算 identity。
+
 新增 Endpoint 前先清除已经达到 TTL 的记录。若仍达到 `MaxEndpoints`，采用固定的
 reject-new 策略；现有 Endpoint 仍可刷新，不因攻击者提供的新来源而被驱逐。Endpoint
 达到 TTL 后从调度候选和 probe state 删除，但 SessionID、已建立状态和其他路径不变。
@@ -163,6 +167,11 @@ queue 均有显式配置上限。
 Close 清除所有 deadline、Endpoint、probe 和 FEC state，取消 in-flight control/DATA
 context，并等待已进入的有界操作退出。状态机自身不启动后台 goroutine，因此不存在隐藏
 timer 或 worker 需要回收。
+
+公共 `WritePacket` 使用的 `context.Background()` 直接借用 Session lifetime context，
+避免逐报文创建派生 context 和取消回调。单次发送完成不取消共享 lifetime；Close 仍取消
+所有在途发送并等待其退出。带调用方取消、deadline 或 value 的 context 保留原派生语义；
+best-effort CLOSE 使用独立的关闭 context，不继承已取消的 DATA lifetime。
 
 ## 测试契约
 
