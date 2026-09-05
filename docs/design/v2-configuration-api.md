@@ -1,14 +1,19 @@
 # V2 Configuration And Proposed API Contract
 
-Status: concrete proposal for #20 review. Strict `protocol` and `wire.version`
+Status: implemented Linux fixed/session Datagram subset plus the remaining
+#20 proposal. Strict `protocol` and `wire.version`
 recognition, protocol-specific FEC validation, shared v2 transport/resource
 settings, directional path budgets/rates, receive deadlines, aggregation,
 repair, KCP tuning and mux configuration validation are implemented.
 `config.DefaultV2(protocol)` supplies the recognized v2 defaults for Go callers;
-`config.Default()` preserves v1 defaults. A valid v2 configuration still returns
-`ErrProtocolUnavailable` from Peer construction before runtime side effects.
-New runtime APIs and data-plane behavior below remain proposals; the runnable
-data plane remains v1 Datagram. The
+`config.Default()` preserves v1 defaults. Linux Peer construction supports v2
+Datagram with fixed Session budgets, repair disabled and optional aggregation.
+KCP, repair, PLPMTUD, per-Carrier budgets and v2 on other platforms still return
+`ErrProtocolUnavailable` before runtime side effects. The optional public
+`DatagramSession` adds local Flush and graceful-close fences. Reliable APIs,
+full scheduler/health behavior, MTU migration and performance acceptance below
+remain proposed or pending. The serial v2 dispatcher makes bounded synchronous
+socket attempts; it is not the proposed parallel send-worker implementation. The
 maintained [configuration](../CONFIGURATION.md) and [API](../API.md) describe
 the implemented parser/runtime boundary. Wire values are assigned in the
 [registry](v2-registry.md); behavior and capacity are in the
@@ -216,6 +221,11 @@ a count decrement alone is not proof of byte reclamation.
 
 ## Compatibility Matrix
 
+This is the joint protocol contract. The current runtime rejects KCP, repair,
+PLPMTUD and per-Carrier selections locally as unavailable; their remote
+negotiation rows describe the intended later implementation, not current
+network acceptance evidence.
+
 | Local / Remote Selection | Required Result |
 |---|---|
 | Omitted new fields / omitted new fields | Existing v1 Datagram, explicit positive FEC, fixed session budget |
@@ -236,11 +246,14 @@ a count decrement alone is not proof of byte reclamation.
 ## Public API Choices
 
 Session stays `WritePacket([]byte) error`, `ReadPacket() ([]byte,error)`,
-`Close() error`. v2 aggregation is explicit admission semantics; the optional
-DatagramFlusher interface and exact fences are in joint section 6. Ordinary
-Close is local bounded discard; CloseGracefully has a caller deadline.
+`Close() error`. The implemented optional `DatagramSession` embeds Session and
+adds `Flush(context.Context) error` and `CloseGracefully(context.Context) error`.
+V2 aggregation uses explicit admission semantics and the frontier defined in
+joint section 6. Ordinary Close is local bounded discard; CloseGracefully has
+a caller deadline. See the maintained [public API](../API.md) and
+[Chinese version](../API.zh-CN.md) for supported behavior and limitations.
 
-For reliable mode add these separate entry points, retaining existing role
+For the still-unavailable reliable mode, the proposal adds these entry points, retaining existing role
 errors and rejecting Datagram API entry points in KCP mode:
 
 ```go
@@ -288,9 +301,9 @@ counter/drop; diagnostics contain neither key material nor application bytes.
 
 ## Remaining Evidence
 
-The definitions above choose behavior and defaults so implementation can
-proceed after review. Missing work is concrete: byte-exact codec/KDF vectors,
-strict-parser tests, handshake/reflection/replay tests, grants/cancellation
-under global pressure, lifecycle/deadline and leak tests, then exact-SHA
-network/MTU/capacity acceptance. Dependency experiments are narrow evidence,
+The implemented configuration, codec/KDF vectors, bounded handshake, ownership
+and fixed Datagram runtime do not complete this joint contract. Remaining
+work includes reliable/control contracts, repair and MTU migration, full
+scheduling/health and cross-mode lifecycle tests, then exact-SHA network/MTU/
+capacity acceptance. Dependency experiments are narrow evidence,
 not completion of #20, #21, #24, #25, #13 or #14.

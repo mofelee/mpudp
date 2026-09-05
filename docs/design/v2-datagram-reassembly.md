@@ -3,8 +3,10 @@
 `internal/reassemblyv2` implements original-Datagram ownership after a FEC
 group has decoded. It consumes the [group codec](fecv2-group-codec.md),
 [credit ledger](v2-credit-ledger.md) and
-[terminal receive window](v2-receive-window.md). Public v2 runtime activation,
-pending-shard decoding, repair, migration and delivery queues remain pending.
+[terminal receive window](v2-receive-window.md). The Linux fixed/session
+Datagram [public runtime](../API.md) connects pending-group decoding to this
+receiver and owns its delivery queue. This package remains socket-free;
+repair, migration and their full lifecycle acceptance remain pending.
 
 `RequiredInitialBytes(limits)` validates bounds and computes both terminal
 bitmap arrays' combined charge without allocation. `New` reserves that charge;

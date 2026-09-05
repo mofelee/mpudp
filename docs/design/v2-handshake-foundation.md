@@ -1,10 +1,11 @@
 # V2 Handshake State Foundation
 
 `internal/handshakev2` implements bounded HELLO, CHALLENGE, FINISH and READY
-state over `wirev2`, `negotiationv2` and `creditv2`. It is not connected to
-the public Peer, UDP sockets, configuration selection, FEC, KCP or smux.
-Issue #20 remains open until runtime integration and its network acceptance
-matrix are complete. The runnable public protocol remains v1.
+state over `wirev2`, `negotiationv2` and `creditv2`. The Linux fixed/session
+Datagram [public runtime](../API.md) supplies its transport and installer
+callbacks; this package itself owns no sockets or workers. KCP and smux are
+not activated. Issue #20 remains open for the remaining protocol and network
+acceptance matrix; v1 behavior is preserved.
 
 ## Ownership And Admission
 

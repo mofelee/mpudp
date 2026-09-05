@@ -389,7 +389,8 @@ Keep Session's three required methods unchanged. Add this optional interface,
 implemented by v2 Datagram sessions; v1 behavior is unchanged:
 
 ```go
-type DatagramFlusher interface {
+type DatagramSession interface {
+    Session
     Flush(context.Context) error
     CloseGracefully(context.Context) error
 }

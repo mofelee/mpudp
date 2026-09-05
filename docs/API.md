@@ -1,72 +1,78 @@
-# MPUDP 公共 API
+# MPUDP Public API
 
-公共包为 `github.com/mofelee/mpudp`，严格配置模型位于
-`github.com/mofelee/mpudp/config`。公共数据面只提供 Datagram Session，不暴露 shard、
-Carrier 或上层协议适配。
+[简体中文](API.zh-CN.md)
 
-## 启动与角色
+The public package is `github.com/mofelee/mpudp`; strict configuration lives
+in `github.com/mofelee/mpudp/config`. The data plane exposes complete Datagram
+Sessions, without exposing shards, Carriers or upper-layer adapters.
+
+## Startup And Roles
 
 ```go
 cfg, err := config.Parse(yamlBytes)
 if err != nil {
     // errors.Is(err, mpudp.ErrInvalidConfig)
 }
-
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 peer, err := mpudp.NewPeerContext(ctx, cfg)
 if err != nil {
-    // 构造失败已经回收半初始化资源
+    // Partially initialized resources have already been released.
 }
 defer peer.Close()
 
 if cfg.InitiatorEnabled() {
     outbound, err := peer.NewSession()
-    // 握手异步进行；建立前 WritePacket 返回 ErrNotReady
+    // Handshake is asynchronous; WritePacket returns ErrNotReady initially.
+    _, _ = outbound, err
 }
-
 if cfg.ListenerEnabled() {
     listener, err := peer.Listener()
-    inbound, err := listener.Accept(ctx)
+    if err == nil {
+        inbound, err := listener.Accept(ctx)
+        _, _ = inbound, err
+    }
 }
 ```
 
-`NewPeer` 先完成无副作用验证，再为 listener/dual 模式绑定 `listen` socket，并启动一个
-Peer 级 dispatcher。initiator-only 不绑定 listener；每次 `NewSession` 为每个配置的
-Carrier 打开一个长期 UDP socket，并立即发起认证 HELLO。任一 Carrier 打开失败时，本次
-调用已经打开的 socket 会全部关闭，且不会保留半初始化 Session。
+`NewPeer` validates configuration before runtime side effects, binds `listen`
+for listener/dual roles, then starts one Peer dispatcher. Initiator-only Peers
+do not bind a listener. `NewSession` opens one long-lived UDP socket per
+configured Carrier and begins authenticated bootstrap. Failed construction
+closes sockets opened by that call and removes partial Session state.
+V2 reserves temporary startup credit before Carrier sockets open. DNS and
+socket startup run outside the shared Peer mutex; cancellation or failure
+releases the temporary reservation and partial socket resources.
 
-配置层识别 `protocol: datagram|kcp` 和 `wire.version: v1|v2`，但当前仅实现 v1 Datagram
-运行时。合法的 v2 配置在 `NewPeer` / `NewPeerContext` 中返回 `ErrProtocolUnavailable`，
-Peer 为 nil；拒绝发生在访问 context、随机源、socket/timer 依赖和启动 goroutine 之前。
-非法配置仍先返回 `ErrInvalidConfig`，例如 KCP 配 v1、非零 FEC 或 v2 UDP 上限小于 512。
-`Parse` / `Validate` 成功只表示配置合法，不表示运行时可用；没有自动降级或 KCP packet adapter。
-两个错误均通过 `errors.Is` 区分，错误不回显协议输入值或 PSK。
+Existing v1 Datagram remains supported. Linux also supports explicit v2
+Datagram with `transport.mtu_discovery: fixed`,
+`transport.budget_strategy: session`, repair disabled, and aggregation either
+enabled or disabled. KCP, repair, PLPMTUD, per-Carrier budget, and v2 on other
+platforms remain unavailable. Valid unsupported selections return a nil Peer
+and `ErrProtocolUnavailable` before accessing runtime context, randomness,
+socket/timer dependencies or starting goroutines. Invalid configurations return
+`ErrInvalidConfig` first. There is no automatic downgrade or KCP adapter.
 
-`NewPeerContext` 提供相同的启动路径，并允许 context 取消 listener bind、Carrier dial 和
-运行时网络操作。context 取消会阻止或中止工作，但调用方仍须调用 `Peer.Close`，才能同步
-关闭 socket 并等待 dispatcher、receive loop 和在途 callback 全部退出。
+`NewPeerContext` allows cancellation of listener binding, Carrier startup and
+runtime operations. Callers must still call `Close` to synchronously release
+sockets and join dispatcher/receive work. The CLI creates a Peer from `-config`,
+creates one outbound Session for initiator/dual mode, and runs until SIGINT or
+SIGTERM with controlled cleanup.
 
-CLI `cmd/mpudp` 读取 `-config` 后创建 Peer。initiator/dual 模式还会自动创建一个 outbound
-Session，然后持续运行直到 SIGINT 或 SIGTERM；启动失败或收到信号时都会执行受控 Close。
+Go callers start with `config.Default()` for v1 or `config.DefaultV2(protocol)`
+for v2, then provide roles, FEC and PSK. The latter returns configuration, not
+resources; only the supported subset above can start. `Validate` does not fill
+numeric zeros in Go literals. `Clone` deep-copies directional path budgets and
+rate maps. Empty `Protocol` and `Wire.Version` preserve legacy Go literals as
+Datagram/v1 without rewriting the object; explicit empty YAML strings reject.
+Use `EffectiveProtocol()` and `EffectiveWireVersion()` to inspect defaults.
+KCP requires explicit v2 and FEC 0/0, but its runtime remains unavailable.
 
-YAML 解析只对真正省略的可选字段应用默认值。Go 调用方直接组装 v1 配置时先调用
-`config.Default()`，再覆盖角色、FEC、PSK 和需要调整的选项；v2 使用
-`config.DefaultV2(protocol)` 初始化共享 transport/资源和所选协议的配置默认值，仍会由 Peer 构造函数返回
-`ErrProtocolUnavailable`。零值 `config.Config` 不会由 `Validate` 或 `NewPeer` 隐式补数值
-默认；直接 Go literal 必须显式满足全部 v2 校验。`Clone()` 同时深复制方向路径预算和 rate
-map。`Config.Protocol` 与 `Config.Wire.Version` 使用 `config.Protocol` /
-`config.WireVersion` 类型；`Default()` 填入 `ProtocolDatagram`
-与 `WireVersionV1`。为兼容旧 Go struct literal，只有这两个新增字段的空字符串按
-datagram/v1 解释，并可通过 `EffectiveProtocol()` / `EffectiveWireVersion()` 查询；原配置
-不被改写。显式 YAML 空字符串仍无效。KCP 选择必须显式使用 `WireVersionV2` 并保持 FEC 0/0，
-目前构造仍返回 `ErrProtocolUnavailable`。
+`NewSession` requires initiator/dual mode; `Listener` requires listener/dual.
+Wrong roles return `ErrModeUnavailable`. One dual Peer's `max_sessions` covers
+outbound and inbound Sessions together.
 
-`Peer.NewSession()` 只在 initiator/dual 模式可用；`Peer.Listener()` 只在 listener/dual
-模式可用，错误角色返回 `ErrModeUnavailable`。一个 dual Peer 的
-`limits.max_sessions` 同时约束 outbound 与 accepted inbound Session 总数。
-
-## Datagram 接口
+## Datagram Sessions
 
 ```go
 type Session interface {
@@ -76,21 +82,73 @@ type Session interface {
 }
 ```
 
-一次成功的 `WritePacket` 表示一个完整 Datagram，一次成功的 `ReadPacket` 返回一个完整
-Datagram。空 Datagram 返回非 nil 的零长度 slice。不同 PacketID 不承诺有序交付。
-同一存活 Session 接收方向内，FEC duplicate/late shard 不会让同一 PacketID 重复交付。
-接收端使用固定 65536-ID 窗口，尚未接纳且已落到窗口外的 Datagram 会被丢弃；既有 pending
-block 保留到原 deadline。`Close` 后重新创建的 Session 不继承窗口。MPUDP 不提供可靠、
-有序或流语义；完整范围和 v1 HELLO 重放边界见 [FEC 设计](FEC.md#解码超时与去重)。
+Each successful read returns a whole original Datagram. Empty Datagrams return
+a nonnil zero-length slice. Delivery order is unspecified. Duplicate/late FEC
+shards cannot deliver an original twice within one live receive direction.
+The bounded 65536-ID window rejects previously unadmitted IDs below its floor;
+already admitted pending work keeps its original deadline. Recreated Sessions
+do not inherit history. See [FEC](FEC.md#解码超时与去重) for v1 replay boundaries.
+V2 keeps independent Completed/Expired histories for original DatagramIDs and
+encoding GroupIDs, and only delivers complete originals. A returned slice is
+caller-owned and survives later Session closure unchanged.
 
-`NewSession` 不等待握手完成。握手期间 `WritePacket` 返回 `ErrNotReady`；建立后，payload
-先按协商后的有效 Datagram 上限检查，超限返回 `ErrMessageTooLarge`，不会分配 FEC block、
-取得 PacketID 或发送任何 shard。其他发送失败通过根包的 `ErrNoAvailablePaths`、
-`ErrPartialSend`、`ErrAllSendsFailed` 和 `ErrPathMTUExceeded` 分类，并保留底层
-`errors.Is` cause。一个错误可同时匹配发送结果和路径原因，例如 partial send 与 PMTU。
+`NewSession` does not wait for readiness. `WritePacket` returns `ErrNotReady`
+until handshake and required v2 path/encoding setup complete. Oversized whole
+Datagrams return `ErrMessageTooLarge` before retaining payload, consuming an ID
+or sending a prefix. Limits include configured and negotiated receiver bounds
+and effective FEC fragment capacity.
 
-`ReadPacket` 会阻塞到一个完整 Datagram 到达或 Session 关闭。它当前不接受 context；需要
-取消等待时，调用方应关闭 Session 或其所属 Peer。Close 后不会交付队列中残留的数据。
+V1 and v2 with aggregation disabled complete the original's local encoding and
+socket attempts before `WritePacket` returns. This is not remote delivery
+confirmation. With v2 aggregation enabled, nil means the complete payload was
+copied, metadata/bytes reserved, and its DatagramID committed to the bounded
+queue. The caller may reuse its slice. Full admission returns `ErrResourceLimit`
+without a partial prefix or retained background waiter. Concurrent admissions
+order IDs at queue commit, not call start or socket send.
+
+Capacity, descriptor count, the oldest admission's `aggregation.max_delay`, or
+an explicit Flush seals a group. Later writes do not extend that deadline.
+Operating-system scheduling and shared dispatcher work can add latency;
+`max_delay` is not a hard end-to-end timing guarantee.
+
+V2 Datagram Sessions implement this optional interface; v1 and the existing
+three-method `Session` remain compatible:
+
+```go
+type DatagramSession interface {
+    Session
+    Flush(context.Context) error
+    CloseGracefully(context.Context) error
+}
+
+datagram, ok := current.(mpudp.DatagramSession)
+if ok {
+    err := datagram.Flush(ctx)
+    _ = err
+}
+```
+
+`Flush(ctx)` captures the already committed admission frontier, seals its tail,
+and waits for every original shard through that frontier to finish its local
+socket attempt or failure. It excludes later writes and does not wait for
+repair, remote ACKs or application reads. Context cancellation stops only that
+wait; accepted Datagrams remain owned and may still send. The first asynchronous
+send failure stays in the Session for subsequent applicable Flush/graceful
+close calls, independently of the lossy `Peer.Errors` channel. Nil context
+returns `ErrInvalidConfig`.
+
+`CloseGracefully(ctx)` stops new admission, flushes accepted work, and closes
+after success, failure or context expiry. Repair is unavailable, so this does
+not wait for remote repair obligations. Repeated calls return the first call's
+completed result. Ordinary `Close` may discard unsent
+accepted work. Neither method turns local completion into a delivery guarantee.
+
+`ReadPacket` blocks until a complete Datagram arrives or the Session closes.
+It has no context argument: close the Session or Peer to cancel a read. Queued
+data is not returned after closure. Send failures retain `errors.Is` causes;
+one failure can match both a send result and a path-MTU cause.
+
+## Listener Admission
 
 ```go
 type Listener interface {
@@ -99,81 +157,97 @@ type Listener interface {
 }
 ```
 
-`Accept` 阻塞到认证且兼容的 HELLO 创建新 Session、context 取消/超时，或 Listener 关闭。
-nil context 返回 `ErrInvalidConfig`。每个入站 Session 只因第一次创建入队一次；重复 HELLO
-只刷新现有状态。`Listener.Close` 停止入站接收、关闭其 accepted Session，并唤醒全部
-Accept；dual Peer 的 outbound Session 不受影响。
+`Accept` waits for an authenticated compatible admitted Session, context
+cancellation/expiry, or Listener closure. V2 verifies FINISH, promotes reserved
+credits and installs components before READY. Pending-accept slots are reserved
+during handshake and released only when public Accept takes the Session.
+Retries do not enqueue duplicate public Sessions. Nil context is invalid.
+`Listener.Close` ends accepted and queued inbound Sessions and wakes Accept
+callers; outbound Sessions on a dual Peer remain independent.
 
-## 有界队列与 deadline
+## Bounds And Deadlines
 
-Peer 只创建一个 runtime dispatcher goroutine和一个可复用 timer，负责全部 Session 的
-HELLO retry、keepalive、Endpoint expiry 和 FEC sweep deadline。每个 UDP Carrier 可有一个
-transport receive loop；callback 只把拥有所有权的 packet 非阻塞放入 ingress，不执行认证、
-FEC、Close 或 goroutine 创建。
+One dispatcher and one reusable timer drive each Peer. V1 deadlines cover
+HELLO retry, keepalive, Endpoint expiry and FEC sweep. V2 drives handshake and
+control retries, aggregation tails and group/original receive deadlines. Each
+UDP Carrier can have a receive loop. Transport callbacks enqueue owned packets
+without blocking or starting per-packet workers.
 
-| 资源 | 容量 | 满载策略 |
+| Resource | Capacity | Full Policy |
 |---|---:|---|
-| Peer packet/recoverable-error ingress | `limits.receive_queue_capacity` | drop newest event |
-| Listener terminal failure latch | 1 | retain first terminal failure |
-| Listener accept | `limits.receive_queue_capacity` | close/release newest Session |
-| 每 Session delivery | `limits.delivery_queue_capacity` | drop newest Datagram |
+| Peer packet/recoverable-error ingress | `limits.receive_queue_capacity` | Drop newest event |
+| Listener terminal failure latch | 1 | Retain first failure |
+| V1 Listener accept | `limits.receive_queue_capacity` | Close/release newest Session |
+| V2 Listener accept | `limits.max_pending_accepts` | Reject admission without reserved capacity |
+| Session delivery | `limits.delivery_queue_capacity` | Drop newest Datagram and release ownership |
 
-因此一个慢 `Accept`/`ReadPacket` 消费者不会阻塞 transport callback、其他 Session 或无限增加
-内存。drop 策略不会产生 DATA 重传或把 Datagram 降级成字节流。listener 的 terminal socket
-error 使用独立的一次性 latch，不会因 packet ingress 已满而丢失；超大 packet、nil remote
-和临时网络错误仍是可恢复的单次诊断，不会关闭仍可用的 Listener 或 Carrier。
+Slow application consumption cannot create unbounded queues or block transport
+callbacks. Dropping a Datagram does not enable retransmission or stream
+semantics. A separate listener failure latch cannot be hidden by full ingress.
+Oversized packets and recoverable transport errors do not alone close a live
+socket.
 
-公共配置到内部 Session 的额外有界映射为：
+V1 completion history is a fixed 65536-ID/8 KiB bitmap independent of pending
+capacity and Endpoint TTL. V2's independent terminal windows, queue backing,
+FEC output, receive state and pending deliveries use Session/Peer credits.
+Disposal clears storage before returning credit; global byte pressure can
+reject admission before the configured Session count is reached.
+Credits measure reserved obligations and Peer/Session-owned storage, not
+process RSS. Go allocator/GC retention and shared codec lookup tables are
+outside these ownership counters.
 
-- completed PacketID 使用固定 65536-ID / 8 KiB 接收窗口，独立于 pending 容量和 Endpoint TTL；
-- handshake jitter 未单独暴露配置，使用 retry interval 的四分之一默认值。
+The current v2 dispatcher is serial and uses bounded synchronous socket
+attempts with a 20ms context per attempt. Encoding or sending for one Session
+can delay another. There is no per-packet goroutine or unbounded wait queue.
+`max_send_workers` and path-queue settings do not promise an implemented
+parallel worker pool. Current path selection/rate limits are not the complete
+#22 scheduler or fast health detector, and do not establish #16 throughput
+acceptance. Repair, MTU probing/migration, KCP and smux remain unavailable.
 
-## 关闭与并发
+## Closure And Concurrency
 
-- `Peer.NewSession`、`Peer.Listener`、`Peer.Config`、`Peer.Mode` 和 `Peer.Close` 可并发调用。
-- 同一 `Session` 的 `WritePacket`、`ReadPacket` 和 `Close` 可并发调用。
-- 同一 `Listener` 的多个 `Accept` 和 `Close` 可并发调用。
-- 多个并发 `WritePacket` 保持 Datagram 边界，但 PacketID/send 顺序不作保证。
-- `Peer.Close`、`Listener.Close` 和 `Session.Close` 均幂等；并发调用共享首次关闭结果。
+Peer lifecycle/configuration methods, Session reads/writes/Close, and Listener
+Accept/Close support concurrent callers. Datagram boundaries remain distinct;
+physical send and delivery order are unspecified. Peer, Listener and Session
+Close are idempotent and share their first close result.
 
-关闭首先阻止新的 write/Session/accept，再取消 dispatcher 和在途 Session 操作；内部状态机
-在 socket 可用时用最长一秒的 context 尝试 CLOSE，随后关闭 Carrier/listener socket、释放
-FEC/Endpoint/timer 状态、唤醒阻塞调用，并等待 receive loop、callback 和 dispatcher 退出。
-Close 返回后不再有属于该对象的后台网络活动。收到认证的远端 CLOSE 也会释放对应公共
-Session 和 initiator Carrier。
+Closure prevents new work, cancels runtime operations, attempts bounded CLOSE
+when possible, releases queued/receive/FEC/path storage, closes sockets and
+wakes waiters. V1 uses a bounded one-second close context; v2 socket attempts
+use 20ms contexts. Close joins owned background network activity. Authenticated
+remote CLOSE also releases the public Session and its initiator Carriers.
+V2 Session and Listener closure cancel their associated in-flight sends.
 
-`Peer.Errors()` 返回容量为一的异步诊断 channel。运行时生产者不会阻塞；channel 已满时
-丢弃最新诊断。错误文本只给出稳定操作类别，底层 cause 仍可用 `errors.Is`/`errors.As`
-检查。该 channel 在 `Peer.Close` 时不会关闭，消费者应与自己的 lifecycle context 一起
-select。
+`Peer.Errors()` is a capacity-one diagnostic channel. Producers never block
+and drop the newest diagnostic when full. Text exposes stable operation
+categories, while `errors.Is`/`errors.As` retain causes. The channel is not
+closed by `Peer.Close`; select with a lifecycle context.
 
-## SessionID 与诊断
+<a id="sessionid-与诊断"></a>
 
-`Peer.Statistics()` 返回可直接 JSON 编码的有界诊断快照；`CapturedAt` 用于相邻采样差分，
-例如 `ΔPaths[i].SentPackets / Δseconds` 得到 PPS。累计计数和峰值贯穿 Peer 生命周期，
-不因 Session 关闭或 socket rebuild 清零，`Peer.Close()` 后仍可读取。各字段独立原子采样，正在收发时
-不是同一瞬间的一致性事务；不可用单次快照中字段之间的细微差异推断丢包。
+## Diagnostics
 
-默认记录 ingress accepted/drop、delivery accepted/drop、成功写入的 Datagram 和实际
-`ReadPacket` 返回的 payload 字节，以及 FEC 完成、需要 parity 的恢复 block/缺失 data
-shard、pending 超时、decoder-full、pending duplicate、已完成 ID 的 late shard，以及
-固定窗口外的 `TooOldShards`。`FEC.LateShards` 包括窗口内已恢复完成后正常抵达的剩余
-parity/data shard；`TooOldShards` 包括没有既存 pending state 且低于窗口下界的 ID，不能
-区分从未到达的数据与已经完成的数据。两者均不能单独证明网络丢包，旧 ID 丢弃不会增加
-decoder-full。`IngressDrops` 仅统计完整 packet ingress
-队列溢出；可恢复错误事件、鉴权拒绝及关闭时未消费的数据不计入这个数值。
+`Peer.Statistics()` returns a JSON-compatible bounded snapshot. Counters and
+independent high-water marks last for the Peer lifetime and remain readable
+after Close. `CapturedAt` supports interval rates; independently sampled fields
+are not one atomic transaction. Differences inside one snapshot do not prove
+packet loss.
 
-`FEC.CompletedCapacityEvictions` 保留用于旧内部 decoder 对照，只累计旧 completed cache
-因容量上限产生的淘汰，不包含 TTL 到期；生产窗口不使用该缓存，因此该计数为零。
-`PendingBlocks`、`PendingShards`、`PendingBytes` 是所有存活 decoder 的当前
-占用总和，会在完成、超时和关闭时下降；`PendingBytes` 仅计算 decoder 持有的 shard
-payload 字节，不含 map、索引、codec 和重建过程的临时内存。对应的
-`PendingBlocksHighWater`、`PendingShardsHighWater`、`PendingBytesHighWater` 保存 Peer
-生命周期内各总和的独立峰值，关闭后仍保留；它们不是逐 Session 峰值之和。
+Detailed FEC/Endpoint metrics below describe v1. V2 reuses basic Peer/transport
+ingress, delivery, admission and socket counters, but does not yet provide
+equivalent internal FEC/path coverage. Missing evidence must not be inferred
+from zero counters. V2 `SentDatagrams` counts admitted originals.
 
-容量淘汰计数与 pending 占用不能单独证明某个 completed key 被晚到 shard 重新打开。
-以下确定性工作负载先完成 32 个已知 PacketID，再释放各自两个 parity shard；固定
-RS(3+2)、1200-byte Datagram、16 个 pending 槽，比较旧 completed 容量 8/16/32 与固定窗口：
+V1 tracks delivery/ingress overflow, completed and recovered blocks, missing
+data shards, timeout/full/duplicate events, known late shards and `TooOldShards`.
+Late or too-old shards do not independently measure network loss.
+`CompletedCapacityEvictions` supports the old decoder comparison and stays zero
+for the production bitmap window. Current `PendingBlocks`, `PendingShards` and
+`PendingBytes` fall on completion, expiry and closure; bytes count retained
+shard payload only, excluding map/codec/temporary allocation overhead. Their
+high-water marks are independent Peer-wide maxima, not sums of Session peaks.
+
+The reproducible delayed-parity comparison is:
 
 ```sh
 go test ./internal/fec -run 'TestDelayedParity(Capacity|Window)Diagnostics' -v
@@ -181,88 +255,59 @@ go test ./internal/fec -run TestReplayWindowHighBlockRateDelayedParityDoesNotReo
 go test ./internal/fec -run '^$' -bench BenchmarkDelayedParityCapacity -benchmem
 ```
 
-| 模式/旧 Completed 容量 | 容量淘汰 | 重新打开的 pending block | Pending shard | Pending 字节 | Decoder-full | 新 block 被拒绝 |
-|---|---|---|---|---|---|---|
-| 旧缓存 / 8 | 24 | 16 | 32 | 12800 | 17 | 是 |
-| 旧缓存 / 16 | 16 | 16 | 32 | 12800 | 1 | 是 |
-| 旧缓存 / 32 | 0 | 0 | 0 | 0 | 0 | 否 |
-| 65536-ID 窗口 / 任意旧容量 | 0 | 0 | 0 | 0 | 0 | 否 |
+For RS(3+2), 32 completed IDs and 16 pending slots, old cache capacities 8/16/32
+reopen 16/16/0 blocks and reject a new block in the first two cases. The fixed
+window reopens none and admits the new block. After 65568 completions followed
+by all parity, it records 131072 late and 64 too-old shards with no reopened
+pending work. These are correctness regressions, not throughput measurements.
 
-Pending 指标在全部晚到 parity 处理后、尝试新 block 前采样；decoder-full 包含随后对新
-block 首个 shard 的尝试。窗口模式将全部 64 个已知晚到 parity 计为 `LateShards`。
-高 block-rate 对照先完成 65568 个 ID，再释放全部 parity：窗口模式的 `LateShards` 为
-131072、`TooOldShards` 为 64、重新打开的 pending 和 decoder-full 均为零，新 block
-仍可完成。这些确定性实验验证 #18 的接收状态修复，不代表网络吞吐量或生产容量建议。
+`Paths` aggregates configured `carrier-N` sockets across Sessions and the shared
+listener without exposing addresses, SessionIDs, PSKs or payload. Bytes measure
+complete UDP payload, excluding IP/UDP/L2. Receive oversize counts distinguish
+kernel-truncated reads. Sent bytes count socket write results; sent packets
+require complete writes. `SendErrors` includes socket errors/short writes, not
+later kernel/qdisc loss or earlier validation/deadline failures.
 
-`Paths` 只包含配置顺序的 `carrier-N` 和可选的 `listener`：同一 Carrier 索引的多个
-Session socket 合并，listener 为单个共享 socket 的汇总，不输出地址、SessionID、PSK
-或业务内容。计数是 UDP payload 层，包括 MPUDP 头部、FEC 和控制报文，不含 IP/UDP/L2
-头部。接收字节使用 `Read`/`ReadFrom` 返回的长度；超大报文可能已被内核截断至接收
-buffer，因此该情况另计 `ReceiveOversizeDrops`。`SentBytes` 只累计 socket write 返回
-的已写入字节，`SentPackets` 仅计完整成功的 socket write，`SendErrors` 计 socket write
-错误或 short write；写前校验、设置 deadline 失败和内核/qdisc 后续丢弃不在其中。
+V1 `ListenerPaths` tracks authenticated accepted Endpoints in at most 256
+anonymous lifetime slots, then one overflow row. Socket generation and local/
+remote endpoints define identity, not SessionID; slots persist across expiry.
+Authentication/protocol/admission failures create no slots. Accepted duplicates
+count, while CLOSE uses only an existing source row. Its scope differs from
+the raw listener socket row, so totals need not match.
 
-`ListenerPaths` 单独统计监听端已认证且协议语义接受的 Endpoint 流量，路径名称按首次
-接受顺序分配为 `listener-path-N`。Peer 生命周期内最多保留 256 个匿名路径槽，之后
-的新路径合并至 `listener-overflow`，不再保留新地址索引。身份包含监听 socket generation
-和本地/远端 Endpoint，不含 SessionID；同一路径跨 Session、Endpoint TTL 到期后仍复用
-已有槽，计数不会清零，也不回收槽。统计快照不输出地址或身份哈希。
+`SetDiagnosticsEnabled(true)` enables optional ingress-queue and send latency,
+socket-write-lock wait and socket-call time, plus fixed packet-size histograms.
+Latency uses 24 independent buckets from `<=1us` through `<=4194304us`, then
+overflow; `TotalNS`/`MaxNS` are nanoseconds. Disabling retains existing samples.
+These counters do not replace kernel/qdisc, reliable-transport or MTU/epoch
+instrumentation. Local diagnostic overhead benchmarks do not establish
+end-to-end performance.
 
-无效认证、未知 Session 非 HELLO、不兼容握手、Endpoint/Session/decoder 容量拒绝和
-不匹配的 PONG、窗口外旧 DATA 不分配槽，也不增加路径接收计数；已接受的
-duplicate/late shard 仍计入。
-CLOSE 只归入该 Session 已有的源 Endpoint，不为未知源分配槽。发送包含该路径上的
-HELLO_ACK、PONG、keepalive、DATA 和 CLOSE 的实际 socket 写入。因接收范围不同，
-`ListenerPaths` 总和不必等于包含无效/超大报文的 `Paths` 中 `listener` 汇总；路径行的
-`ReceiveOversizeDrops` 为零，超大报文只计入原始 socket 行。
+`SessionID` is `[16]byte` and generated with `crypto/rand.Reader`; zero values
+are retried boundedly and entropy failure cannot return a usable ID. Config
+cannot force an ID. Default Peer/Listener/Session formatting contains roles,
+counts, state and a short ID hash, never secrets, full IDs or packet contents.
 
-`Peer.SetDiagnosticsEnabled(true)` 打开额外诊断，默认关闭：
+## Stable Errors
 
-- `IngressQueue`：callback enqueue 到 dispatcher 处理之间的队列时间。
-- `SendLatency`：公共 Session 写入通过生命周期检查后，内部 Datagram 写入的总耗时，
-  包括编码、调度和 socket send；不是接收确认时间。
-- 每路径 `WriteQueue`：socket 写锁的实际等待时间，不包含 deadline 等写前准备；
-  `SocketWrite` 为实际 socket 调用耗时，不包含写后计数和 deadline 清理。
-  listener socket 汇总与匿名路径使用同一次 socket 调用测量，不计上层 `Send` 包装耗时。
-- 每路径 `SentPacketSizes` / `ReceivedPacketSizes`：完整 UDP payload 长度的固定分桶，
-  `UpperBounds` 为包含上界，`Counts` 为各桶独立计数。
+Use `errors.Is`:
 
-延迟使用固定 24 桶：`<=1us, <=2us, ..., <=4194304us, overflow`，同样为独立计数；
-`TotalNS` 和 `MaxNS` 单位为纳秒。关闭诊断保留已有样本；开关切换前启动的在途操作仍可
-完成统计。关闭状态保留基本原子计数，但不读取额外时钟或记录包长分布；
-`go test -run '^$' -bench BenchmarkIngressDiagnostics -benchmem .` 可比较 ingress 局部
-开销，不代替完整负载下的开启/关闭实验。
-
-这些统计不声称在 256 个槽以外逐一覆盖监听端远端、socket receive overflow、qdisc drop、KCP
-RTT/RTO/重传、业务 ACK 返回排队、per-Carrier MTU epoch/probe/padding 等指标。它们需要
-基准工具的相应内核/上层采样或后续协议实现，不能以零值替代缺失证据。
-
-`SessionID` 是 `[16]byte`。`NewSessionID()` 和公开 `NewPeer()` 始终使用
-`crypto/rand.Reader`；全零结果有限重试，随机源失败不会返回可用 ID。配置和公共 API 没有
-设置固定 SessionID 的入口。
-
-Peer、Listener 和运行时 Session 的默认格式只包含角色、计数、状态及 SessionID 的短哈希。
-错误文本只包含稳定类别或 packet/path 计数。PSK、认证 tag、完整 SessionID、完整 payload
-和底层注入错误文本不会进入默认诊断；底层 cause 仍可通过 `errors.Is`/`errors.As` 检查。
-
-## 稳定错误类别
-
-调用方应使用 `errors.Is` 判断：
-
-| Sentinel | 含义 |
+| Sentinel | Meaning |
 |---|---|
-| `ErrInvalidConfig` | YAML、配置值或 nil context 无效 |
-| `ErrMessageTooLarge` | Datagram 超过配置/协商后的有效上限 |
-| `ErrClosed` | Peer、Listener 或 Session 已关闭 |
-| `ErrAuthentication` | HMAC/认证失败 |
-| `ErrHandshakeIncompatible` | 协议、FEC 或 transport 能力不兼容 |
-| `ErrNotReady` | initiator 尚未完成握手或握手已耗尽 |
-| `ErrModeUnavailable` | 当前配置未启用请求的 bootstrap 角色 |
-| `ErrResourceLimit` | Session、Endpoint 或 FEC block 达到有界上限 |
-| `ErrNoAvailablePaths` | Datagram 开始发送时没有健康路径 |
-| `ErrPartialSend` | 一个 Datagram 的部分 FEC shard 发送失败 |
-| `ErrAllSendsFailed` | 一个 Datagram 的全部 FEC shard 发送失败 |
-| `ErrPathMTUExceeded` | UDP packet 超过路径已知 MTU；可与发送结果类别同时匹配 |
+| `ErrInvalidConfig` | Invalid YAML/configuration or nil context |
+| `ErrProtocolUnavailable` | Valid protocol/feature/platform combination is unimplemented |
+| `ErrMessageTooLarge` | Original exceeds effective configured/negotiated bounds |
+| `ErrClosed` | Peer, Listener or Session closed |
+| `ErrAuthentication` | Authentication failed |
+| `ErrHandshakeIncompatible` | Protocol, FEC or transport capabilities conflict |
+| `ErrNotReady` | Handshake or required v2 context is not ready |
+| `ErrModeUnavailable` | Requested bootstrap role is disabled |
+| `ErrResourceLimit` | Admission/count/queue or Session/Peer byte capacity exhausted |
+| `ErrNoAvailablePaths` | No available path before sending |
+| `ErrPartialSend` | Some original FEC shard attempts failed |
+| `ErrAllSendsFailed` | All original FEC shard attempts failed |
+| `ErrPathMTUExceeded` | Packet exceeds path MTU; may also match a send-result error |
 
-认证失败和 malformed 外部 UDP packet 在 dispatcher 内被丢弃，不会创建公共 Session 或通过
-`ReadPacket`/`Accept` 暴露；上述类别适用于可观察的公共调用和保留 cause 的错误链。
+Malformed or unauthenticated packets are dropped in the dispatcher without
+creating a public Session or escaping through ReadPacket/Accept. Public errors
+and retained causes do not expose PSKs, authentication tags or payloads.
