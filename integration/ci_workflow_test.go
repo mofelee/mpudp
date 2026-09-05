@@ -74,12 +74,12 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 		t.Fatalf("invalid CI workflow YAML: %v", err)
 	}
 
-	for _, trigger := range []string{"pull_request", "push", "workflow_dispatch"} {
+	for _, trigger := range []string{"pull_request", "push", "workflow_dispatch", "workflow_call"} {
 		if _, ok := workflow.On[trigger]; !ok {
 			t.Errorf("CI workflow is missing %q trigger", trigger)
 		}
 	}
-	if len(workflow.On) != 3 {
+	if len(workflow.On) != 4 {
 		t.Errorf("CI workflow has unexpected triggers: %v", workflow.On)
 	}
 	if !reflect.DeepEqual(workflow.On["push"].Branches, []string{"main"}) {

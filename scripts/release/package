@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: MPUDP_RELEASE_VERSION=v0.1.0 MPUDP_RELEASE_ARCH=amd64 bash scripts/release/package OUTPUT_DIR" >&2
+  exit 2
+fi
+
+version=${MPUDP_RELEASE_VERSION:?MPUDP_RELEASE_VERSION is required}
+arch=${MPUDP_RELEASE_ARCH:?MPUDP_RELEASE_ARCH is required}
+if [[ ! $version =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+  echo "release version must be vMAJOR.MINOR.PATCH with an optional prerelease suffix" >&2
+  exit 2
+fi
+if [[ $version == *-* ]]; then
+  IFS=. read -r -a identifiers <<<"${version#*-}"
+  for identifier in "${identifiers[@]}"; do
+    if [[ $identifier =~ ^0[0-9]+$ ]]; then
+      echo "numeric prerelease identifiers must not have leading zeroes" >&2
+      exit 2
+    fi
+  done
+fi
+case "$arch" in
+  amd64|arm64) ;;
+  *) echo "unsupported release architecture: $arch" >&2; exit 2 ;;
+esac
+
+root=$(git rev-parse --show-toplevel)
+output_dir=$(realpath -m -- "$1")
+cd "$root"
+commit=$(git rev-parse HEAD)
+source_date_epoch=$(git show -s --format=%ct HEAD)
+archive_root="mpudp_${version#v}_linux_${arch}"
+mkdir -p -- "$output_dir"
+if [[ -e "$output_dir/$archive_root.tar.gz" ]]; then
+  echo "release archive already exists: $output_dir/$archive_root.tar.gz" >&2
+  exit 1
+fi
+build_dir=$(mktemp -d)
+trap 'rm -rf -- "$build_dir"' EXIT
+package_dir="$build_dir/$archive_root"
+mkdir -p "$package_dir/licenses"
+
+export CGO_ENABLED=0 GOOS=linux GOARCH="$arch"
+export GOAMD64=v1 GOARM64=v8.0
+go build -mod=readonly -trimpath -buildvcs=false \
+  -ldflags "-s -w -X main.version=$version -X main.commit=$commit" \
+  -o "$package_dir/mpudp" ./cmd/mpudp
+cp README.md "$package_dir/"
+cp -R docs "$package_dir/docs"
+if [[ -f LICENSE ]]; then
+  cp LICENSE "$package_dir/"
+fi
+
+# Derive notices from the actual production dependency graph for this target.
+go list -mod=readonly -deps -f '{{if and .Module (not .Module.Main)}}{{.Module.Path}}{{"\t"}}{{.Module.Dir}}{{end}}' ./cmd/mpudp |
+  LC_ALL=C sort -u >"$build_dir/modules.txt"
+while IFS=$'\t' read -r module module_dir; do
+  [[ -n "$module" ]] || continue
+  [[ -f "$module_dir/LICENSE" ]]
+  for notice in LICENSE NOTICE PATENTS; do
+    if [[ -f "$module_dir/$notice" ]]; then
+      install -D -m 0644 "$module_dir/$notice" "$package_dir/licenses/$module/$notice"
+    fi
+  done
+done <"$build_dir/modules.txt"
+
+goroot=$(go env GOROOT)
+for notice in LICENSE PATENTS; do
+  install -D -m 0644 "$goroot/$notice" "$package_dir/licenses/go/$notice"
+done
+while IFS= read -r -d '' notice; do
+  install -D -m 0644 "$notice" "$package_dir/licenses/go/${notice#"$goroot/"}"
+done < <(find "$goroot/src/vendor" -type f \( -name LICENSE -o -name NOTICE -o -name PATENTS \) -print0)
+
+(
+  cd "$package_dir"
+  printf 'version: %s\ncommit: %s\n' "$version" "$commit"
+  go version -m mpudp
+) >"$package_dir/BUILDINFO.txt"
+
+tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+  -C "$build_dir" -cf - "$archive_root" |
+  gzip -n >"$output_dir/$archive_root.tar.gz"
+printf '%s\n' "$output_dir/$archive_root.tar.gz"

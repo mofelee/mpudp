@@ -31,9 +31,11 @@ module files already describe that graph.
 
 This snapshot was checked against the license and notice files in the selected
 module versions. The compiled module sets were also compared with `GOOS=linux`
-for both `GOARCH=amd64` and `GOARCH=arm64`; they were identical. CI declares Go
-1.24.x; a release audit must repeat the checks with the exact toolchain, target,
-and build flags used for the released artifact.
+for both `GOARCH=amd64` and `GOARCH=arm64`; they were identical. Compatibility CI
+declares Go 1.24.x. Release builds use Go 1.26.4 with `CGO_ENABLED=0`,
+`-mod=readonly`, `-trimpath`, `-buildvcs=false`, and `-s -w`, plus version/commit
+linker values. `BUILDINFO.txt` in each archive records the actual binary's module
+and build metadata; repeat this audit when the toolchain, target, or flags change.
 
 ## Compiled production dependencies
 
@@ -95,6 +97,7 @@ is MIT:
 | `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` | v7.0.1 | [MIT](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/LICENSE) |
 | `actions/setup-go` | `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e` | v7.0.0 | [MIT](https://github.com/actions/setup-go/blob/b7ad1dad31e06c5925ef5d2fc7ad053ef454303e/LICENSE) |
 | `actions/upload-artifact` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` | v7.0.1 | [MIT](https://github.com/actions/upload-artifact/blob/043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/LICENSE) |
+| `actions/download-artifact` | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` | v8.0.1 | [MIT](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/LICENSE) |
 
 The Linux integration workflow installs `conntrack`, `diffutils`, `iproute2`,
 `iputils-ping`, `nftables`, `procps`, and `tcpdump`. Those packages, the hosted
@@ -108,7 +111,8 @@ them if a future image, appliance, container, or bundle includes them.
 Before any source or binary distribution, audit the exact artifact rather than
 relying only on the module graph:
 
-- choose and publish a root MPUDP license separately;
+- preserve the owner's MPUDP licensing decision; publishing an artifact without
+  a root project license does not grant an open-source license for MPUDP itself;
 - reproduce the copyright, permission, and disclaimer text required by every
   included MIT, ISC, BSD-2-Clause, and BSD-3-Clause component, including the
   applicable no-endorsement clauses;
@@ -123,8 +127,15 @@ relying only on the module graph:
 - repeat the audit for vendored code, generated code, copied assets, packaging
   metadata, container layers, and any newly introduced release tooling.
 
-The current CI workflow runs `go build ./...` but publishes no binaries. Its
-only upload is short-lived integration failure diagnostics. Issue
-[#10](https://github.com/mofelee/mpudp/issues/10) covers this documentation
-audit; it does not authorize a release, tag, artifact publication, or root
-license choice.
+The CI workflow uploads only short-lived integration failure diagnostics.
+The separate Release workflow publishes Linux amd64/arm64 static binaries on
+version tags after the complete CI and native architecture tests pass. Its
+archives include the production modules' original `LICENSE`, `NOTICE`, and
+`PATENTS` files where present, the Go license/patent files and vendored notices,
+the project documentation, and exact binary build metadata. Test-only modules
+and external system tools are not shipped in these binary archives.
+
+See [the release process](RELEASING.md) for artifact names, build flags, dry runs,
+tag publication, and checksum verification. The original issue
+[#10](https://github.com/mofelee/mpudp/issues/10) remains the v0.1 documentation
+audit record; subsequent release work is tracked by its commits and Actions runs.
