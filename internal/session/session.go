@@ -192,13 +192,22 @@ func (s *Session) HandlePacket(ctx context.Context, packet ReceivedPacket) (Hand
 }
 
 func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket, message wire.Message) (HandleResult, error) {
+	return s.handleAuthenticatedWithIdentity(ctx, packet, message, "")
+}
+
+func (s *Session) handleAuthenticatedWithIdentity(ctx context.Context, packet ReceivedPacket, message wire.Message, key string) (HandleResult, error) {
 	result := HandleResult{Message: message}
 	if message.Header.SessionID != s.id {
 		return result, ErrUnknownSession
 	}
-	key, err := replyIdentity(packet.Reply)
-	if err != nil {
-		return result, err
+	var err error
+	if key == "" {
+		key, err = replyIdentityUnchecked(packet.Reply)
+	}
+	// A Listener supplies the packet's immutable identity, but its path may
+	// have become unavailable while the registry was being consulted.
+	if err != nil || packet.Reply == nil || !packet.Reply.Available() {
+		return result, ErrInvalidReplyPath
 	}
 	now := s.settings.clock.Now()
 
