@@ -25,6 +25,8 @@ type pendingGroup struct {
 	next      uint64
 }
 
+const pendingGroupMetadataBytes = uint64(unsafe.Sizeof(pendingGroup{})) + 64
+
 func (c *Controller) sendLookup(epoch uint32) (wirev2.EncodingContext, bool) {
 	return c.sendContext, c.contextAcknowledged && epoch == c.sendContext.Epoch
 }
@@ -118,7 +120,7 @@ func (c *Controller) reserveGroup(record wirev2.FECRecord, now time.Time) (*pend
 	n := uint64(context.DataShards) + uint64(context.ParityShards)
 	// Reserve retained shards, concurrent reconstruction workspace, owned
 	// decoded logical bytes, descriptor/slice storage, and bounded map metadata.
-	charge := 2*n*uint64(context.ShardBytes) + uint64(context.MaxLogicalBytes) + 2*n*uint64(unsafe.Sizeof([]byte{})) + uint64(context.MaxDescriptors)*uint64(unsafe.Sizeof(fecv2.Fragment{})) + uint64(unsafe.Sizeof(pendingGroup{})) + 64
+	charge := 2*n*uint64(context.ShardBytes) + uint64(context.MaxLogicalBytes) + 2*n*uint64(unsafe.Sizeof([]byte{})) + uint64(context.MaxDescriptors)*uint64(unsafe.Sizeof(fecv2.Fragment{})) + pendingGroupMetadataBytes
 	lease, err := c.setup.Scope.Reserve(creditv2.Claim{Bytes: charge})
 	if err != nil {
 		return nil, err
@@ -206,6 +208,15 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			}
 			group.shards, group.fragments = nil, fragments
 			c.decodedGroups++
+			// Decode owns exactly logical bytes, including the manifest prefix,
+			// plus the returned descriptor backing array. Its reconstruction
+			// workspace and our shards are gone before returning their credit.
+			retained := uint64(group.logical) + uint64(cap(fragments))*uint64(unsafe.Sizeof(fecv2.Fragment{})) + pendingGroupMetadataBytes
+			if err := group.lease.ShrinkBytes(retained); err != nil {
+				c.groupWindow.Finish(record.GroupID, recvwindow.Expired)
+				c.releaseGroup(record.GroupID, group)
+				return err
+			}
 			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
 				return err
 			}

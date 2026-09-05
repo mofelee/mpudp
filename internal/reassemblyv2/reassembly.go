@@ -246,6 +246,9 @@ func (r *Receiver) AddGroup(now time.Time, fragments []fecv2.Fragment) ([]*Datag
 			r.window.Finish(f.DatagramID, recvwindow.Completed)
 			r.removePending(f.DatagramID, a)
 			a.ranges = nil
+			// This private live lease covers data plus discarded ranges/links;
+			// reducing it to the surviving payload cannot fail or grow credit.
+			_ = a.lease.ShrinkBytes(uint64(cap(a.data)))
 			completed = append(completed, &Datagram{state: &datagramState{id: f.DatagramID, data: a.data, lease: a.lease}})
 			a.data, a.lease = nil, nil
 		}

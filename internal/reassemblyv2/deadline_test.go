@@ -100,7 +100,11 @@ func TestDeadlineLinkStorageCharged(t *testing.T) {
 				payload = "a"
 			}
 			done := add(t, r, start, fragment(1, uint32(size), 0, payload))
-			if got, want := p.Snapshot().Bytes-before, uint64(size+r.limits.MaxFragments*8+16); got != want {
+			want := uint64(size)
+			if size != 0 {
+				want += uint64(r.limits.MaxFragments*8 + 16)
+			}
+			if got := p.Snapshot().Bytes - before; got != want {
 				t.Fatalf("original charge = %d, want %d including deadline links", got, want)
 			}
 			if size != 0 {

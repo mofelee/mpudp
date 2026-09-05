@@ -360,6 +360,32 @@ func (l *Lease) MarkAccepted() error {
 	return nil
 }
 
+// ShrinkBytes reduces the byte obligation after the owner has disposed of the
+// corresponding storage or ended its reservation. It never grows a claim or
+// changes stream, accept or reservation counts, even when bytes reaches zero.
+// Bound and copied handles share the reduction; only the storage owner may
+// shrink them. Like Release, shrinking remains valid after scope Close.
+func (l *Lease) ShrinkBytes(bytes uint64) error {
+	if l == nil || l.state == nil {
+		return invalid("nil lease")
+	}
+	state := l.state
+	p := state.peer
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state.released {
+		return ErrReleased
+	}
+	if bytes > state.claim.Bytes {
+		return invalid("cannot grow a byte obligation")
+	}
+	released := state.claim.Bytes - bytes
+	state.claim.Bytes = bytes
+	state.owner.usage.Bytes -= released
+	p.usage.Bytes -= released
+	return nil
+}
+
 // Release is idempotent and safe after Close. The caller must first clear
 // actual owned storage/obligations; closing a scope never releases it for them.
 func (l *Lease) Release() {
