@@ -14,9 +14,34 @@ import (
 // failure. Callers should use errors.Is rather than matching error text.
 var ErrInvalidConfig = errors.New("invalid MPUDP configuration")
 
-// Config is the complete v0.1 configuration established by issue #2.
+// Protocol selects Datagram or reliable KCP framing independently of Peer roles.
+type Protocol string
+
+const (
+	ProtocolDatagram Protocol = "datagram"
+	ProtocolKCP      Protocol = "kcp"
+)
+
+// WireVersion selects a protocol incarnation without permitting downgrade.
+type WireVersion string
+
+const (
+	WireVersionV1 WireVersion = "v1"
+	WireVersionV2 WireVersion = "v2"
+)
+
+// WireConfig selects the wire version. Recognition does not imply that the
+// runtime implements that version.
+type WireConfig struct {
+	Version WireVersion `yaml:"version"`
+}
+
+// Config is the strict configuration model. V2 selections can be validated
+// before the runtime implements them.
 // Carriers are remote UDP entries; they are never local bind addresses.
 type Config struct {
+	Protocol  Protocol        `yaml:"protocol,omitempty"`
+	Wire      WireConfig      `yaml:"wire,omitempty"`
 	Carriers  []string        `yaml:"carriers,omitempty"`
 	Listen    string          `yaml:"listen,omitempty"`
 	FEC       FECConfig       `yaml:"fec"`
@@ -57,8 +82,37 @@ type TimerConfig struct {
 	HandshakeRetryInterval time.Duration `yaml:"handshake_retry_interval"`
 }
 
+// EffectiveProtocol preserves Datagram behavior for Go Config literals that
+// predate the Protocol field. It does not mutate the configuration.
+func (c Config) EffectiveProtocol() Protocol {
+	if c.Protocol == "" {
+		return ProtocolDatagram
+	}
+	return c.Protocol
+}
+
+// EffectiveWireVersion preserves v1 behavior for Go Config literals that
+// predate Wire.Version. Explicit empty YAML values are rejected by Parse.
+func (c Config) EffectiveWireVersion() WireVersion {
+	if c.Wire.Version == "" {
+		return WireVersionV1
+	}
+	return c.Wire.Version
+}
+
 // Validate checks Config without opening sockets or starting background work.
+// It checks recognized configurations, not runtime protocol availability.
 func (c Config) Validate() error {
+	protocol, version := c.EffectiveProtocol(), c.EffectiveWireVersion()
+	if protocol != ProtocolDatagram && protocol != ProtocolKCP {
+		return invalidf("protocol must be datagram or kcp")
+	}
+	if version != WireVersionV1 && version != WireVersionV2 {
+		return invalidf("wire.version must be v1 or v2")
+	}
+	if version == WireVersionV1 && protocol == ProtocolKCP {
+		return invalidf("protocol kcp requires wire.version v2")
+	}
 	if len(c.Carriers) == 0 && c.Listen == "" {
 		return invalidf("at least one of carriers or listen is required")
 	}
@@ -83,17 +137,23 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.FEC.DataShards <= 0 {
-		return invalidf("fec.data_shards must be greater than zero")
-	}
-	if c.FEC.ParityShards <= 0 {
-		return invalidf("fec.parity_shards must be greater than zero")
-	}
-	if c.FEC.DataShards > MaxTotalShards-c.FEC.ParityShards {
-		return invalidf("fec.data_shards + fec.parity_shards must not exceed %d", MaxTotalShards)
-	}
-	if _, err := reedsolomon.New(c.FEC.DataShards, c.FEC.ParityShards); err != nil {
-		return invalidf("fec parameters are unsupported by the selected Reed-Solomon codec: %v", err)
+	if protocol == ProtocolKCP {
+		if c.FEC.DataShards != 0 || c.FEC.ParityShards != 0 {
+			return invalidf("fec.data_shards and fec.parity_shards must be zero for protocol kcp")
+		}
+	} else {
+		if c.FEC.DataShards <= 0 {
+			return invalidf("fec.data_shards must be greater than zero")
+		}
+		if c.FEC.ParityShards <= 0 {
+			return invalidf("fec.parity_shards must be greater than zero")
+		}
+		if c.FEC.DataShards > MaxTotalShards-c.FEC.ParityShards {
+			return invalidf("fec.data_shards + fec.parity_shards must not exceed %d", MaxTotalShards)
+		}
+		if _, err := reedsolomon.New(c.FEC.DataShards, c.FEC.ParityShards); err != nil {
+			return invalidf("fec parameters are unsupported by the selected Reed-Solomon codec: %v", err)
+		}
 	}
 
 	if c.PSK.Len() == 0 {
@@ -103,7 +163,11 @@ func (c Config) Validate() error {
 		return invalidf("psk exceeds the maximum length of %d bytes", MaxPSKBytes)
 	}
 
-	if err := intRange("transport.max_udp_payload", c.Transport.MaxUDPPayload, MinMaxUDPPayload, MaxMaxUDPPayload); err != nil {
+	minPayload := MinMaxUDPPayload
+	if version == WireVersionV2 {
+		minPayload = MinV2MaxUDPPayload
+	}
+	if err := intRange("transport.max_udp_payload", c.Transport.MaxUDPPayload, minPayload, MaxMaxUDPPayload); err != nil {
 		return err
 	}
 	if err := intRange("limits.max_datagram_size", c.Limits.MaxDatagramSize, MinMaxDatagramSize, MaxMaxDatagramSize); err != nil {

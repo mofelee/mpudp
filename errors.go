@@ -10,6 +10,10 @@ var (
 	// ErrInvalidConfig classifies strict decoding and validation failures.
 	ErrInvalidConfig = config.ErrInvalidConfig
 
+	// ErrProtocolUnavailable means a valid configured protocol or wire version
+	// is not implemented by this runtime. Construction creates no runtime state.
+	ErrProtocolUnavailable = errors.New("MPUDP protocol unavailable")
+
 	// ErrMessageTooLarge means a Datagram exceeds the applicable upper limit.
 	ErrMessageTooLarge = errors.New("MPUDP message too large")
 

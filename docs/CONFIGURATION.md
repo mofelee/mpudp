@@ -1,4 +1,4 @@
-# MPUDP v0.1 配置参考
+# MPUDP 配置参考
 
 配置是单个 YAML 文档。解析器启用 `yaml.v3` 的 `KnownFields` 严格模式：未知字段、
 重复键、错误类型、额外 YAML 文档和数值溢出都返回
@@ -10,9 +10,12 @@
 内存。任何位置的显式 YAML `null`（包括 `~` 和空 mapping value）都是错误，不能借此
 把已提供但类型错误的字段伪装成“省略”；只有真正未出现的可选字段会应用默认值。
 
-Go 代码直接构造配置时应从 `cfg := config.Default()` 开始，再设置模式、FEC 和 PSK；
+Go 代码直接构造配置时应从 `cfg := config.Default()` 开始，再设置角色、FEC 和 PSK；
 `Config` 的零值不会在 `Validate`/`NewPeer` 中被静默改写为默认值。这样配置文件中的显式
-零和程序中的零具有同样的严格语义。
+数值零和程序中的数值零具有同样的严格语义。兼容旧版 Go struct literal 时，新增的
+`Protocol == ""` 和 `Wire.Version == ""` 分别按 `datagram` 和 `v1` 解释，原对象不被
+改写；`EffectiveProtocol()` 和 `EffectiveWireVersion()` 返回这两个有效选择。显式 YAML
+空字符串不适用这个兼容规则，会被拒绝。
 
 ## 运行模式
 
@@ -33,6 +36,26 @@ host 不能为空，也不能是 `0.0.0.0`/`::`；支持 DNS 名、IPv4 和带�
 配置中不存在 `peer.id` 或 `session_id`。这两个名称会作为未知字段被拒绝。SessionID
 由运行时使用 `crypto/rand.Reader` 生成 16 个字节，不绑定 UDP 五元组。
 
+## 协议与 wire 版本
+
+`protocol` 与上面的 initiator/listener/dual 角色独立，必须是字符串 `datagram` 或 `kcp`，
+省略时为 `datagram`。`wire.version` 必须是字符串 `v1` 或 `v2`，省略时为 `v1`。
+大小写变体、空字符串、数字、布尔值、错误容器、未知字段和显式 `null` 均被拒绝。
+`config.Default()` 显式设置 `ProtocolDatagram` 和 `WireVersionV1`。
+
+| 配置选择 | `Parse` / `Validate` | `NewPeer` / `NewPeerContext` |
+|---|---|---|
+| 省略新字段，或 `datagram` + `v1` | 按既有 FEC/资源规则验证 | 既有 v1 Datagram 运行时 |
+| `kcp` + 省略版本或 `v1` | `ErrInvalidConfig` | `ErrInvalidConfig` |
+| `datagram` + `v2` | 必须显式提供正数 k/r；UDP 上限至少 512 | `ErrProtocolUnavailable` |
+| `kcp` + `v2` | 省略 FEC 得到 0/0；显式非零或负数 FEC 无效；UDP 上限至少 512 | 合法配置返回 `ErrProtocolUnavailable` |
+
+当前增量只实现配置边界，尚未实现 v2 握手、数据面或 KCP Session。配置解析成功不表示
+该协议可运行。两个构造函数先验证配置，再拒绝尚未实现的 v2，且不访问运行时 context、
+随机源、socket 或 timer 依赖，也不启动 goroutine。不会静默回退到 v1。
+aggregation、repair、KCP tuning、mux 和其他计划中的 v2 配置字段仍是未知字段。
+下面的资源和时间字段仍按既有语法验证，不表示已实现 v2 的资源模型。
+
 ## 最小示例
 
 ```yaml
@@ -50,7 +73,7 @@ transport:
   max_udp_payload: 1200
 ```
 
-`fec.data_shards` 和 `fec.parity_shards` 都必须大于 0，总数不得超过 256。这个范围
+Datagram 的 `fec.data_shards` 和 `fec.parity_shards` 都必须大于 0，总数不得超过 256。这个范围
 选择 `github.com/klauspost/reedsolomon` 的标准 GF(2^8) profile；运行时按这组参数为
 每个方向创建 encoder/decoder。
 
@@ -82,7 +105,8 @@ artifact。
 
 | 字段 | 默认值 | 合法闭区间 | 归属 |
 |---|---:|---:|---|
-| `transport.max_udp_payload` | 1200 bytes | 72..65507 bytes | 完整 MPUDP UDP payload |
+| `transport.max_udp_payload`，v1 | 1200 bytes | 72..65507 bytes | 完整 MPUDP UDP payload |
+| `transport.max_udp_payload`，v2 配置 | 1200 bytes | 512..65507 bytes | 配置验证；v2 运行时尚不可用 |
 
 `max_udp_payload` 是 UDP header 之后的完整 MPUDP wire packet 上限，包括 MPUDP
 prefix、type-specific body、完整 32-byte HMAC tag 和 packet payload。它不是 IP MTU，

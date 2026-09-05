@@ -73,7 +73,8 @@ type Peer struct {
 
 // NewPeer validates cfg, binds the configured listener when present, and
 // starts one bounded runtime dispatcher. Invalid configuration has no socket,
-// goroutine, or timer side effects.
+// goroutine, or timer side effects. Recognized but unimplemented protocol
+// selections return ErrProtocolUnavailable with the same side-effect boundary.
 func NewPeer(cfg config.Config) (*Peer, error) {
 	return newPeerWithContextAndDependencies(context.Background(), cfg, cryptorand.Reader, defaultRuntimeDependencies())
 }
@@ -96,6 +97,9 @@ func newPeerWithDependencies(cfg config.Config, random io.Reader, deps runtimeDe
 func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config, random io.Reader, deps runtimeDependencies) (*Peer, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if cfg.EffectiveWireVersion() != config.WireVersionV1 {
+		return nil, ErrProtocolUnavailable
 	}
 	if parent == nil {
 		return nil, fmt.Errorf("%w: nil Peer context", ErrInvalidConfig)

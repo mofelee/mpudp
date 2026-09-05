@@ -17,6 +17,7 @@ const (
 const (
 	DefaultMaxUDPPayload = 1200
 	MinMaxUDPPayload     = 72
+	MinV2MaxUDPPayload   = 512
 	MaxMaxUDPPayload     = 65507
 )
 
@@ -67,10 +68,12 @@ const (
 )
 
 // Default returns a Config populated with every optional runtime default.
-// Callers constructing a Config in Go must still provide a mode, FEC values,
-// and a non-empty PSK before validation.
+// Callers must still provide a role, positive FEC values for Datagram, and a
+// non-empty PSK. KCP requires explicit v2 selection and zero FEC values.
 func Default() Config {
 	return Config{
+		Protocol: ProtocolDatagram,
+		Wire:     WireConfig{Version: WireVersionV1},
 		Transport: TransportConfig{
 			MaxUDPPayload: DefaultMaxUDPPayload,
 		},
