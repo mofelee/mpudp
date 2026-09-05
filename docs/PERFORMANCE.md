@@ -76,7 +76,9 @@ upload and the client for download. UDP is offered at 100 Mbit/s per path with
 shaper loss is expected at that offered load.
 
 The host collector samples CPU, memory, swap, softirq, pressure and UDP/TCP kernel
-counters every second. It captures link/qdisc/socket state before and after the
+counters every second. It also records bounded numeric CPU/RSS counters for QEMU,
+iperf3 and benchmark processes, keyed by PID and process start time; command lines
+are excluded. It captures link/qdisc/socket state before and after the
 load; `--diagnostics full` captures these expensive commands every sample and
 must be compared with the default `basic` mode. HTB classes are collected per
 interface. Hypervisor CPU summaries use tick-weighted deltas within the common
@@ -88,6 +90,51 @@ pressure, sampler gaps and per-path capacity together.
 The per-path 90 Mbit/s diagnostic flag is only a native-capacity screen. It does
 not freeze an encapsulation budget or certify the host, and every calibration
 summary explicitly has `product_acceptance: false`.
+
+## Counting And Capacity
+
+## Protocol Comparison Runner
+
+The [isolated probe](../integration/perf/README.md) implements native TCP/UDP,
+direct KCP, MPUDP Datagram and KCP-over-MPUDP. Build from a committed checkout,
+then pass a private file containing one raw PSK line (mode 0600):
+
+```bash
+go build -C integration/perf -trimpath \
+  -ldflags "-X main.sourceSHA=$(git rev-parse HEAD)" \
+  -o bin/perfprobe ./cmd/perfprobe
+python3 scripts/perf/run-probe.py \
+  --topology scripts/perf/topology.example.json \
+  --ssh-config /root/mpudp-test/.lab/ssh_config \
+  --binary integration/perf/bin/perfprobe --source-sha "$(git rev-parse HEAD)" \
+  --psk-file /private/mpudp-perf.psk \
+  --output integration/perf/artifacts/protocol-baseline
+```
+
+Add `--hypervisor-python` as needed, as for capacity calibration. Use `--plan`
+to produce the exact matrix without SSH or network load. The default matrix is
+696 cases, at least 61.9 hours of warmup and measurement alone. It covers five
+protocols, 1/2/3/5 candidate paths, both directions, 64/1200/1400/maximum messages
+and three independent rounds. Native protocols distinguish a single flow on one
+path from concurrent independent native paths. MPUDP single-flow cases use one
+Session over all selected Carriers. Add `--flows 1 2` for the separate multi-flow
+comparison and `--diagnostics off on` for instrumentation overhead comparisons;
+these increase the matrix size. A formal baseline must include those comparisons.
+
+For a deployment smoke test, select `--paths 5 --payloads 1400 --rounds 1
+--warmup 1 --seconds 5`. A smoke run only verifies the tool and traffic workflow.
+The runner records all resolved dimensions and never declares product acceptance.
+
+The runner deploys the exact hashed executable into a new private remote workspace
+and verifies the bytes on disk. It sends secret configuration through SSH stdin
+into mode-0600 files. Original services and configurations are preserved. Every
+case has bounded, individually owned systemd units, receiver-verified per-second
+records, both hosts' exchanged summaries, host samples and cleanup proof. Full
+host diagnostics are enabled by default; `--host-diagnostics basic` allows a
+collector overhead comparison. Optional `--profiles` stores local private
+profiles under each case's `.lab/profiles`, excluded from the shareable checksum
+manifest until separately inspected. The generated configuration matches the
+original 4096-entry delivery/receive queues and 8192 pending FEC block bound.
 
 ## Counting And Capacity
 

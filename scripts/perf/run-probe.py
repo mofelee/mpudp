@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Run the receiver-verified perfprobe matrix on the existing reference SSH lab.
+
+Build integration/perf/cmd/perfprobe with -X main.sourceSHA=<full source SHA>,
+then supply --binary, --source-sha, --topology, --ssh-config, --psk-file and
+--output. Defaults are 20s warmup, 300s steady state and three rounds.
+Profiles remain private under output/.lab and are excluded from SHA256SUMS.
+The default matrix has 696 cases and at least 61.9 hours of measurement windows,
+before setup, collection and cleanup. Use --plan to review the selected matrix;
+filter --protocols/--paths/--directions/--payloads for a bounded subset. Reduced
+windows are smoke tests and never satisfy the formal measurement gate.
+"""
+import argparse
+import concurrent.futures
+import datetime
+import hashlib
+import importlib.util
+import ipaddress
+import itertools
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("probe_calibrate", Path(__file__).with_name("calibrate.py"))
+calibrate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(calibrate)
+ROOT = Path(__file__).resolve().parents[2]
+PROTOCOLS = ("tcp", "udp", "kcp", "mpudp", "kcp-mpudp")
+MPUDP = ("mpudp", "kcp-mpudp")
+DATA_SHARD_OVERHEAD = 71  # v1: prefix 24 + metadata 15 + HMAC-SHA256 32.
+PROFILE_SUFFIXES = ("cpu", "allocs", "heap", "mutex", "block")
+REMOTE_PATH = "/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def read_secret(path):
+    if path is None:
+        raise ValueError("MPUDP protocols require --psk-file")
+    if path.stat().st_mode & 0o077:
+        raise ValueError("PSK file must not be accessible to group or other users")
+    value = path.read_text().removesuffix("\n").removesuffix("\r")
+    if not 1 <= len(value.encode()) <= 4096 or any(c in value for c in "\n\r\x00"):
+        raise ValueError("PSK file must contain one nonempty line, at most 4096 bytes")
+    return value
+
+
+def payload_size(label, protocol, args):
+    limit = min(args.max_datagram_size, args.data_shards * (args.udp_budget - DATA_SHARD_OVERHEAD))
+    if label == "max":
+        if protocol == "mpudp":
+            return limit
+        if protocol == "udp":
+            return args.physical_mtu - 28
+        return args.stream_max_payload
+    size = int(label)
+    if protocol == "mpudp" and size > limit:
+        raise ValueError("requested MPUDP payload exceeds negotiated v1 fixed budget")
+    if protocol == "udp" and size > args.physical_mtu - 28:
+        raise ValueError("requested UDP payload exceeds reference IPv4 path budget")
+    return size
+
+
+def matrix(args):
+    result = []
+    dimensions = itertools.product(args.protocols, args.paths, args.directions, args.payloads,
+                                   args.flows, args.diagnostics, range(1, args.rounds + 1))
+    for protocol, paths, direction, label, flows, diagnostics, round_number in dimensions:
+        layouts = ("mpudp",) if protocol in MPUDP else ("single", "parallel") if paths > 1 else ("single",)
+        for layout in layouts:
+            workers = paths if layout == "parallel" else 1
+            case = {"protocol": protocol, "candidate_paths": paths, "layout": layout,
+                    "active_paths": paths if protocol in MPUDP or layout == "parallel" else 1,
+                    "workers": workers, "flows_per_worker": flows, "total_flows": flows * workers,
+                    "single_flow": flows * workers == 1, "direction": direction,
+                    "payload_label": label, "message_bytes": payload_size(label, protocol, args),
+                    "verification_header_bytes": 40, "diagnostics": diagnostics == "on",
+                    "round": round_number, "seconds": args.seconds, "warmup_seconds": args.warmup,
+                    "formal_window": args.seconds >= 300 and args.warmup >= 20 and args.rounds >= 3,
+                    "product_acceptance": False}
+            case["case_id"] = (f"{protocol}-p{paths}-{layout}-{direction}-b{label}-f{flows}-"
+                               f"diag{diagnostics}-r{round_number}")
+            if case["message_bytes"] < 64 or case["message_bytes"] * flows > 64 * 1024 * 1024:
+                raise ValueError("message and flow sizes exceed probe memory bounds")
+            if protocol == "kcp-mpudp" and args.kcp_mtu > min(args.max_datagram_size, args.data_shards * (args.udp_budget - DATA_SHARD_OVERHEAD)):
+                raise ValueError("KCP MTU exceeds MPUDP negotiated Datagram budget")
+            result.append(case)
+    if len({c["case_id"] for c in result}) != len(result):
+        raise ValueError("matrix dimensions must not contain duplicates")
+    return result
+
+
+def mpudp_config(args, topology, case, side, secret):
+    cfg = {"psk": secret, "fec": {"data_shards": args.data_shards, "parity_shards": args.parity_shards},
+           "transport": {"max_udp_payload": args.udp_budget},
+           "limits": {"max_datagram_size": args.max_datagram_size,
+                      "max_pending_fec_blocks": args.pending_blocks,
+                      "receive_queue_capacity": args.queue_capacity,
+                      "delivery_queue_capacity": args.queue_capacity}}
+    if side == "client":
+        cfg["carriers"] = [f"{address}:{args.data_port}" for address in topology["server_addresses"][:case["candidate_paths"]]]
+    else:
+        cfg["listen"] = f"0.0.0.0:{args.data_port}"
+    return cfg
+
+
+def records(path):
+    with path.open() as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def unique_record(rows, kind):
+    selected = [row for row in rows if row.get("type") == kind]
+    if len(selected) != 1:
+        raise ValueError(f"expected exactly one {kind} record")
+    return selected[0]
+
+
+def verify_pair(client_path, server_path, case, worker_id, source_sha):
+    sides = {"client": records(client_path), "server": records(server_path)}
+    summaries = {}
+    receiver_side = "server" if case["direction"] == "upload" else "client"
+    for side, rows in sides.items():
+        metadata = unique_record(rows, "metadata")
+        summary = unique_record(rows, "summary")
+        if metadata.get("source_sha") != source_sha or metadata.get("side") != side:
+            raise ValueError("remote executable source SHA or side mismatch")
+        expected = {"run_id": worker_id, "protocol": case["protocol"], "direction": case["direction"],
+                    "flows": case["flows_per_worker"], "seconds": case["seconds"],
+                    "warmup_seconds": case["warmup_seconds"], "message_bytes": case["message_bytes"]}
+        if any(summary.get(k) != value or metadata.get("options", {}).get(k) != value for k, value in expected.items()):
+            raise ValueError("probe output does not match requested measurement")
+        role = "receiver" if side == receiver_side else "sender"
+        if summary.get("role") != role or summary.get("side") != side:
+            raise ValueError("sender accounting cannot substitute receiver evidence")
+        expected_paths = case["candidate_paths"] if case["protocol"] in MPUDP else 1
+        if metadata.get("path_count") != expected_paths or summary.get("path_count") != expected_paths:
+            raise ValueError("actual configured path count does not match matrix")
+        summaries[side] = summary
+    for side, opposite in (("client", "server"), ("server", "client")):
+        if unique_record(sides[side], "remote_summary").get("summary") != summaries[opposite]:
+            raise ValueError("exchanged remote summary differs from receiver/sender log")
+    receiver = summaries[receiver_side]
+    samples = [r for r in sides[receiver_side] if r.get("type") == "sample" and r.get("role") == "receiver"]
+    if len(samples) != case["seconds"] + case["warmup_seconds"]:
+        raise ValueError("receiver per-second evidence is incomplete")
+    for index, sample in enumerate(samples):
+        second = index + 1 - case["warmup_seconds"]
+        if sample.get("side") != receiver_side or sample.get("second") != second or sample.get("steady") is not (second > 0):
+            raise ValueError("receiver sample order or steady-state flag mismatch")
+        for field in ("verified_bytes", "verified_packets"):
+            if type(sample.get(field)) is not int or sample[field] < 0:
+                raise ValueError("invalid verified payload accounting")
+        if sample["verified_bytes"] != sample["verified_packets"] * (case["message_bytes"] - 40):
+            raise ValueError("verified bytes include headers or unverified payload")
+    steady = samples[case["warmup_seconds"]:]
+    verified = sum(r["verified_bytes"] for r in steady)
+    mbps = verified * 8 / case["seconds"] / 1e6
+    if receiver.get("verified_bytes") != verified or not isinstance(receiver.get("mbps"), (float, int)) or not math.isclose(receiver["mbps"], mbps, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError("receiver summary disagrees with per-second verified bytes")
+    if receiver.get("verified_packets") != sum(row["verified_packets"] for row in steady):
+        raise ValueError("receiver packet count disagrees with per-second evidence")
+    return {"worker_id": worker_id, "receiver_side": receiver_side, "receiver": receiver,
+            "sender": summaries["client" if receiver_side == "server" else "server"]}
+
+
+class ProbeRunner:
+    def __init__(self, args, topology, binary_digest, secret):
+        self.args, self.topology, self.binary_digest, self.secret = args, topology, binary_digest, secret
+        self.lab = calibrate.Lab(args, topology)
+        self.remote_dirs = {}
+        self.cleanup_verified = True
+        self.control_address = args.control_address
+
+    def remote(self, host, command, data=None, timeout=30):
+        result = subprocess.run(self.lab.ssh(host, command), input=data, capture_output=True, timeout=timeout)
+        if result.returncode:
+            # Commands can consume private configuration on stdin. Never echo it.
+            raise RuntimeError(f"remote command failed on {host}: status {result.returncode}")
+        return result.stdout
+
+    def python(self, host, script, *args, data=None, timeout=30):
+        return self.remote(host, [self.lab.python(host), "-c", script, *args], data, timeout)
+
+    def prepare(self):
+        self.lab.connect()
+        for host in (self.topology["client"], self.topology["server"]):
+            raw = self.python(host, "import tempfile; print(tempfile.mkdtemp(prefix='mpudp-perf-',dir='/tmp'))")
+            directory = raw.decode().strip()
+            if not re.fullmatch(r"/tmp/mpudp-perf-[a-zA-Z0-9_-]+", directory):
+                raise ValueError("remote workspace did not have expected private prefix")
+            self.remote_dirs[host] = directory
+            digest = self.python(host,
+                "import hashlib,os,sys; p=sys.argv[1]; b=sys.stdin.buffer.read(); "
+                "f=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o700); "
+                "s=os.fdopen(f,'wb'); s.write(b); s.close(); "
+                "f=open(p,'rb'); print(hashlib.file_digest(f,'sha256').hexdigest()); f.close()",
+                directory + "/perfprobe", data=self.args.binary.read_bytes(), timeout=60).decode().strip()
+            if digest != self.binary_digest:
+                raise ValueError("remote executable SHA256 differs from local binary")
+        if self.control_address is None:
+            output = calibrate.run(["ssh", "-F", str(self.args.ssh_config), "-G", self.topology["server"]])
+            hostnames = [line.split(maxsplit=1)[1] for line in output.splitlines() if line.startswith("hostname ")]
+            if len(hostnames) != 1:
+                raise ValueError("cannot resolve control address from SSH configuration")
+            self.control_address = str(ipaddress.IPv4Address(hostnames[0]))
+
+    def deploy_config(self, host, name, config):
+        path = self.remote_dirs[host] + "/" + name + ".json"
+        self.python(host, "import os,sys; f=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); "
+                    "s=os.fdopen(f,'wb'); s.write(sys.stdin.buffer.read()); s.close()", path,
+                    data=json.dumps(config).encode())
+        return path
+
+    def stop_unit(self, host, unit):
+        script = ("import json,subprocess,sys; u=sys.argv[1]; "
+                  "subprocess.run(['systemctl','stop',u],capture_output=True,timeout=15); "
+                  "r=subprocess.run(['systemctl','show',u,'-p','ActiveState','-p','MainPID'],capture_output=True,text=True,timeout=5); "
+                  "v=dict(x.split('=',1) for x in r.stdout.splitlines() if '=' in x); "
+                  "print(json.dumps({'state':v.get('ActiveState'),'main_pid':v.get('MainPID'),"
+                  "'stopped':r.returncode in (0,4) and v.get('ActiveState') in ('inactive','failed') and v.get('MainPID')=='0'}))")
+        try:
+            return {"host": host, "unit": unit, **json.loads(self.python(host, script, unit, timeout=25))}
+        except (OSError, RuntimeError, ValueError, TypeError, subprocess.TimeoutExpired) as error:
+            return {"host": host, "unit": unit, "stopped": False, "error": type(error).__name__}
+
+    def finish(self):
+        results = []
+        try:
+            for host, directory in self.remote_dirs.items():
+                removed = False
+                if self.cleanup_verified:
+                    try:
+                        self.python(host, "import shutil,sys; shutil.rmtree(sys.argv[1])", directory)
+                        removed = True
+                    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                        pass
+                results.append({"host": host, "workspace": directory, "removed": removed})
+            save(self.args.output / "workspace-cleanup.json", results)
+        finally:
+            self.lab.disconnect()
+        if any(not item["removed"] for item in results):
+            raise RuntimeError("remote workspace cleanup could not be verified")
+
+    def command(self, case, side, index, config_path, profile_prefix):
+        host = self.topology[side]
+        address_index = index if case["layout"] == "parallel" else 0
+        address = self.topology["server_addresses"][address_index]
+        command = [self.remote_dirs[host] + "/perfprobe", "-mode", side, "-protocol", case["protocol"],
+                   "-control", f"{self.control_address}:{self.args.control_port + index}",
+                   "-address", f"{address}:{self.args.data_port + index * 64}",
+                   "-id", case["case_id"] + f"-w{index}", "-direction", case["direction"],
+                   "-flows", case["flows_per_worker"], "-seconds", case["seconds"],
+                   "-warmup", case["warmup_seconds"], "-payload", case["message_bytes"],
+                   "-kcp-mtu", self.args.kcp_mtu, "-kcp-window", self.args.kcp_window,
+                   "-rate-mbps", self.args.rate_mbps]
+        if config_path:
+            command += ["-config", config_path]
+        if case["diagnostics"]:
+            command += ["-diagnostics"]
+        if self.args.ack_no_delay:
+            command += ["-ack-no-delay"]
+        if profile_prefix:
+            command += ["-profile-prefix", profile_prefix]
+        return command
+
+    def case(self, case):
+        output = self.args.output / case["case_id"]
+        output.mkdir(mode=0o700)
+        save(output / "case.json", case)
+        duration = case["warmup_seconds"] + case["seconds"] + 90
+        token = secrets.token_hex(8)
+        units, processes, handles, monitors, servers, clients, profiles, configs = [], [], [], [], [], [], [], []
+        hosts = [self.topology["client"], self.topology["server"], *self.topology["routers"], self.topology["hypervisor"]]
+
+        def start(host, label, command, name, data=None):
+            unit = f"mpudp-probe-{token}-{label}"
+            units.append((host, unit))
+            stdout = (output / (name + ".jsonl")).open("wb")
+            stderr = (output / (name + ".stderr")).open("wb")
+            handles.extend((stdout, stderr))
+            command = ["systemd-run", "--quiet", "--pipe", "--wait", "--collect", "--unit", unit,
+                       "--property", f"RuntimeMaxSec={duration + 15}", "--property", "KillMode=control-group",
+                       "--property", "TimeoutStopSec=3", "--setenv", "PATH=" + REMOTE_PATH, "--", *command]
+            process = subprocess.Popen(self.lab.ssh(host, command), stdout=stdout, stderr=stderr,
+                                       stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL)
+            processes.append(process)
+            if data is not None:
+                try:
+                    process.stdin.write(data)
+                finally:
+                    process.stdin.close()
+            return process
+
+        try:
+            required_ports = {self.args.control_port + i for i in range(case["workers"])}
+            required_ports.update(self.args.data_port + i * 64 + flow for i in range(case["workers"]) for flow in range(case["flows_per_worker"]))
+            for flag in ("-ltn", "-lun"):
+                occupied = calibrate.listening_endpoints(self.remote(self.topology["server"], ["ss", "-H", flag]).decode())
+                if any(int(endpoint.rsplit(":", 1)[1]) in required_ports for endpoint in occupied):
+                    raise RuntimeError("probe control or data port is already occupied")
+            for host in hosts:
+                name = "host-" + host
+                monitor = start(host, "sampler", [self.lab.python(host), "-", duration, self.args.host_diagnostics],
+                                name, Path(__file__).with_name("sample-host.py").read_bytes())
+                monitors.append(monitor)
+                until = time.monotonic() + 20
+                while True:
+                    with (output / (name + ".jsonl")).open("rb") as stream:
+                        first_line = stream.readline()
+                    if first_line.endswith(b"\n") and json.loads(first_line).get("kind") == "host":
+                        break
+                    if monitor.poll() is not None or time.monotonic() > until:
+                        raise RuntimeError("host sampler failed to become ready")
+                    time.sleep(.1)
+            for index in range(case["workers"]):
+                for side in ("server", "client"):
+                    host = self.topology[side]
+                    config_path = None
+                    if case["protocol"] in MPUDP:
+                        config_path = self.deploy_config(host, token + "-" + side,
+                                                        mpudp_config(self.args, self.topology, case, side, self.secret))
+                        configs.append((host, config_path))
+                    prefix = self.remote_dirs[host] + f"/{token}-{side}-{index}" if self.args.profiles else None
+                    if prefix:
+                        profiles.append((host, prefix, f"{side}-{index}"))
+                    command = self.command(case, side, index, config_path, prefix)
+                    if side == "server":
+                        server = start(host, f"server{index}", command, f"server-{index}")
+                        servers.append(server)
+                        until = time.monotonic() + 20
+                        while True:
+                            listening = calibrate.listening_endpoints(self.remote(host, ["ss", "-H", "-ltn"]).decode())
+                            if server.poll() is not None:
+                                raise RuntimeError("probe control listener exited during startup")
+                            if f"{self.control_address}:{self.args.control_port + index}" in listening:
+                                break
+                            if time.monotonic() > until:
+                                raise RuntimeError("probe control listener failed during startup")
+                            time.sleep(.1)
+                    else:
+                        clients.append((host, command, index))
+            # All listeners and samplers are ready before concurrent business load.
+            clients = [start(host, f"client{index}", command, f"client-{index}") for host, command, index in clients]
+            until = time.monotonic() + duration
+            for process in [*clients, *servers]:
+                if process.wait(timeout=max(1, until - time.monotonic())):
+                    raise RuntimeError("probe failed; see bounded per-process logs")
+            if any(monitor.poll() is not None for monitor in monitors):
+                raise RuntimeError("host sampler stopped before measurement completed")
+            time.sleep(1.1)
+        finally:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                cleanup = list(executor.map(lambda item: self.stop_unit(*item), units))
+            save(output / "cleanup.json", cleanup)
+            self.cleanup_verified = self.cleanup_verified and all(row["stopped"] for row in cleanup)
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for handle in handles:
+                handle.close()
+            if not self.cleanup_verified:
+                raise RuntimeError("owned remote process cleanup could not be verified")
+        pairs = [verify_pair(output / f"client-{i}.jsonl", output / f"server-{i}.jsonl", case,
+                             case["case_id"] + f"-w{i}", self.args.source_sha) for i in range(case["workers"])]
+        starts = [datetime.datetime.fromisoformat(pair["receiver"]["started_utc"].replace("Z", "+00:00")).timestamp() + case["warmup_seconds"] for pair in pairs]
+        start_ns, end_ns = int(max(starts) * 1e9), int((min(starts) + case["seconds"]) * 1e9)
+        if end_ns <= start_ns:
+            raise ValueError("native workers had no overlapping steady-state interval")
+        headroom = {host: calibrate.host_headroom(output / f"host-{host}.jsonl", start_ns, end_ns) for host in hosts}
+        if case["formal_window"] and any(row["sample_intervals"] < max(1, int((end_ns - start_ns) / 1e9) - 2) for row in headroom.values()):
+            raise ValueError("host steady-state sampling is incomplete")
+        for host, prefix, name in profiles:
+            (output / ".lab").mkdir(exist_ok=True, mode=0o700)
+            private = output / ".lab" / "profiles"
+            private.mkdir(exist_ok=True, mode=0o700)
+            for suffix in PROFILE_SUFFIXES:
+                data = self.python(host, "from pathlib import Path; import sys; p=Path(sys.argv[1]); "
+                                   "assert p.stat().st_size<=256*1024*1024; sys.stdout.buffer.write(p.read_bytes())",
+                                   prefix + "." + suffix + ".pprof", timeout=60)
+                path = private / (name + "." + suffix + ".pprof")
+                path.write_bytes(data)
+                path.chmod(0o600)
+                self.python(host, "from pathlib import Path; import sys; Path(sys.argv[1]).unlink()",
+                            prefix + "." + suffix + ".pprof")
+        for host, path in configs:
+            self.python(host, "from pathlib import Path; import sys; Path(sys.argv[1]).unlink()", path)
+        summary = {"case": case, "pairs": pairs, "aggregate_receiver_mbps": sum(p["receiver"]["mbps"] for p in pairs),
+                   "overlap_seconds": (end_ns - start_ns) / 1e9, "hosts": headroom, "product_acceptance": False}
+        save(output / "summary.json", summary)
+        print(json.dumps({"case_id": case["case_id"], "aggregate_receiver_mbps": summary["aggregate_receiver_mbps"],
+                          "single_flow": case["single_flow"], "product_acceptance": False}), flush=True)
+        return summary
+
+
+def checksums(output, secret):
+    rows = []
+    for path in sorted(output.rglob("*")):
+        if not path.is_file() or ".lab" in path.relative_to(output).parts or path.name == "SHA256SUMS":
+            continue
+        if secret:
+            needle, previous = secret.encode(), b""
+            with path.open("rb") as stream:
+                while block := stream.read(1024 * 1024):
+                    block = previous + block
+                    if needle in block:
+                        raise ValueError("private PSK detected in shareable artifacts")
+                    previous = block[-len(needle):]
+        rows.append(f"{sha256(path)}  {path.relative_to(output)}")
+    (output / "SHA256SUMS").write_text("\n".join(rows) + "\n")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--topology", type=Path, required=True)
+    parser.add_argument("--ssh-config", type=Path, required=True)
+    parser.add_argument("--hypervisor-python", default="python3")
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--binary-sha256")
+    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--psk-file", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--plan", action="store_true", help="write matrix and manifest without SSH or load")
+    parser.add_argument("--paths", type=int, nargs="+", choices=(1, 2, 3, 5), default=[1, 2, 3, 5])
+    parser.add_argument("--protocols", nargs="+", choices=PROTOCOLS, default=list(PROTOCOLS))
+    parser.add_argument("--directions", nargs="+", choices=("upload", "download"), default=["upload", "download"])
+    parser.add_argument("--payloads", nargs="+", choices=("64", "1200", "1400", "max"), default=["64", "1200", "1400", "max"])
+    parser.add_argument("--flows", type=int, nargs="+", default=[1])
+    parser.add_argument("--diagnostics", nargs="+", choices=("off", "on"), default=["off"])
+    parser.add_argument("--host-diagnostics", choices=("basic", "full"), default="full")
+    parser.add_argument("--profiles", action="store_true")
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--seconds", type=int, default=300)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--control-address")
+    parser.add_argument("--control-port", type=int, default=28900)
+    parser.add_argument("--data-port", type=int, default=29000)
+    parser.add_argument("--physical-mtu", type=int, default=1500)
+    parser.add_argument("--udp-budget", type=int, default=1200)
+    parser.add_argument("--data-shards", type=int, default=3)
+    parser.add_argument("--parity-shards", type=int, default=2)
+    parser.add_argument("--max-datagram-size", type=int, default=65536)
+    parser.add_argument("--stream-max-payload", type=int, default=65536)
+    parser.add_argument("--queue-capacity", type=int, default=4096)
+    parser.add_argument("--pending-blocks", type=int, default=8192)
+    parser.add_argument("--kcp-mtu", type=int, default=1400)
+    parser.add_argument("--kcp-window", type=int, default=1024)
+    parser.add_argument("--ack-no-delay", action="store_true")
+    parser.add_argument("--rate-mbps", type=float, default=0)
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha):
+        parser.error("--source-sha must be a full lowercase Git SHA")
+    if args.binary_sha256 and not re.fullmatch(r"[0-9a-f]{64}", args.binary_sha256):
+        parser.error("--binary-sha256 must be a lowercase SHA256")
+    if not 1 <= args.rounds <= 20 or not 1 <= args.seconds <= 3600 or not 0 <= args.warmup <= 300:
+        parser.error("rounds, seconds or warmup outside bounded range")
+    if not args.flows or any(not 1 <= flows <= 64 for flows in args.flows):
+        parser.error("each flow count must be 1..64")
+    if not 1 <= args.data_shards <= 255 or not 1 <= args.parity_shards <= 255 or args.data_shards + args.parity_shards > 256:
+        parser.error("FEC shard counts outside v1 range")
+    if not 92 <= args.physical_mtu <= 65535 or not 72 <= args.udp_budget <= args.physical_mtu - 28:
+        parser.error("UDP budget must fit the stated IPv4 physical MTU")
+    if not 64 <= args.max_datagram_size <= 16777216 or not 64 <= args.stream_max_payload <= 16777216 or not 1 <= args.queue_capacity <= 65536 or not 1 <= args.pending_blocks <= 65536:
+        parser.error("message size or queue capacity outside bounded range")
+    if not 64 <= args.kcp_mtu <= min(1500, args.physical_mtu - 28) or not 1 <= args.kcp_window <= 65536:
+        parser.error("KCP settings outside implementation/path bounds")
+    if not math.isfinite(args.rate_mbps) or not 0 <= args.rate_mbps <= 1000000:
+        parser.error("offered rate must be finite and within 0..1000000 Mbit/s")
+    control_ports = set(range(args.control_port, args.control_port + 5))
+    data_ports = set(range(args.data_port, args.data_port + 5 * 64))
+    if min(control_ports | data_ports) < 1024 or max(control_ports | data_ports) > 65535 or control_ports & data_ports:
+        parser.error("control and data ranges must be separate unprivileged ports")
+    if args.control_address:
+        args.control_address = str(ipaddress.IPv4Address(args.control_address))
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    topology = calibrate.topology(args.topology)
+    cases = matrix(args)
+    secret = read_secret(args.psk_file) if any(p in MPUDP for p in args.protocols) and not args.plan else None
+    digest = sha256(args.binary)
+    if args.binary_sha256 and digest != args.binary_sha256:
+        raise ValueError("local executable SHA256 differs from --binary-sha256")
+    args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    parameters = {key: value for key, value in vars(args).items() if not isinstance(value, Path) and key != "binary_sha256"}
+    save(args.output / "manifest.json", {"schema": 1, "kind": "receiver-verified-probe-matrix",
+        "source_sha": args.source_sha, "baseline_sha": calibrate.BASELINE_SHA, "binary_sha256": digest,
+        "run_id": args.output.name, "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "topology": topology, "parameters": parameters, "data_shard_overhead": DATA_SHARD_OVERHEAD,
+        "runner_source_sha": calibrate.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
+        "runner_dirty": bool(calibrate.run(["git", "-C", str(ROOT), "status", "--porcelain"])),
+        "runner_sha256": {path.name: sha256(path) for path in sorted(Path(__file__).parent.glob("*.py"))}})
+    save(args.output / "matrix.json", cases)
+    plan_summary = {"type": "plan_summary", "total_cases": len(cases),
+                    "minimum_wall_seconds": len(cases) * (args.warmup + args.seconds),
+                    "excludes_setup_collection_cleanup": True, "product_acceptance": False}
+    save(args.output / "plan-summary.json", plan_summary)
+    print(json.dumps(plan_summary), flush=True)
+    if args.plan:
+        checksums(args.output, secret)
+        return
+    runner = ProbeRunner(args, topology, digest, secret)
+    measured = False
+    try:
+        runner.prepare()
+        for case in cases:
+            runner.case(case)
+        measured = True
+    except BaseException as error:
+        save(args.output / "failure.json", {"error": type(error).__name__, "completed": False})
+        raise
+    finally:
+        try:
+            runner.finish()
+            if measured:
+                save(args.output / "completed.json", {"completed_cases": len(cases), "source_sha": args.source_sha,
+                     "binary_sha256": digest, "cleanup_verified": True, "product_acceptance": False})
+        except BaseException as error:
+            save(args.output / "failure.json", {"error": type(error).__name__, "completed": False})
+            raise
+        finally:
+            checksums(args.output, secret)
+
+
+if __name__ == "__main__":
+    def terminate(_signal, _frame):
+        raise KeyboardInterrupt("probe matrix terminated")
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        print(f"probe matrix failed: {type(error).__name__}: {error}", file=sys.stderr)
+        sys.exit(1)

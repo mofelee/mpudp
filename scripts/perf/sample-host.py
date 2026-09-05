@@ -22,6 +22,28 @@ def command(args):
         return {"error": type(error).__name__}
 
 
+def process_counters():
+    rows = []
+    for path in Path("/proc").glob("[0-9]*/stat"):
+        raw = read(path)
+        if raw is None:
+            continue
+        prefix, _, rest = raw.rpartition(")")
+        name = prefix.partition("(")[2]
+        if "qemu-system" not in name and name not in ("iperf3", "perfprobe", "labprobe"):
+            continue
+        fields = rest.split()
+        if len(fields) < 22:
+            continue
+        rows.append({"pid": int(path.parent.name), "comm": name,
+                     "user_ticks": int(fields[11]), "system_ticks": int(fields[12]),
+                     "threads": int(fields[17]), "start_ticks": int(fields[19]),
+                     "rss_pages": int(fields[21])})
+        if len(rows) == 1024:
+            break
+    return rows
+
+
 def sample(seconds, full):
     print(json.dumps({"kind": "host", "uname": command(["uname", "-a"]),
                       "cpu": command(["lscpu", "-J"]),
@@ -30,7 +52,7 @@ def sample(seconds, full):
     start = time.monotonic()
     for index in range(seconds + 1):
         record = {"kind": "sample", "index": index, "unix_ns": time.time_ns(),
-                  "elapsed": time.monotonic() - start}
+                  "elapsed": time.monotonic() - start, "processes": process_counters()}
         for name in ("stat", "meminfo", "vmstat", "softirqs", "net/snmp", "net/netstat",
                      "pressure/cpu", "pressure/memory", "pressure/io"):
             record[name] = read("/proc/" + name)
