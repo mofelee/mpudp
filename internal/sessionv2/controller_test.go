@@ -81,20 +81,29 @@ func newPairWithCreditLimits(t testing.TB, paths, bootstrap int, aggregate bool,
 	t.Helper()
 	p := profile(paths)
 	p.Epochs.GraceMS = grace
-	_, contract, err := negotiationv2.Select(negotiationv2.Advertisement{Profile: p, BootstrapPathID: uint16(bootstrap)}, p)
+	return newPairWithProfiles(t, p, p, bootstrap, aggregate, adjust)
+}
+
+func newPairWithProfiles(t testing.TB, client, server negotiationv2.Profile, bootstrap int, aggregate bool, adjust func(negotiationv2.Role, Config, *creditv2.Limits)) *pair {
+	t.Helper()
+	_, contract, err := negotiationv2.Select(negotiationv2.Advertisement{Profile: client, BootstrapPathID: uint16(bootstrap)}, server)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pair := &pair{now: time.Unix(1000, 0)}
 	for _, role := range []negotiationv2.Role{negotiationv2.Initiator, negotiationv2.Responder} {
 		e := &endpoint{now: &pair.now}
-		cfg := configFor(p, aggregate)
+		local, _, err := contract.Profiles(role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := configFor(local, aggregate)
 		binding := clientBinding(bootstrap)
 		if role == negotiationv2.Responder {
 			binding = opposite(binding, true)
 		}
 		cfg.BootstrapPath = &testPath{binding}
-		for i := 1; i <= paths; i++ {
+		for i := 1; i <= int(client.MaxPaths); i++ {
 			cfg.Carriers = append(cfg.Carriers, Carrier{Carrier: handshakev2.Carrier{PathID: uint16(i), Binding: clientBinding(i)}, Sender: &testPath{clientBinding(i)}})
 		}
 		cfg.Emit = func(sender transport.ReplyPath, data []byte) error {
@@ -211,7 +220,7 @@ func (p *pair) ready() bool {
 		if !e.controller.Snapshot().Ready || !e.controller.receiveAckSent {
 			return false
 		}
-		for _, path := range e.controller.paths {
+		for _, path := range e.controller.paths[:e.controller.setup.Contract.MaxPaths] {
 			if !path.active || path.sendEpoch != 2 || path.receiveEpoch != 2 {
 				return false
 			}
