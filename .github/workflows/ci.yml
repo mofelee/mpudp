@@ -54,6 +54,7 @@ jobs:
           go test ./internal/wirev2 -run '^$' -fuzz '^FuzzAuthenticatedHandshake$' -fuzztime 3s -timeout 1m -parallel 2
           go test ./internal/wirev2 -run '^$' -fuzz '^FuzzEstablishedBodies$' -fuzztime 3s -timeout 1m -parallel 2
           go test ./internal/wirev2 -run '^$' -fuzz '^FuzzFECBundle$' -fuzztime 3s -timeout 1m -parallel 2
+          go test ./internal/negotiationv2 -run '^$' -fuzz '^FuzzDecodeContractTLV$' -fuzztime 3s -timeout 1m -parallel 2
           go test ./internal/fecv2 -run '^$' -fuzz '^FuzzManifest$' -fuzztime 3s -timeout 1m -parallel 2
           go test ./internal/fecv2 -run '^$' -fuzz '^FuzzPrefixPacking$' -fuzztime 3s -timeout 1m -parallel 2
       - name: Verify independent v2 handshake vectors
