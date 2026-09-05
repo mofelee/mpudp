@@ -26,36 +26,36 @@ type rawWire struct {
 }
 
 type rawFEC struct {
-	DataShards   *yamlShardCount `yaml:"data_shards"`
-	ParityShards *yamlShardCount `yaml:"parity_shards"`
+	DataShards   *yamlInteger `yaml:"data_shards"`
+	ParityShards *yamlInteger `yaml:"parity_shards"`
 }
 
-type yamlShardCount int
+type yamlInteger int
 
-func (c *yamlShardCount) UnmarshalYAML(node *yaml.Node) error {
+func (c *yamlInteger) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.ScalarNode || node.Tag != "!!int" {
-		return fmt.Errorf("FEC shard count must be an integer")
+		return fmt.Errorf("numeric configuration value must be an integer")
 	}
 	var value int
 	if err := node.Decode(&value); err != nil {
-		return fmt.Errorf("FEC shard count exceeds the integer range")
+		return fmt.Errorf("numeric configuration value exceeds the integer range")
 	}
-	*c = yamlShardCount(value)
+	*c = yamlInteger(value)
 	return nil
 }
 
 type rawTransport struct {
-	MaxUDPPayload *int `yaml:"max_udp_payload"`
+	MaxUDPPayload *yamlInteger `yaml:"max_udp_payload"`
 }
 
 type rawLimits struct {
-	MaxDatagramSize        *int `yaml:"max_datagram_size"`
-	MaxPendingFECBlocks    *int `yaml:"max_pending_fec_blocks"`
-	ReceiveQueueCapacity   *int `yaml:"receive_queue_capacity"`
-	DeliveryQueueCapacity  *int `yaml:"delivery_queue_capacity"`
-	MaxSessions            *int `yaml:"max_sessions"`
-	MaxEndpointsPerSession *int `yaml:"max_endpoints_per_session"`
-	MaxHandshakeAttempts   *int `yaml:"max_handshake_attempts"`
+	MaxDatagramSize        *yamlInteger `yaml:"max_datagram_size"`
+	MaxPendingFECBlocks    *yamlInteger `yaml:"max_pending_fec_blocks"`
+	ReceiveQueueCapacity   *yamlInteger `yaml:"receive_queue_capacity"`
+	DeliveryQueueCapacity  *yamlInteger `yaml:"delivery_queue_capacity"`
+	MaxSessions            *yamlInteger `yaml:"max_sessions"`
+	MaxEndpointsPerSession *yamlInteger `yaml:"max_endpoints_per_session"`
+	MaxHandshakeAttempts   *yamlInteger `yaml:"max_handshake_attempts"`
 }
 
 type rawTimers struct {
@@ -172,28 +172,28 @@ func parseBytes(data []byte) (Config, error) {
 		}
 	}
 	if raw.Transport.MaxUDPPayload != nil {
-		cfg.Transport.MaxUDPPayload = *raw.Transport.MaxUDPPayload
+		cfg.Transport.MaxUDPPayload = int(*raw.Transport.MaxUDPPayload)
 	}
 	if raw.Limits.MaxDatagramSize != nil {
-		cfg.Limits.MaxDatagramSize = *raw.Limits.MaxDatagramSize
+		cfg.Limits.MaxDatagramSize = int(*raw.Limits.MaxDatagramSize)
 	}
 	if raw.Limits.MaxPendingFECBlocks != nil {
-		cfg.Limits.MaxPendingFECBlocks = *raw.Limits.MaxPendingFECBlocks
+		cfg.Limits.MaxPendingFECBlocks = int(*raw.Limits.MaxPendingFECBlocks)
 	}
 	if raw.Limits.ReceiveQueueCapacity != nil {
-		cfg.Limits.ReceiveQueueCapacity = *raw.Limits.ReceiveQueueCapacity
+		cfg.Limits.ReceiveQueueCapacity = int(*raw.Limits.ReceiveQueueCapacity)
 	}
 	if raw.Limits.DeliveryQueueCapacity != nil {
-		cfg.Limits.DeliveryQueueCapacity = *raw.Limits.DeliveryQueueCapacity
+		cfg.Limits.DeliveryQueueCapacity = int(*raw.Limits.DeliveryQueueCapacity)
 	}
 	if raw.Limits.MaxSessions != nil {
-		cfg.Limits.MaxSessions = *raw.Limits.MaxSessions
+		cfg.Limits.MaxSessions = int(*raw.Limits.MaxSessions)
 	}
 	if raw.Limits.MaxEndpointsPerSession != nil {
-		cfg.Limits.MaxEndpointsPerSession = *raw.Limits.MaxEndpointsPerSession
+		cfg.Limits.MaxEndpointsPerSession = int(*raw.Limits.MaxEndpointsPerSession)
 	}
 	if raw.Limits.MaxHandshakeAttempts != nil {
-		cfg.Limits.MaxHandshakeAttempts = *raw.Limits.MaxHandshakeAttempts
+		cfg.Limits.MaxHandshakeAttempts = int(*raw.Limits.MaxHandshakeAttempts)
 	}
 	if raw.Timers.DecodeTimeout != nil {
 		cfg.Timers.DecodeTimeout = raw.Timers.DecodeTimeout.Duration
