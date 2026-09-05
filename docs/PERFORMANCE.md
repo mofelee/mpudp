@@ -91,8 +91,6 @@ The per-path 90 Mbit/s diagnostic flag is only a native-capacity screen. It does
 not freeze an encapsulation budget or certify the host, and every calibration
 summary explicitly has `product_acceptance: false`.
 
-## Counting And Capacity
-
 ## Protocol Comparison Runner
 
 The [isolated probe](../integration/perf/README.md) implements native TCP/UDP,
