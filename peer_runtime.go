@@ -878,6 +878,10 @@ func (p *Peer) closeListener(ctx context.Context) error {
 }
 
 func (p *Peer) close() {
+	if p.v2 != nil {
+		p.v2.closePeer()
+		return
+	}
 	p.mu.Lock()
 	p.closed = true
 	publicListener := p.listener
