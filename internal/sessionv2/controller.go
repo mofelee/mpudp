@@ -422,6 +422,15 @@ func (c *Controller) Close() {
 	c.sendContext, c.receiveContext = wirev2.EncodingContext{}, wirev2.EncodingContext{}
 }
 
+// Completion reports send-fence progress without inspecting paths or deadlines.
+// The owner serializes access with other Controller operations. Values survive Close.
+func (c *Controller) Completion() (through, failedFrom uint64, sendError error) {
+	if c == nil {
+		return 0, 0, nil
+	}
+	return c.completed, c.failedFrom, c.sticky
+}
+
 func (c *Controller) Snapshot() Snapshot {
 	if c == nil {
 		return Snapshot{Closed: true}
