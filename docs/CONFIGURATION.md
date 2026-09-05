@@ -4,6 +4,9 @@
 重复键、错误类型、额外 YAML 文档和数值溢出都返回
 `config.ErrInvalidConfig`（它与 `mpudp.ErrInvalidConfig` 是同一个 sentinel）。省略可选
 字段会应用默认值；显式填写 `0` 不等同于省略，并会按对应范围严格校验。
+所有整数参数只接受 YAML integer，拒绝小数、浮点数（包括 `120.0`）、指数浮点表示、
+数字字符串和布尔值；不会将 `120.5` 静默截断为 `120`。合法整数的 YAML 十六进制、
+八进制、二进制和下划线分隔形式仍按整数解码，再校验对应字段范围。
 
 配置文件最大为 1 MiB（`config.MaxConfigBytes`）。`Parse` 在解析前检查 byte slice
 长度；`Decode` 最多读取 1 MiB + 1 byte 来判断超限，不会把任意大的文件无界读入
