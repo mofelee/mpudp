@@ -657,6 +657,11 @@ func (s *Session) execute(ctx context.Context, plans []sendPlan, cleanFailedProb
 }
 
 func (s *Session) operationContextWithCancel(ctx context.Context) (context.Context, context.CancelFunc) {
+	// Public packet writes have no caller cancellation or values to preserve.
+	// The shared lifetime already cancels every in-flight send on Session close.
+	if ctx == context.Background() {
+		return s.lifetime, func() {}
+	}
 	result, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(s.lifetime, cancel)
 	return result, func() {
