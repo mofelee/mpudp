@@ -13,6 +13,9 @@ evidence and fresh profiles of the remaining upload failure.
 The [negotiated-path comparison](v2-paths-20260905.md) removes the observed
 short-run upload stall and publishes matching profiles and local benchmarks;
 formal throughput and capacity acceptance remain open.
+The [allocation-cost comparison](v2-allocations-20260905.md) records reduced
+v2 sender allocations, mixed throughput changes and separate transport timing;
+it does not establish a causal throughput improvement.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.
