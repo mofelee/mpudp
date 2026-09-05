@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mofelee/mpudp/internal/creditv2"
 	"github.com/mofelee/mpudp/internal/handshakev2"
 	"github.com/mofelee/mpudp/internal/reassemblyv2"
 	"github.com/mofelee/mpudp/internal/sessionv2"
@@ -16,27 +17,34 @@ import (
 )
 
 type v2Session struct {
-	owner      *v2Peer
-	ctx        context.Context
-	cancel     context.CancelFunc
-	id         wirev2.SessionID
-	dial       handshakev2.DialID
-	inbound    bool
-	controller *sessionv2.Controller
-	carriers   []runtimeCarrier
-	paths      []sessionv2.Carrier
-	delivery   chan *reassemblyv2.Datagram
-	done       chan struct{}
-	changed    chan struct{}
-	closed     bool
-	draining   bool
-	closeErr   error
-	graceOnce  sync.Once
-	graceErr   error
+	owner        *v2Peer
+	ctx          context.Context
+	cancel       context.CancelFunc
+	id           wirev2.SessionID
+	dial         handshakev2.DialID
+	inbound      bool
+	controller   *sessionv2.Controller
+	carriers     []runtimeCarrier
+	paths        []sessionv2.Carrier
+	delivery     chan *reassemblyv2.Datagram
+	done         chan struct{}
+	changed      chan struct{}
+	closed       bool
+	draining     bool
+	closeErr     error
+	terminalErr  error
+	startupScope *creditv2.Session
+	startupLease *creditv2.Lease
+	graceOnce    sync.Once
+	graceErr     error
 }
 
 func (r *v2Peer) newWrapper(inbound bool) *v2Session {
-	ctx, cancel := context.WithCancel(r.peer.ctx)
+	parent := r.peer.ctx
+	if inbound {
+		parent = r.listener.ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
 	s := &v2Session{owner: r, ctx: ctx, cancel: cancel, inbound: inbound,
 		delivery: make(chan *reassemblyv2.Datagram, r.peer.config.Limits.DeliveryQueueCapacity),
 		done:     make(chan struct{}), changed: make(chan struct{})}
@@ -125,8 +133,9 @@ func (s *v2Session) waitFence(ctx context.Context, frontier uint64) error {
 		r := s.owner
 		r.mu.Lock()
 		if s.closed || s.controller == nil || s.ctx.Err() != nil {
+			err := errors.Join(ErrClosed, s.terminalErr)
 			r.mu.Unlock()
-			return ErrClosed
+			return err
 		}
 		snapshot := s.controller.Snapshot()
 		var failure error
@@ -143,9 +152,9 @@ func (s *v2Session) waitFence(ctx context.Context, frontier uint64) error {
 		case <-ctx.Done():
 			return errors.Join(ctx.Err(), failure)
 		case <-s.ctx.Done():
-			return ErrClosed
+			continue
 		case <-s.done:
-			return ErrClosed
+			continue
 		case <-changed:
 		}
 	}
@@ -204,6 +213,7 @@ func (s *v2Session) CloseGracefully(ctx context.Context) error {
 }
 
 func (s *v2Session) Close() error {
+	s.cancel()
 	r := s.owner
 	r.mu.Lock()
 	defer r.mu.Unlock()

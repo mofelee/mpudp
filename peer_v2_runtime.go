@@ -100,7 +100,7 @@ func (r *v2Peer) receive(event v2Ingress) {
 	if event.err != nil {
 		r.report("MPUDP v2 transport failed", event.err)
 		if !isRecoverableRuntimeTransportError(event.err) && event.target != nil {
-			r.closeSession(event.target)
+			r.failCarrier(event.target, event.socketID)
 		}
 		return
 	}
@@ -123,6 +123,9 @@ func (r *v2Peer) receive(event v2Ingress) {
 		return
 	}
 	header := envelope.Header()
+	if header.Type == wirev2.TypeHello && event.socketID != 1 {
+		return
+	}
 	if header.Type.IsHandshake() || header.Type == wirev2.TypeClose {
 		r.current = v2Bootstrap{binding: binding, path: packet.Reply, owner: event.target}
 		result, err := r.engine.Receive(time.Now(), binding, packet.Payload)
@@ -137,6 +140,31 @@ func (r *v2Peer) receive(event v2Ingress) {
 	}
 	result, err := s.controller.Receive(time.Now(), binding, packet.Reply, packet.Payload)
 	r.handleSession(s, result, err)
+}
+
+func (r *v2Peer) failCarrier(s *v2Session, socketID uint64) {
+	if s.closed {
+		return
+	}
+	for i, path := range s.paths {
+		if path.Binding.SocketID != socketID {
+			continue
+		}
+		_ = s.carriers[i].Close()
+		if s.controller != nil {
+			result, err := s.controller.FailPath(time.Now(), path.Binding)
+			r.handleSession(s, result, err)
+			return
+		}
+		for id, route := range r.routes {
+			if route.owner == s && route.binding.SocketID == socketID {
+				result, err := r.engine.CloseSession(time.Now(), id)
+				r.handleHandshake(result)
+				r.report("MPUDP v2 Carrier fallback failed", err)
+				return
+			}
+		}
+	}
 }
 
 func (r *v2Peer) closeSession(s *v2Session) {
@@ -169,6 +197,7 @@ func (r *v2Peer) dispose(s *v2Session) {
 	for len(s.delivery) > 0 {
 		(<-s.delivery).Release()
 	}
+	s.delivery = nil
 	var failures []error
 	for _, carrier := range s.carriers {
 		if err := carrier.Close(); err != nil {
@@ -180,6 +209,11 @@ func (r *v2Peer) dispose(s *v2Session) {
 		delete(r.sockets, path.Binding.SocketID)
 	}
 	s.carriers, s.paths = nil, nil
+	if s.startupScope != nil {
+		s.startupScope.Close()
+		s.startupLease.Release()
+		s.startupScope, s.startupLease = nil, nil
+	}
 	delete(r.sessions, s)
 	delete(r.established, s.id)
 	delete(r.dials, s.dial)
@@ -212,6 +246,7 @@ func (r *v2Peer) closeListener() error {
 		return nil
 	}
 	l.closed = true
+	l.cancel()
 	close(l.done)
 	var failures []error
 	for s := range r.sessions {
@@ -230,6 +265,7 @@ func (r *v2Peer) closeListener() error {
 	if r.peer.listenerSocket != nil {
 		failures = append(failures, r.peer.listenerSocket.Close())
 	}
+	l.accept = nil
 	l.closeErr = mapV2Error(errors.Join(failures...))
 	return l.closeErr
 }
@@ -257,10 +293,12 @@ func (r *v2Peer) closePeer() {
 	r.credits.Close()
 	clear(r.routes)
 	r.mu.Unlock()
+	r.constructing.Wait()
 	<-p.workerDone
 	for len(r.ingress) > 0 {
 		<-r.ingress
 	}
+	r.ingress = nil
 	p.closeErr = mapV2Error(errors.Join(failures...))
 	close(p.closeDone)
 }
@@ -285,8 +323,11 @@ func (r *v2Peer) string() string {
 
 type v2Listener struct {
 	owner    *v2Peer
+	ctx      context.Context
+	cancel   context.CancelFunc
 	accept   chan *v2Session
 	done     chan struct{}
+	changed  chan struct{}
 	closed   bool
 	closeErr error
 }
@@ -299,20 +340,14 @@ func (l *v2Listener) Accept(ctx context.Context) (Session, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		r := l.owner
+		r.mu.Lock()
+		if l.closed || r.closed || l.ctx.Err() != nil {
+			r.mu.Unlock()
+			return nil, ErrClosed
+		}
 		select {
-		case <-l.done:
-			return nil, ErrClosed
-		case <-l.owner.peer.ctx.Done():
-			return nil, ErrClosed
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		case s := <-l.accept:
-			r := l.owner
-			r.mu.Lock()
-			if l.closed || r.closed {
-				r.mu.Unlock()
-				return nil, ErrClosed
-			}
 			if s.closed {
 				r.mu.Unlock()
 				continue
@@ -323,11 +358,22 @@ func (l *v2Listener) Accept(ctx context.Context) (Session, error) {
 				return nil, mapV2Error(err)
 			}
 			return s, nil
+		default:
+		}
+		changed := l.changed
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-l.ctx.Done():
+			return nil, ErrClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }
 
 func (l *v2Listener) Close() error {
+	l.cancel()
 	l.owner.mu.Lock()
 	defer l.owner.mu.Unlock()
 	return l.owner.closeListener()

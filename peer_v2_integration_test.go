@@ -32,7 +32,11 @@ func v2LoopbackConfig(aggregation bool) config.Config {
 
 func v2LoopbackListener(t *testing.T, bind string, aggregation bool) (*Peer, Listener) {
 	t.Helper()
-	cfg := v2LoopbackConfig(aggregation)
+	return v2LoopbackListenerConfig(t, bind, v2LoopbackConfig(aggregation))
+}
+
+func v2LoopbackListenerConfig(t *testing.T, bind string, cfg config.Config) (*Peer, Listener) {
+	t.Helper()
 	host, _, err := net.SplitHostPort(bind)
 	if err != nil {
 		t.Fatal(err)

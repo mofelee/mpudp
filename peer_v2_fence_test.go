@@ -20,11 +20,21 @@ type v2Gate struct {
 	seen      atomic.Int64
 	failAfter atomic.Int64
 	failure   error
+	stall     atomic.Bool
+	started   chan struct{}
 }
 
 func (g *v2Gate) send(ctx context.Context, path transport.ReplyPath, packet []byte) error {
 	if len(packet) > 5 && wirev2.PacketType(packet[5]) == wirev2.TypeFECBundle {
 		count := g.seen.Add(1)
+		if g.stall.Load() {
+			select {
+			case g.started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
 		if threshold := g.failAfter.Load(); threshold >= 0 && count > threshold {
 			return g.failure
 		}
@@ -198,5 +208,43 @@ func TestV2CloseCancelsPendingFlushAndReleasesStorage(t *testing.T) {
 	}
 	if usage := client.v2.credits.Snapshot(); usage.Bytes != 0 || usage.Reservations != 0 || usage.SessionSlots != 0 {
 		t.Fatalf("Close retained owned storage: %+v", usage)
+	}
+}
+
+func TestV2CloseInterruptsSocketAttempt(t *testing.T) {
+	gate := &v2Gate{started: make(chan struct{}, 1)}
+	gate.failAfter.Store(-1)
+	client, sender, _ := v2FencePair(t, gate, config.DefaultPathRateBPS)
+	gate.stall.Store(true)
+	if err := sender.WritePacket([]byte("stalled")); err != nil {
+		t.Fatal(err)
+	}
+	flushed := make(chan error, 1)
+	go func() { flushed <- sender.Flush(context.Background()) }()
+	select {
+	case <-gate.started:
+	case <-time.After(time.Second):
+		t.Fatal("socket attempt did not start")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- sender.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt the socket attempt")
+	}
+	select {
+	case err := <-flushed:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("interrupted Flush = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupted Flush did not exit")
+	}
+	if usage := client.v2.credits.Snapshot(); usage.Bytes != 0 || usage.SessionSlots != 0 {
+		t.Fatalf("socket interruption retained state: %+v", usage)
 	}
 }

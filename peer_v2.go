@@ -41,21 +41,22 @@ type v2Bootstrap struct {
 // The mutex serializes the socket-free engines, admission and public fences.
 // Socket callbacks only enqueue; they never acquire this mutex.
 type v2Peer struct {
-	mu          sync.Mutex
-	peer        *Peer
-	credits     *creditv2.Peer
-	creditLimit creditv2.Limits
-	engine      *handshakev2.Engine
-	ingress     chan v2Ingress
-	listener    *v2Listener
-	sessions    map[*v2Session]struct{}
-	established map[wirev2.SessionID]*v2Session
-	dials       map[handshakev2.DialID]*v2Session
-	routes      map[wirev2.SessionID]v2Bootstrap
-	sockets     map[uint64]*v2Session
-	nextSocket  uint64
-	current     v2Bootstrap
-	closed      bool
+	mu           sync.Mutex
+	peer         *Peer
+	credits      *creditv2.Peer
+	creditLimit  creditv2.Limits
+	engine       *handshakev2.Engine
+	ingress      chan v2Ingress
+	listener     *v2Listener
+	sessions     map[*v2Session]struct{}
+	established  map[wirev2.SessionID]*v2Session
+	dials        map[handshakev2.DialID]*v2Session
+	routes       map[wirev2.SessionID]v2Bootstrap
+	sockets      map[uint64]*v2Session
+	nextSocket   uint64
+	constructing sync.WaitGroup
+	current      v2Bootstrap
+	closed       bool
 }
 
 func newV2Peer(parent context.Context, cfg config.Config, random io.Reader, deps runtimeDependencies) (*Peer, error) {
@@ -111,7 +112,9 @@ func newV2Peer(parent context.Context, cfg config.Config, random io.Reader, deps
 			return nil, err
 		}
 		engineConfig.Listener = &policy
-		r.listener = &v2Listener{owner: r, accept: make(chan *v2Session, cfg.Limits.MaxPendingAccepts), done: make(chan struct{})}
+		listenerContext, listenerCancel := context.WithCancel(ctx)
+		r.listener = &v2Listener{owner: r, ctx: listenerContext, cancel: listenerCancel,
+			accept: make(chan *v2Session, cfg.Limits.MaxPendingAccepts), done: make(chan struct{}), changed: make(chan struct{})}
 	}
 	r.engine, err = handshakev2.New(cfg.PSK.Bytes(), engineConfig)
 	if err != nil {
@@ -163,16 +166,18 @@ func (r *v2Peer) policy(responder bool) (handshakev2.Policy, error) {
 
 func (r *v2Peer) newSession() (Session, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed || r.peer.ctx.Err() != nil {
+		r.mu.Unlock()
 		return nil, ErrClosed
 	}
 	cfg := r.peer.config
 	if !cfg.InitiatorEnabled() {
+		r.mu.Unlock()
 		return nil, ErrModeUnavailable
 	}
 	policy, err := r.policy(false)
 	if err != nil {
+		r.mu.Unlock()
 		return nil, err
 	}
 	bytes := policy.Receive.Bytes + handshakev2.PacketReservationBytes
@@ -182,24 +187,38 @@ func (r *v2Peer) newSession() (Session, error) {
 	usage := r.credits.Snapshot()
 	if usage.SessionSlots >= r.creditLimit.MaxSessions || usage.PendingHandshakes >= r.creditLimit.MaxPendingHandshakes ||
 		usage.Bytes+bytes > r.creditLimit.MaxPeerBytes || bytes > r.creditLimit.MaxSessionBytes || usage.Reservations+len(policy.Initial)+2 > r.creditLimit.MaxReservations {
+		r.mu.Unlock()
 		return nil, ErrResourceLimit
 	}
-	// Construction holds the admission mutex through BeginDial, so its checked
-	// initial obligation cannot be spent by another operation while sockets open.
+	if uint64(len(cfg.Carriers)) > math.MaxUint64-r.nextSocket {
+		r.mu.Unlock()
+		return nil, ErrResourceLimit
+	}
+	// Reserve the entire construction obligation while sockets open outside
+	// the dispatcher lock. BeginDial replaces this reservation under the lock.
+	scope, lease, err := r.credits.BeginHandshake(creditv2.Claim{Bytes: bytes})
+	if err != nil {
+		r.mu.Unlock()
+		return nil, mapV2Error(err)
+	}
 	s := r.newWrapper(false)
+	s.startupScope, s.startupLease = scope, lease
+	firstSocket := r.nextSocket + 1
+	r.nextSocket += uint64(len(cfg.Carriers))
+	r.constructing.Add(1)
+	r.mu.Unlock()
 	failed := true
 	defer func() {
+		r.mu.Lock()
 		if failed {
 			r.dispose(s)
 		}
+		r.mu.Unlock()
+		r.constructing.Done()
 	}()
 	carriers := make([]handshakev2.Carrier, 0, len(cfg.Carriers))
 	for index, remote := range cfg.Carriers {
-		if r.nextSocket == math.MaxUint64 {
-			return nil, ErrResourceLimit
-		}
-		r.nextSocket++
-		socketID := r.nextSocket
+		socketID := firstSocket + uint64(index)
 		openContext, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 		carrier, err := r.peer.deps.openCarrier(openContext, fmt.Sprintf("carrier-%d", index), remote, transport.CarrierOptions{
 			MaxPayload: cfg.Transport.MaxUDPPayload, MaxReceivePayload: cfg.Transport.MaxReceiveUDPPayload,
@@ -213,29 +232,48 @@ func (r *v2Peer) newSession() (Session, error) {
 		if err != nil {
 			return nil, mapV2Error(err)
 		}
+		r.mu.Lock()
+		if s.closed || r.closed || s.ctx.Err() != nil {
+			r.mu.Unlock()
+			_ = carrier.Close()
+			return nil, ErrClosed
+		}
 		s.carriers = append(s.carriers, carrier)
 		sender, ok := carrier.(transport.ReplyPath)
 		if !ok {
+			r.mu.Unlock()
 			return nil, classifyRuntimeError(ErrInvalidConfig, transport.ErrInvalidArgument)
 		}
 		binding, err := v2Binding(socketID, sender.LocalAddr(), sender.RemoteAddr())
 		if err != nil {
+			r.mu.Unlock()
 			return nil, err
 		}
 		path := handshakev2.Carrier{PathID: uint16(index + 1), Binding: binding}
 		s.paths = append(s.paths, sessionv2.Carrier{Carrier: path, Sender: sender})
 		r.sockets[socketID] = s
+		r.mu.Unlock()
 		carriers = append(carriers, path)
 	}
+	r.mu.Lock()
+	if s.closed || r.closed || s.ctx.Err() != nil {
+		r.mu.Unlock()
+		return nil, ErrClosed
+	}
+	s.startupScope.Close()
+	s.startupLease.Release()
+	s.startupScope, s.startupLease = nil, nil
 	id, result, err := r.engine.BeginDial(time.Now(), handshakev2.DialRequest{Policy: policy, Carriers: carriers})
 	if err != nil {
 		r.handleHandshake(result)
+		r.mu.Unlock()
 		return nil, mapV2Error(err)
 	}
 	s.dial = id
 	r.dials[id] = s
 	r.handleHandshake(result)
 	failed = false
+	r.mu.Unlock()
 	r.peer.wakeDriver()
 	return s, nil
 }
@@ -259,10 +297,14 @@ func v2Binding(socketID uint64, local, remote net.Addr) (handshakev2.Binding, er
 }
 
 func (r *v2Peer) emit(path transport.ReplyPath, packet []byte) error {
+	return r.emitContext(r.peer.ctx, path, packet)
+}
+
+func (r *v2Peer) emitContext(parent context.Context, path transport.ReplyPath, packet []byte) error {
 	if path == nil {
 		return ErrNoAvailablePaths
 	}
-	ctx, cancel := context.WithTimeout(r.peer.ctx, v2SocketAttemptTimeout)
+	ctx, cancel := context.WithTimeout(parent, v2SocketAttemptTimeout)
 	defer cancel()
 	return path.Send(ctx, packet)
 }
@@ -294,6 +336,12 @@ func (r *v2Peer) emitBootstrap(binding handshakev2.Binding, packet []byte) error
 	if route.path == nil || route.binding != binding {
 		return ErrNoAvailablePaths
 	}
+	if route.owner != nil && header.Type != wirev2.TypeClose {
+		return r.emitContext(route.owner.ctx, route.path, packet)
+	}
+	if binding.SocketID == 1 && r.listener != nil && header.Type != wirev2.TypeClose {
+		return r.emitContext(r.listener.ctx, route.path, packet)
+	}
 	return r.emit(route.path, packet)
 }
 
@@ -301,7 +349,7 @@ func (r *v2Peer) install(setup handshakev2.Setup) (func(), error) {
 	responder := setup.Role == negotiationv2.Responder
 	var s *v2Session
 	if responder {
-		if r.listener == nil || r.listener.closed {
+		if r.listener == nil || r.listener.closed || r.listener.ctx.Err() != nil {
 			return nil, ErrClosed
 		}
 		s = r.newWrapper(true)
@@ -324,7 +372,10 @@ func (r *v2Peer) install(setup handshakev2.Setup) (func(), error) {
 	if err != nil {
 		return failedInstall, err
 	}
-	cfg.BootstrapPath, cfg.Carriers, cfg.Entropy, cfg.Emit = route.path, s.paths, r.peer.random, r.emit
+	cfg.BootstrapPath, cfg.Carriers, cfg.Entropy = route.path, s.paths, r.peer.random
+	cfg.Emit = func(path transport.ReplyPath, packet []byte) error {
+		return r.emitContext(s.ctx, path, packet)
+	}
 	controller, err := sessionv2.New(setup, cfg)
 	if err != nil {
 		return failedInstall, err
@@ -337,6 +388,11 @@ func (r *v2Peer) install(setup handshakev2.Setup) (func(), error) {
 func (r *v2Peer) handleHandshake(result handshakev2.Result) {
 	for _, attempt := range result.Sends {
 		r.report("MPUDP v2 handshake send failed", attempt.Err)
+		if attempt.Type == wirev2.TypeHello && attempt.Err != nil && !isRecoverableRuntimeTransportError(attempt.Err) {
+			if route, ok := r.routes[attempt.ID]; ok && route.owner != nil {
+				r.failCarrier(route.owner, route.binding.SocketID)
+			}
+		}
 	}
 	for _, setup := range result.Established {
 		s := r.established[setup.ID]
@@ -348,6 +404,8 @@ func (r *v2Peer) handleHandshake(result handshakev2.Result) {
 		if s.inbound && !s.closed {
 			select {
 			case r.listener.accept <- s:
+				close(r.listener.changed)
+				r.listener.changed = make(chan struct{})
 			default:
 				r.closeSession(s)
 			}
@@ -393,7 +451,8 @@ func (r *v2Peer) handleSession(s *v2Session, result sessionv2.Result, err error)
 	}
 	r.report("MPUDP v2 Session operation failed", err)
 	s.notify()
-	if errors.Is(err, sessionv2.ErrExpired) || errors.Is(err, sessionv2.ErrExhausted) || errors.Is(err, sessionv2.ErrEntropy) {
+	if errors.Is(err, sessionv2.ErrExpired) || errors.Is(err, sessionv2.ErrExhausted) || errors.Is(err, sessionv2.ErrEntropy) || errors.Is(err, transport.ErrNoAvailablePaths) {
+		s.terminalErr = mapV2Error(err)
 		r.closeSession(s)
 	}
 }
