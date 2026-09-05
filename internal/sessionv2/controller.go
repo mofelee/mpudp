@@ -30,6 +30,7 @@ type Controller struct {
 	sendContext, receiveContext    wirev2.EncodingContext
 	receiveCodec                   *fecv2.Codec
 	context                        controlRetry
+	contextPath                    uint16
 	contextAcknowledged            bool
 	receiveAckSent                 bool
 	out                            *aggregationv2.Output
@@ -92,7 +93,7 @@ func requiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	n := uint64(cfg.LocalProfile.DataShards) + uint64(cfg.LocalProfile.ParityShards)
 	// Bounded controller/path records include exact retained control frames.
 	// The two codec profiles additionally reserve a conservative matrix budget.
-	stateBytes := uint64(unsafe.Sizeof(Controller{})) + uint64(cfg.LocalProfile.MaxPaths)*uint64(unsafe.Sizeof(pathState{})) + 16*n*n
+	stateBytes := uint64(unsafe.Sizeof(Controller{})) + uint64(cfg.LocalProfile.MaxPaths)*uint64(unsafe.Sizeof(pathState{})) + 16*n*n + 512*n + 16384
 	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes}}, nil
 }
 
@@ -136,7 +137,7 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 			}
 		}
 	}
-	c := &Controller{setup: setup, cfg: cfg, remote: remote, accepting: true, sendContext: context, groups: make(map[uint64]*pendingGroup)}
+	c := &Controller{setup: setup, cfg: cfg, remote: remote, accepting: true, sendContext: context, contextPath: setup.PathID, groups: make(map[uint64]*pendingGroup)}
 	c.sendKey, c.receiveKey = setup.Keys.ClientToServer, setup.Keys.ServerToClient
 	if setup.Role == negotiationv2.Responder {
 		c.sendKey, c.receiveKey = c.receiveKey, c.sendKey
@@ -261,6 +262,9 @@ func (c *Controller) Write(now time.Time, payload []byte) (receipt Receipt, resu
 		return 0, result, ErrClosed
 	}
 	if !c.ready() {
+		if c.contextAcknowledged && !c.pendingPathWork() {
+			return 0, result, transport.ErrNoAvailablePaths
+		}
 		return 0, result, ErrNotReady
 	}
 	id, err := c.queue.Admit(payload, now)
@@ -305,6 +309,56 @@ func (c *Controller) Advance(now time.Time) (result Result, err error) {
 		c.retryGroups(now, &result)
 		err = c.drive(now, &result)
 	}
+	return result, err
+}
+
+// FailPath retires authority for one trusted local transport failure. It never
+// learns a tuple from a packet, releases admitted originals, or closes another
+// Carrier. The runtime must pass the failed immutable socket/tuple binding.
+func (c *Controller) FailPath(now time.Time, binding handshakev2.Binding) (result Result, err error) {
+	if err = c.enter(now); err != nil {
+		return result, err
+	}
+	defer c.leave(&result)
+	if !validBinding(binding) {
+		return result, ErrInvalid
+	}
+	contextPathFailed := false
+	for i := range c.paths {
+		p := &c.paths[i]
+		if p.active && p.binding == binding {
+			p.active, p.sender = false, nil
+			p.budget, p.replies = controlRetry{}, [2]controlFrame{}
+			result.PathsChanged = true
+			contextPathFailed = contextPathFailed || p.id == c.contextPath
+		}
+		if p.join.binding == binding {
+			p.join = pathJoin{}
+		}
+		for j := range p.old {
+			if p.old[j].binding == binding {
+				p.old[j] = oldRoute{}
+			}
+		}
+	}
+	if contextPathFailed && !c.contextAcknowledged {
+		c.contextPath = 0
+		for i := range c.paths {
+			if c.eligible(&c.paths[i]) {
+				if err = c.startEncoding(&c.paths[i], now); err != nil {
+					return result, err
+				}
+				break
+			}
+		}
+		if c.contextPath == 0 && !c.pendingPathWork() {
+			return result, transport.ErrNoAvailablePaths
+		}
+	}
+	if c.contextAcknowledged && !c.ready() && !c.pendingPathWork() {
+		return result, transport.ErrNoAvailablePaths
+	}
+	err = c.drive(now, &result)
 	return result, err
 }
 
@@ -370,8 +424,10 @@ func (c *Controller) Snapshot() Snapshot {
 
 func (c *Controller) drive(now time.Time, result *Result) error {
 	c.driveControl(now, result)
-	if c.contextAcknowledged && !c.ready() && (c.out != nil || c.accepted > c.completed) {
-		return transport.ErrNoAvailablePaths
+	if c.contextAcknowledged && !c.ready() {
+		if !c.pendingPathWork() {
+			return transport.ErrNoAvailablePaths
+		}
 	}
 	if !c.ready() || now.Before(c.retryStorage) {
 		return nil
@@ -382,6 +438,16 @@ func (c *Controller) drive(now time.Time, result *Result) error {
 		return nil
 	}
 	return err
+}
+
+func (c *Controller) pendingPathWork() bool {
+	for i := range c.paths {
+		p := &c.paths[i]
+		if (p.join.pending && !p.join.committed) || (p.active && p.budget.pending) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) Receive(now time.Time, binding handshakev2.Binding, reply transport.ReplyPath, packet []byte) (result Result, err error) {

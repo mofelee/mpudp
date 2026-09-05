@@ -332,15 +332,25 @@ func (c *Controller) receiveBudget(p *pathState, now time.Time, message wirev2.E
 		return ErrProtocol
 	}
 	p.sendBudget, p.sendEpoch, p.budget.pending = budget, 2, false
-	if p.id == c.setup.PathID && !c.context.pending && !c.contextAcknowledged {
-		packet, err := wirev2.AppendEncodingContext(nil, c.setup.ID, p.route(), c.sendContext, c.sendKey)
-		if err != nil {
-			return err
-		}
-		c.context = controlRetry{pending: true, next: now, deadline: now.Add(ControlLifetime)}
-		return c.context.frame.set(packet)
+	if (p.id == c.contextPath || c.contextPath == 0) && !c.contextAcknowledged {
+		return c.startEncoding(p, now)
 	}
 	return nil
+}
+
+func (c *Controller) startEncoding(p *pathState, now time.Time) error {
+	if c.context.pending && !now.Before(c.context.deadline) {
+		return ErrExpired
+	}
+	packet, err := wirev2.AppendEncodingContext(nil, c.setup.ID, p.route(), c.sendContext, c.sendKey)
+	if err != nil {
+		return err
+	}
+	if !c.context.pending {
+		c.context = controlRetry{pending: true, deadline: now.Add(ControlLifetime)}
+	}
+	c.contextPath, c.context.next = p.id, now
+	return c.context.frame.set(packet)
 }
 
 func (c *Controller) receiveEncoding(p *pathState, now time.Time, envelope wirev2.AuthenticatedEnvelope) error {
@@ -429,6 +439,15 @@ func (c *Controller) sendRetry(p *pathState, retry *controlRetry, sender transpo
 }
 
 func (c *Controller) driveControl(now time.Time, result *Result) {
+	if c.context.pending && c.context.sends > 0 && !now.Before(c.context.next) && now.Before(c.context.deadline) {
+		for offset := 0; offset < len(c.paths); offset++ {
+			p := &c.paths[(int(c.contextPath)+offset)%len(c.paths)]
+			if c.eligible(p) {
+				_ = c.startEncoding(p, now)
+				break
+			}
+		}
+	}
 	for offset := 0; offset < len(c.paths) && len(result.Sends) < MaxSendsPerStep; offset++ {
 		p := &c.paths[(c.controlCursor+offset)%len(c.paths)]
 		if p.join.pending {
@@ -448,7 +467,7 @@ func (c *Controller) driveControl(now time.Time, result *Result) {
 			}
 		}
 		c.sendRetry(p, &p.budget, p.sender, p.binding, now, result, false)
-		if p.id == c.setup.PathID {
+		if p.id == c.contextPath {
 			c.sendRetry(p, &c.context, p.sender, p.binding, now, result, false)
 		}
 	}
@@ -477,6 +496,9 @@ func (c *Controller) expireControl(now time.Time) error {
 				p.old[j] = oldRoute{}
 			}
 		}
+	}
+	if c.contextPath == 0 && !c.contextAcknowledged && !c.pendingPathWork() {
+		return transport.ErrNoAvailablePaths
 	}
 	return nil
 }
@@ -510,7 +532,7 @@ func (c *Controller) NextDeadline() time.Time {
 			include(p.join.deadline)
 		}
 		retry(p, &p.budget, ControlSends)
-		if p.id == c.setup.PathID {
+		if p.id == c.contextPath {
 			retry(p, &c.context, ControlSends)
 		}
 		for _, frame := range p.replies {
@@ -527,6 +549,9 @@ func (c *Controller) NextDeadline() time.Time {
 		if group.fragments != nil {
 			include(later(c.last, c.retryStorage))
 		}
+	}
+	if c.context.pending {
+		include(c.context.deadline)
 	}
 	if c.originals != nil {
 		include(c.originals.NextDeadline())
