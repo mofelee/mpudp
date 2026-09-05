@@ -34,12 +34,6 @@ func (c *Controller) receiveLookup(epoch uint32) (wirev2.EncodingContext, bool) 
 func (c *Controller) driveData(now time.Time, result *Result) error {
 	for len(result.Sends) < MaxSendsPerStep {
 		if c.out == nil {
-			output, err := c.queue.Seal(now, c.forced > c.completed)
-			if err != nil || output == nil {
-				return err
-			}
-			c.out, c.outNext = output, 0
-			view, _ := output.View()
 			var active [256]uint16
 			count := 0
 			for i := range c.paths {
@@ -51,6 +45,12 @@ func (c *Controller) driveData(now time.Time, result *Result) error {
 			if count == 0 {
 				return ErrNotReady
 			}
+			output, err := c.queue.Seal(now, c.forced > c.completed)
+			if err != nil || output == nil {
+				return err
+			}
+			c.out, c.outNext = output, 0
+			view, _ := output.View()
 			for i := range view.Group.Shards {
 				c.outPaths[i] = active[(int(view.GroupID%uint64(count))+i)%count]
 			}
@@ -166,7 +166,9 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 			return ErrProtocol
 		}
 		if group.fragments != nil {
-			c.admitOriginals(record.GroupID, group, now, result)
+			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
+				return err
+			}
 			continue
 		}
 		if previous := group.shards[record.ShardIndex]; previous != nil {
@@ -188,37 +190,43 @@ func (c *Controller) receiveBundle(now time.Time, envelope wirev2.AuthenticatedE
 				clear(shard)
 			}
 			group.shards, group.fragments = nil, fragments
-			c.admitOriginals(record.GroupID, group, now, result)
+			if err := c.admitOriginals(record.GroupID, group, now, result); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (c *Controller) admitOriginals(id uint64, group *pendingGroup, now time.Time, result *Result) {
+func (c *Controller) admitOriginals(id uint64, group *pendingGroup, now time.Time, result *Result) error {
 	deliveries, err := c.originals.AddGroup(now, group.fragments)
 	if err != nil {
 		if errors.Is(err, creditv2.ErrResourceLimit) {
 			c.retryStorage = now.Add(time.Millisecond)
-			return
+			return nil
 		}
 		c.groupWindow.Finish(id, recvwindow.Expired)
 		c.releaseGroup(id, group)
-		return
+		return err
 	}
 	result.Deliveries = append(result.Deliveries, deliveries...)
 	c.groupWindow.Finish(id, recvwindow.Completed)
 	c.releaseGroup(id, group)
+	return nil
 }
 
-func (c *Controller) retryGroups(now time.Time, result *Result) {
+func (c *Controller) retryGroups(now time.Time, result *Result) error {
 	if now.Before(c.retryStorage) {
-		return
+		return nil
 	}
 	for id, group := range c.groups {
 		if group.fragments != nil {
-			c.admitOriginals(id, group, now, result)
+			if err := c.admitOriginals(id, group, now, result); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func (c *Controller) releaseGroup(id uint64, group *pendingGroup) {

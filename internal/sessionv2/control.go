@@ -332,7 +332,7 @@ func (c *Controller) receiveBudget(p *pathState, now time.Time, message wirev2.E
 		return ErrProtocol
 	}
 	p.sendBudget, p.sendEpoch, p.budget.pending = budget, 2, false
-	if (p.id == c.contextPath || c.contextPath == 0) && !c.contextAcknowledged {
+	if !c.contextAcknowledged && (!c.context.pending || p.id == c.contextPath || c.contextPath == 0) {
 		return c.startEncoding(p, now)
 	}
 	return nil
@@ -486,14 +486,24 @@ func (c *Controller) expireControl(now time.Time) error {
 			p.join = pathJoin{}
 		}
 		if p.budget.pending && !now.Before(p.budget.deadline) {
-			if p.id == c.setup.PathID {
-				return ErrExpired
-			}
 			p.active, p.budget.pending = false, false
+			if p.id == c.contextPath && !c.contextAcknowledged {
+				c.contextPath = 0
+			}
 		}
 		for j := range p.old {
 			if !now.Before(p.old[j].until) {
 				p.old[j] = oldRoute{}
+			}
+		}
+	}
+	if c.contextPath == 0 && !c.contextAcknowledged {
+		for i := range c.paths {
+			if c.eligible(&c.paths[i]) {
+				if err := c.startEncoding(&c.paths[i], now); err != nil {
+					return err
+				}
+				break
 			}
 		}
 	}

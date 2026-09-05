@@ -306,8 +306,10 @@ func (c *Controller) Advance(now time.Time) (result Result, err error) {
 	c.expireGroups(now)
 	_, err = c.originals.Expire(now)
 	if err == nil {
-		c.retryGroups(now, &result)
-		err = c.drive(now, &result)
+		err = c.retryGroups(now, &result)
+		if err == nil {
+			err = c.drive(now, &result)
+		}
 	}
 	return result, err
 }

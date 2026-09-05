@@ -184,3 +184,30 @@ func TestFailedCarrierPreservesOtherPathAndAdmittedOriginal(t *testing.T) {
 	}
 	p.close(t)
 }
+
+func TestBootstrapFailureDuringJoinKeepsOriginalPathID(t *testing.T) {
+	p := newPair(t, 2, 1, false, 5000)
+	failed := p.client.controller.paths[0].binding
+	result, err := p.client.controller.FailPath(p.now, failed)
+	if err != nil || !result.PathsChanged || p.client.controller.NextDeadline().IsZero() {
+		t.Fatalf("pending sibling join was abandoned: %+v %v", result, err)
+	}
+	p.drop = func(toServer bool, pk packet) bool {
+		if toServer {
+			return pk.binding.SocketID == failed.SocketID
+		}
+		return pk.binding.Remote == failed.Local
+	}
+	p.pump(t, func() bool {
+		return p.client.controller.ready() && p.server.controller.ready() && p.client.controller.receiveAckSent && p.server.controller.receiveAckSent
+	})
+	if p.client.controller.setup.PathID != 1 || p.client.controller.contextPath != 2 || p.client.controller.paths[0].active {
+		t.Fatal("context fallback renumbered bootstrap or reactivated failed Carrier")
+	}
+	receipt, _, err := p.client.controller.Write(p.now, []byte("joined after local failure"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.pump(t, func() bool { return p.client.controller.completed == uint64(receipt) && len(p.server.deliveries) == 1 })
+	p.close(t)
+}
