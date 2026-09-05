@@ -68,6 +68,7 @@ type pathState struct {
 	oldBudget                 uint16
 	oldEpoch                  uint32
 	oldUntil                  time.Time
+	budgetPeerDeadline        time.Time
 	old                       [8]oldRoute
 	join                      pathJoin
 	budget                    controlRetry
@@ -156,7 +157,7 @@ func (c *Controller) Join(now time.Time, carrier Carrier) (result Result, err er
 func (c *Controller) commitPath(p *pathState, now time.Time, result *Result) error {
 	if p.active {
 		slot := -1
-		for i := 0; i < int(c.cfg.LocalProfile.Epochs.MaxOldEpochs); i++ {
+		for i := 0; i < int(c.setup.Contract.Epochs.MaxOldEpochs); i++ {
 			if !now.Before(p.old[i].until) {
 				slot = i
 				break
@@ -165,11 +166,12 @@ func (c *Controller) commitPath(p *pathState, now time.Time, result *Result) err
 		if slot < 0 {
 			return ErrNotReady
 		}
-		p.old[slot] = oldRoute{binding: p.binding, sender: p.sender, generation: p.generation, epoch: p.receiveEpoch, budget: p.receiveBudget, until: now.Add(time.Duration(c.cfg.LocalProfile.Epochs.GraceMS) * time.Millisecond)}
+		p.old[slot] = oldRoute{binding: p.binding, sender: p.sender, generation: p.generation, epoch: p.receiveEpoch, budget: p.receiveBudget, until: now.Add(time.Duration(c.setup.Contract.Epochs.GraceMS) * time.Millisecond)}
 	}
 	p.active, p.generation, p.binding, p.sender = true, p.join.generation, p.join.binding, p.join.sender
 	p.sendBudget, p.receiveBudget, p.sendEpoch, p.receiveEpoch = 512, 512, 1, 1
 	p.oldBudget, p.oldEpoch, p.oldUntil = 0, 0, time.Time{}
+	p.budgetPeerDeadline = time.Time{}
 	p.budget, p.replies = controlRetry{}, [2]controlFrame{}
 	p.join.committed = true
 	result.PathsChanged = true
@@ -261,6 +263,22 @@ func (c *Controller) sendDirection() byte {
 	return 1
 }
 
+// Static publication retries retain their original control deadline even when
+// receive-only DATA grace is shorter than the250ms retry interval.
+func (c *Controller) allowBudgetRetry(p *pathState, binding handshakev2.Binding, message wirev2.Established, now time.Time) bool {
+	if !p.active || p.binding != binding || p.generation != message.Route.Generation || message.Route.BudgetEpoch != 1 || len(message.Body) != 8 {
+		return false
+	}
+	body := message.Body
+	if message.Header.Type == wirev2.TypePathBudgetUpdate {
+		return now.Before(p.budgetPeerDeadline) && body[0] == c.sendDirection()^1 && body[1] == 0 && binary.BigEndian.Uint16(body[2:4]) == p.receiveBudget && binary.BigEndian.Uint32(body[4:]) == 2
+	}
+	if message.Header.Type == wirev2.TypePathBudgetAck && p.budget.pending && now.Before(p.budget.deadline) {
+		return bytes.Equal(body, p.budget.frame.packet[wirev2.PrefixSize+wirev2.RouteSize:p.budget.frame.length-wirev2.AuthenticationTagSize])
+	}
+	return false
+}
+
 func (c *Controller) startBudget(p *pathState, now time.Time) error {
 	var body [8]byte
 	body[0] = c.sendDirection()
@@ -298,7 +316,8 @@ func (c *Controller) receiveBudget(p *pathState, now time.Time, message wirev2.E
 			}
 		} else {
 			p.oldBudget, p.oldEpoch = p.receiveBudget, p.receiveEpoch
-			p.oldUntil = now.Add(time.Duration(c.cfg.LocalProfile.Epochs.GraceMS) * time.Millisecond)
+			p.oldUntil = now.Add(time.Duration(c.setup.Contract.Epochs.GraceMS) * time.Millisecond)
+			p.budgetPeerDeadline = now.Add(ControlLifetime)
 			p.receiveBudget, p.receiveEpoch = budget, 2
 		}
 		return c.queueReply(p, 0, wirev2.TypePathBudgetAck, body)

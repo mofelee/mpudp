@@ -85,7 +85,9 @@ func New(p Parameters) (*Codec, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
-	rs, err := reedsolomon.New(p.DataShards, p.ParityShards)
+	// Runtime contexts are long-lived; missing-shard patterns must not create
+	// an unbounded retained inversion cache or independent codec worker pool.
+	rs, err := reedsolomon.New(p.DataShards, p.ParityShards, reedsolomon.WithInversionCache(false), reedsolomon.WithMaxGoroutines(1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: Reed-Solomon parameters: %v", ErrInvalid, err)
 	}

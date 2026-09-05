@@ -346,6 +346,12 @@ func (c *Controller) Close() {
 	c.sendKey, c.receiveKey = wirev2.Key{}, wirev2.Key{}
 	c.groupWindowLease.Release()
 	c.controlLease.Release()
+	c.groupWindowLease, c.controlLease = nil, nil
+	c.queue, c.originals, c.groupWindow = nil, nil, nil
+	c.cfg = Config{}
+	c.setup = handshakev2.Setup{}
+	c.remote = negotiationv2.Profile{}
+	c.sendContext, c.receiveContext = wirev2.EncodingContext{}, wirev2.EncodingContext{}
 }
 
 func (c *Controller) Snapshot() Snapshot {
@@ -364,6 +370,9 @@ func (c *Controller) Snapshot() Snapshot {
 
 func (c *Controller) drive(now time.Time, result *Result) error {
 	c.driveControl(now, result)
+	if c.contextAcknowledged && !c.ready() && (c.out != nil || c.accepted > c.completed) {
+		return transport.ErrNoAvailablePaths
+	}
 	if !c.ready() || now.Before(c.retryStorage) {
 		return nil
 	}
@@ -409,6 +418,9 @@ func (c *Controller) Receive(now time.Time, binding handshakev2.Binding, reply t
 		err = c.receiveJoin(p, now, binding, reply, message, &result)
 	} else {
 		budget, restricted, ok := c.validRoute(p, binding, message.Route, now)
+		if !ok && c.allowBudgetRetry(p, binding, message, now) {
+			budget, restricted, ok = 512, true, true
+		}
 		if !ok || len(packet) > int(budget) {
 			return result, nil
 		}
