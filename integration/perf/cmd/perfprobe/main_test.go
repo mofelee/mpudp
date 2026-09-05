@@ -135,6 +135,7 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 					KCPMTU: 1400, KCPWindow: 1024, RateMbps: 1, Control: availableAddress(t, "tcp"), Address: availableAddress(t, "udp")}
 				client := o
 				client.Mode = "client"
+				client.Diagnostics = protocol == "kcp" || protocol == "kcp-mpudp"
 				if protocol == "mpudp" || protocol == "kcp-mpudp" {
 					dir := t.TempDir()
 					o.Config, client.Config = filepath.Join(dir, "server.yaml"), filepath.Join(dir, "client.yaml")
@@ -182,6 +183,19 @@ func TestProtocolMatrixRoundTrip(t *testing.T) {
 				}
 				if receiver.EchoRTT.Scheduled != uint64(client.Seconds*5*client.Flows) {
 					t.Fatalf("lost scheduled probe opportunities: %+v", receiver.EchoRTT)
+				}
+				if client.Diagnostics {
+					if len(receiver.Final.KCPCorrelation) != client.Flows {
+						t.Fatal("missing KCP diagnostic flow snapshots")
+					}
+					for _, trace := range receiver.Final.KCPCorrelation {
+						if trace.PacketCorrelationAvailable != (protocol == "kcp-mpudp") {
+							t.Fatal("incorrect packet correlation boundary")
+						}
+						if protocol == "kcp-mpudp" && (trace.InboundPushSegments == 0 || trace.OutboundACKSegments == 0 || trace.MatchedACKs == 0) {
+							t.Fatalf("missing actual KCP/MPUDP header observations: %+v", trace)
+						}
+					}
 				}
 			})
 		}

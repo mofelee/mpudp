@@ -79,14 +79,15 @@ type processStats struct {
 }
 
 type telemetry struct {
-	At                       time.Time         `json:"at_utc"`
-	Process                  processStats      `json:"process"`
-	MPUDP                    any               `json:"mpudp,omitempty"`
-	MPUDPStatisticsAvailable bool              `json:"mpudp_statistics_available"`
-	KCP                      *kcp.Snmp         `json:"kcp_snmp,omitempty"`
-	KCPTimeoutRetransmits    uint64            `json:"kcp_timeout_retransmits"`
-	KCPSessions              []kcpSessionStats `json:"kcp_sessions,omitempty"`
-	AdapterWriteDrops        uint64            `json:"adapter_write_drops"`
+	At                       time.Time             `json:"at_utc"`
+	Process                  processStats          `json:"process"`
+	MPUDP                    any                   `json:"mpudp,omitempty"`
+	MPUDPStatisticsAvailable bool                  `json:"mpudp_statistics_available"`
+	KCP                      *kcp.Snmp             `json:"kcp_snmp,omitempty"`
+	KCPTimeoutRetransmits    uint64                `json:"kcp_timeout_retransmits"`
+	KCPSessions              []kcpSessionStats     `json:"kcp_sessions,omitempty"`
+	KCPCorrelation           []kcpCorrelationStats `json:"kcp_correlation,omitempty"`
+	AdapterWriteDrops        uint64                `json:"adapter_write_drops"`
 }
 
 func (t *transports) telemetry() telemetry {
@@ -118,6 +119,11 @@ func (t *transports) telemetry() telemetry {
 	}
 	for _, p := range t.adapters {
 		v.AdapterWriteDrops += p.drops.Load()
+	}
+	for i, trace := range t.kcpTraces {
+		if trace != nil {
+			v.KCPCorrelation = append(v.KCPCorrelation, trace.snapshot(i))
+		}
 	}
 	return v
 }

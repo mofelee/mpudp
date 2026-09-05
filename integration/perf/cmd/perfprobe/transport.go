@@ -23,10 +23,17 @@ type messageConn interface {
 	Close() error
 }
 
-type framedStream struct{ net.Conn }
+type framedStream struct {
+	net.Conn
+	trace *kcpTrace
+}
 
 func (c framedStream) Read(b []byte) (int, error) { return io.ReadFull(c.Conn, b) }
 func (c framedStream) Write(b []byte) (int, error) {
+	if c.trace != nil {
+		started := time.Now()
+		defer func() { c.trace.applicationWrite(time.Since(started)) }()
+	}
 	total := 0
 	for total < len(b) {
 		n, err := c.Conn.Write(b[total:])
@@ -99,6 +106,7 @@ func (c *udpConn) Write(b []byte) (int, error) {
 type packetConn struct {
 	s     mpudp.Session
 	drops atomic.Uint64
+	trace *kcpTrace
 }
 
 var virtualRemote = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
@@ -111,10 +119,23 @@ func (p *packetConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if len(d) > len(b) {
 		return 0, virtualRemote, io.ErrShortBuffer
 	}
+	if p.trace != nil {
+		p.trace.incoming(d, time.Now())
+	}
 	return copy(b, d), virtualRemote, nil
 }
 func (p *packetConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	if err := p.s.WritePacket(b); err != nil {
+	var started time.Time
+	var writeID uint64
+	if p.trace != nil {
+		started = time.Now()
+		writeID = p.trace.outgoing(b, started)
+	}
+	err := p.s.WritePacket(b)
+	if p.trace != nil {
+		p.trace.returned(b, writeID, started, time.Now(), err)
+	}
+	if err != nil {
 		if recoverableSend(err) {
 			p.drops.Add(1)
 			return len(b), nil
@@ -138,6 +159,7 @@ type transports struct {
 	conns          []messageConn
 	peer           *mpudp.Peer
 	kcp            []*kcp.UDPSession
+	kcpTraces      []*kcpTrace
 	adapters       []*packetConn
 	listener       io.Closer
 	sockets        []io.Closer
@@ -192,7 +214,7 @@ func openTransports(o options) (*transports, error) {
 	return t, nil
 }
 
-func (t *transports) addKCP(c *kcp.UDPSession, o options) (messageConn, error) {
+func (t *transports) addKCP(c *kcp.UDPSession, o options, trace *kcpTrace) (messageConn, error) {
 	c.SetStreamMode(true)
 	c.SetWindowSize(o.KCPWindow, o.KCPWindow)
 	if !c.SetMtu(o.KCPMTU) {
@@ -201,8 +223,12 @@ func (t *transports) addKCP(c *kcp.UDPSession, o options) (messageConn, error) {
 	}
 	c.SetNoDelay(1, 10, 2, 1)
 	c.SetACKNoDelay(o.ACKNoDelay)
+	if o.Diagnostics && trace == nil {
+		trace = newKCPTrace(false)
+	}
 	t.kcp = append(t.kcp, c)
-	return framedStream{c}, nil
+	t.kcpTraces = append(t.kcpTraces, trace)
+	return framedStream{Conn: c, trace: trace}, nil
 }
 
 func (t *transports) wrapSession(s mpudp.Session, o options) (messageConn, error) {
@@ -210,13 +236,16 @@ func (t *transports) wrapSession(s mpudp.Session, o options) (messageConn, error
 		return datagramConn{s}, nil
 	}
 	p := &packetConn{s: s}
+	if o.Diagnostics {
+		p.trace = newKCPTrace(true)
+	}
 	c, err := kcp.NewConn4(42, virtualRemote, nil, 0, 0, true, p)
 	if err != nil {
 		_ = s.Close()
 		return nil, err
 	}
 	t.adapters = append(t.adapters, p)
-	return t.addKCP(c, o)
+	return t.addKCP(c, o, p.trace)
 }
 
 func flowAddress(address string, index int) (string, error) {
@@ -245,7 +274,7 @@ func (t *transports) listen(o options) (func(int) (messageConn, error), error) {
 			if err != nil {
 				return nil, err
 			}
-			return framedStream{c}, nil
+			return framedStream{Conn: c}, nil
 		}, nil
 	case "kcp":
 		a, err := net.ResolveUDPAddr("udp", o.Address)
@@ -271,7 +300,7 @@ func (t *transports) listen(o options) (func(int) (messageConn, error), error) {
 			if err != nil {
 				return nil, err
 			}
-			return t.addKCP(c, o)
+			return t.addKCP(c, o, nil)
 		}, nil
 	case "udp":
 		for i := 0; i < o.Flows; i++ {
@@ -322,7 +351,7 @@ func (t *transports) dial(o options, index int) (messageConn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return framedStream{c}, nil
+		return framedStream{Conn: c}, nil
 	case "udp", "kcp":
 		address := o.Address
 		if o.Protocol == "udp" {
@@ -364,7 +393,7 @@ func (t *transports) dial(o options, index int) (messageConn, error) {
 			_ = p.Close()
 			return nil, err
 		}
-		return t.addKCP(c, o)
+		return t.addKCP(c, o, nil)
 	default:
 		s, err := t.peer.NewSession()
 		if err != nil {

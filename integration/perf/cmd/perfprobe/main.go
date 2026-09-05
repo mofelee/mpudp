@@ -63,7 +63,7 @@ func flags() options {
 	flag.IntVar(&o.KCPMTU, "kcp-mtu", 1400, "KCP complete UDP payload or MPUDP Datagram budget")
 	flag.IntVar(&o.KCPWindow, "kcp-window", 1024, "KCP send and receive window")
 	flag.BoolVar(&o.ACKNoDelay, "ack-no-delay", false, "KCP immediate ACKs")
-	flag.BoolVar(&o.Diagnostics, "diagnostics", false, "optional MPUDP timing and length histograms")
+	flag.BoolVar(&o.Diagnostics, "diagnostics", false, "optional MPUDP histograms and bounded KCP correlation")
 	flag.StringVar(&o.ProfilePrefix, "profile-prefix", "", "opt-in local private CPU/alloc/heap/mutex/block profile prefix")
 	flag.Float64Var(&o.RateMbps, "rate-mbps", 0, "application message offered Mbit/s per flow; zero unlimited")
 	flag.Parse()
@@ -131,7 +131,7 @@ func controlWrite(c net.Conn, v controlMessage) error {
 	}
 	h := make([]byte, 4)
 	binary.BigEndian.PutUint32(h, uint32(len(b)))
-	_, err = (framedStream{c}).Write(append(h, b...))
+	_, err = (framedStream{Conn: c}).Write(append(h, b...))
 	return err
 }
 

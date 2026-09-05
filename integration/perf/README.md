@@ -91,7 +91,38 @@ socket/qdisc drops require the external harness and additional diagnostic
 evidence; retransmit causes must not be inferred from a single counter.
 
 `-diagnostics` enables optional MPUDP timing and packet-size histograms on both
-hosts. `-profile-prefix /private/run/profile` enables CPU, alloc, heap, mutex, and
+hosts, plus optional probe-side KCP diagnostics. Per-flow `kcp_correlation`
+snapshots contain application write duration for both KCP stacks. For
+KCP-over-MPUDP they also validate concatenated 24-byte KCP headers at the existing
+Datagram adapter, recording PUSH/ACK/header-byte counts and matching ACK `(sn,ts)`
+to at most four attempts in each of 1,024 fixed sequence slots. Only counters and
+fixed histograms are exported; payload and identifiers are never exported.
+Duplicate ACKs, ambiguous timestamps, unmatched ACKs, and slot/attempt evictions
+remain explicit. An attempt eviction or recreation of an older evicted sequence
+marks that sequence's history incomplete; subsequent ACKs cannot contribute an
+exact timing match, even if the retained timestamps appear unique. They increment
+`incomplete_history_acks`. Timing buckets are <=1us, <=2us, ... <=8388608us, then overflow.
+
+`adapter_call` ends when the whole MPUDP `WritePacket` call returns, after its
+shard socket attempts. It is not a timestamp of an individual shard socket
+write. `entry_to_ack` ends when the adapter receives the ACK Datagram, before
+KCP input processing; `return_to_ack` is available only when that ACK follows
+the adapter return. ACKs arriving while remaining shards are still being sent
+increment `ack_before_adapter_return`. These metrics do not separate network
+transit, FEC/delivery queue time, KCP ACK scheduling, or individual socket queues.
+
+Repeated PUSH headers are retransmission candidates with unknown cause; they do
+not prove network loss. In pinned kcp-go v5.6.72, the bounded postprocessing
+channel can discard KCP output before it reaches this adapter without a
+dedicated SNMP counter. Those attempts are invisible here. Fast, early, and
+timeout causes remain available only as aggregate SNMP deltas. Cumulative UNA
+advances are counted separately, without inventing a timestamped ACK match.
+Native KCP packet correlation stays explicitly unavailable: wrapping its UDP
+socket would bypass or disable the library's Linux batch-I/O path. No KCP source
+or product wire format is changed. Run diagnostics off/on controls to quantify
+the overhead before interpreting performance differences.
+
+`-profile-prefix /private/run/profile` enables CPU, alloc, heap, mutex, and
 block profiles only on the host where that argument is supplied. Profile files
 are created with mode 0600 and never overwritten. JSON metadata includes only
 nonsecret configuration fields and dependency/build information. Probe traffic
