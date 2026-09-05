@@ -82,8 +82,23 @@ func TestRequiredDestinationWildcardRepliesAndOwnership(t *testing.T) {
 				if packet.Payload[0] != byte(i) {
 					t.Fatal("later read overwrote retained payload")
 				}
-				reply := transport.WithReplyStatistics(packet.Reply, pathCounters)
-				if err := reply.Send(context.Background(), []byte("response")); err != nil {
+				reply, native, captureErr := transport.CaptureSendPath(transport.WithReplyStatistics(packet.Reply, pathCounters))
+				if captureErr != nil || !native || reply.Generation() != packet.Generation ||
+					reply.LocalAddr().String() != expectedLocal || reply.RemoteAddr().String() != expectedRemote {
+					t.Fatalf("source-aware capture native=%t err=%v", native, captureErr)
+				}
+				var sendErr error
+				if i == 0 {
+					sendErr = reply.Send(context.Background(), []byte("response"))
+				} else {
+					before := time.Now()
+					var attempted time.Time
+					attempted, sendErr = transport.SendWithAttempt(context.Background(), reply, []byte("response"))
+					if attempted.IsZero() || attempted.Before(before) || attempted.After(time.Now()) {
+						t.Fatalf("source-aware reply attempt time = %v", attempted)
+					}
+				}
+				if err := sendErr; err != nil {
 					t.Fatalf("reply: %v: %v", err, errors.Unwrap(err))
 				}
 				if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -143,6 +158,9 @@ func TestRequiredDestinationWildcardRepliesAndOwnership(t *testing.T) {
 			}
 			if err := retained[0].Reply.Send(context.Background(), []byte("late")); !errors.Is(err, transport.ErrClosed) {
 				t.Fatalf("closed reply error = %v", err)
+			}
+			if at, err := transport.SendWithAttempt(context.Background(), retained[0].Reply, []byte("late")); !at.IsZero() || !errors.Is(err, transport.ErrClosed) {
+				t.Fatalf("closed reply attempt time=%v err=%v", at, err)
 			}
 		})
 	}

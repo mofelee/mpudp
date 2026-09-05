@@ -262,10 +262,10 @@ func (l *Listener) reportError(err error) {
 }
 
 func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters) error {
-	return l.sendToWithControl(ctx, generation, remote, payload, statistics, nil)
+	return l.sendToWithControl(ctx, generation, remote, payload, statistics, nil, nil)
 }
 
-func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters, sourceControl []byte) error {
+func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters, sourceControl []byte, attempt *time.Time) error {
 	if ctx == nil {
 		return invalidArgument("nil send context")
 	}
@@ -313,6 +313,9 @@ func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, rem
 	var n int
 	var err error
 	if sourceControl == nil {
+		if attempt != nil {
+			*attempt = time.Now()
+		}
 		n, err = l.conn.WriteTo(payload, remote)
 	} else {
 		udp, socketOK := l.conn.(*net.UDPConn)
@@ -320,7 +323,11 @@ func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, rem
 		if !socketOK || !addressOK || address == nil {
 			err = ErrDestinationUnsupported
 		} else {
-			n, _, err = udp.WriteMsgUDPAddrPort(payload, sourceControl, address.AddrPort())
+			target := address.AddrPort()
+			if attempt != nil {
+				*attempt = time.Now()
+			}
+			n, _, err = udp.WriteMsgUDPAddrPort(payload, sourceControl, target)
 		}
 	}
 	var elapsed time.Duration
@@ -400,9 +407,14 @@ func (r listenerReplyPath) RemoteAddr() net.Addr { return cloneAddr(r.remote) }
 func (r listenerReplyPath) Available() bool      { return r.listener.Available() }
 func (r listenerReplyPath) Send(ctx context.Context, payload []byte) error {
 	if r.sourceControl != nil {
-		return r.listener.sendToWithControl(ctx, r.generation, r.remote, payload, r.statistics, r.sourceControl)
+		return r.listener.sendToWithControl(ctx, r.generation, r.remote, payload, r.statistics, r.sourceControl, nil)
 	}
 	return r.listener.sendTo(ctx, r.generation, r.remote, payload, r.statistics)
+}
+func (r listenerReplyPath) SendWithAttempt(ctx context.Context, payload []byte) (time.Time, error) {
+	var started time.Time
+	err := r.listener.sendToWithControl(ctx, r.generation, r.remote, payload, r.statistics, r.sourceControl, &started)
+	return started, err
 }
 
 // WithReplyStatistics attaches an accepted listener path's collector at the
