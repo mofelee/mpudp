@@ -1,8 +1,12 @@
 # Proposed V2 Configuration And API Contract
 
-Status: concrete proposal for #20 review; no listed v2 field/API is implemented
-by this documentation change. Existing [configuration](../CONFIGURATION.md)
-and [API](../API.md) remain the v1 contract. Wire values are assigned in the
+Status: concrete proposal for #20 review. Strict `protocol` and `wire.version`
+recognition, protocol-specific FEC validation and the v2 512-byte minimum are
+implemented. A valid v2 configuration still returns `ErrProtocolUnavailable`
+from Peer construction before runtime side effects. Other new fields and APIs
+below remain proposals; the runnable data plane remains v1 Datagram. The
+maintained [configuration](../CONFIGURATION.md) and [API](../API.md) describe
+the implemented parser/runtime boundary. Wire values are assigned in the
 [registry](v2-registry.md); behavior and capacity are in the
 [joint design](v2-joint-contract.md).
 
