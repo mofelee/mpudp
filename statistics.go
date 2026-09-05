@@ -18,17 +18,27 @@ type LatencyStatistics metrics.LatencySnapshot
 // UpperBounds are inclusive and Counts are non-cumulative.
 type PacketSizeStatistics metrics.PacketSizeSnapshot
 
-// FECStatistics contains cumulative decoder events. Recovered counts require
-// parity reconstruction of missing data shards. LateShards counts arrivals for
-// blocks still in the completed cache; it does not prove network loss.
+// FECStatistics contains cumulative decoder events and retained-state gauges.
+// Recovered counts require parity reconstruction of missing data shards.
+// LateShards only counts blocks still in the completed cache. Capacity evictions
+// exclude TTL expiry. Neither event alone proves network loss or state reopening.
+// Pending gauges aggregate all live decoders; bytes count owned shard payloads,
+// excluding map/codec overhead. High-water marks persist after state is released.
 type FECStatistics struct {
-	CompletedBlocks uint64 `json:"completed_blocks"`
-	RecoveredBlocks uint64 `json:"recovered_blocks"`
-	RecoveredShards uint64 `json:"recovered_shards"`
-	ExpiredBlocks   uint64 `json:"expired_blocks"`
-	DecoderFull     uint64 `json:"decoder_full"`
-	LateShards      uint64 `json:"late_shards"`
-	DuplicateShards uint64 `json:"duplicate_shards"`
+	CompletedBlocks            uint64 `json:"completed_blocks"`
+	CompletedCapacityEvictions uint64 `json:"completed_capacity_evictions"`
+	RecoveredBlocks            uint64 `json:"recovered_blocks"`
+	RecoveredShards            uint64 `json:"recovered_shards"`
+	ExpiredBlocks              uint64 `json:"expired_blocks"`
+	DecoderFull                uint64 `json:"decoder_full"`
+	LateShards                 uint64 `json:"late_shards"`
+	DuplicateShards            uint64 `json:"duplicate_shards"`
+	PendingBlocks              int64  `json:"pending_blocks"`
+	PendingShards              int64  `json:"pending_shards"`
+	PendingBytes               int64  `json:"pending_bytes"`
+	PendingBlocksHighWater     uint64 `json:"pending_blocks_high_water"`
+	PendingShardsHighWater     uint64 `json:"pending_shards_high_water"`
+	PendingBytesHighWater      uint64 `json:"pending_bytes_high_water"`
 }
 
 // PathStatistics aggregates sockets at one configured Carrier index across
@@ -49,8 +59,9 @@ type PathStatistics struct {
 }
 
 // Statistics is a bounded, non-secret Peer lifetime snapshot. Counters are
-// monotonic, including after Session/Peer closure, but fields are sampled
-// independently and need not describe the same instant during concurrent I/O.
+// monotonic, including after Session/Peer closure, except pending-state gauges
+// which decrease on completion, expiry, and Close. Fields are sampled independently
+// and need not describe the same instant during concurrent I/O.
 // Subtract successive snapshots and divide by elapsed time for bytes/s or PPS.
 type Statistics struct {
 	CapturedAt         time.Time         `json:"captured_at"`
@@ -102,7 +113,7 @@ func (p *Peer) initStatistics() {
 // observation after this call. This method is safe during concurrent I/O.
 func (p *Peer) SetDiagnosticsEnabled(enabled bool) { p.statistics.enabled.Store(enabled) }
 
-// Statistics returns aggregate counters without configuration secrets, packet
+// Statistics returns aggregate diagnostics without configuration secrets, packet
 // content, Session IDs, endpoint addresses, or unbounded per-packet records.
 func (p *Peer) Statistics() Statistics {
 	c := &p.statistics
@@ -116,9 +127,13 @@ func (p *Peer) Statistics() Statistics {
 		SendLatency:  LatencyStatistics(c.sendLatency.Snapshot()),
 		FEC: FECStatistics{
 			CompletedBlocks: c.fec.CompletedBlocks.Load(), RecoveredBlocks: c.fec.RecoveredBlocks.Load(),
-			RecoveredShards: c.fec.RecoveredShards.Load(), ExpiredBlocks: c.fec.ExpiredBlocks.Load(),
+			CompletedCapacityEvictions: c.fec.CompletedCapacityEvictions.Load(),
+			RecoveredShards:            c.fec.RecoveredShards.Load(), ExpiredBlocks: c.fec.ExpiredBlocks.Load(),
 			DecoderFull: c.fec.DecoderFull.Load(), LateShards: c.fec.LateShards.Load(),
 			DuplicateShards: c.fec.DuplicateShards.Load(),
+			PendingBlocks:   c.fec.PendingBlocks.Load(), PendingShards: c.fec.PendingShards.Load(),
+			PendingBytes: c.fec.PendingBytes.Load(), PendingBlocksHighWater: c.fec.PendingBlocksHighWater.Load(),
+			PendingShardsHighWater: c.fec.PendingShardsHighWater.Load(), PendingBytesHighWater: c.fec.PendingBytesHighWater.Load(),
 		},
 		Paths: make([]PathStatistics, 0, len(c.carriers)+1),
 	}

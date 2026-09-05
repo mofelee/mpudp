@@ -197,6 +197,7 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 		}
 		d.pending[input.Key] = block
 		heap.Push(&d.pendingExpiry, expiry)
+		d.statistics.changePending(1, 0, 0)
 	} else if block.originalLength != input.OriginalLength || block.shardSize != shardSize {
 		return Result{}, ErrInconsistentBlock
 	}
@@ -216,6 +217,7 @@ func (d *Decoder) AddVerifiedShard(input IncomingShard) (Result, error) {
 	block.bytes += len(owned)
 	d.pendingShards++
 	d.pendingBytes += len(owned)
+	d.statistics.changePending(0, 1, int64(len(owned)))
 	if block.present < d.params.DataShards {
 		return Result{Outcome: OutcomePending}, nil
 	}
@@ -296,6 +298,7 @@ func (d *Decoder) sweepLocked(now time.Time) ExpireStats {
 		delete(d.pending, entry.key)
 		d.pendingShards -= block.present
 		d.pendingBytes -= block.bytes
+		d.statistics.changePending(-1, -int64(block.present), -int64(block.bytes))
 		expired.PendingBlocks++
 		if d.statistics != nil {
 			d.statistics.ExpiredBlocks.Add(1)
@@ -320,12 +323,16 @@ func (d *Decoder) removePendingLocked(key BlockKey, block *pendingBlock) {
 	}
 	d.pendingShards -= block.present
 	d.pendingBytes -= block.bytes
+	d.statistics.changePending(-1, -int64(block.present), -int64(block.bytes))
 }
 
 func (d *Decoder) rememberCompletedLocked(key BlockKey, now time.Time) {
 	if len(d.completed) >= d.maxCompletedBlocks {
 		oldest := heap.Pop(&d.completedExpiry).(*expiryEntry)
 		delete(d.completed, oldest.key)
+		if d.statistics != nil {
+			d.statistics.CompletedCapacityEvictions.Add(1)
+		}
 	}
 	entry := &expiryEntry{key: key, deadline: now.Add(d.completionTTL), index: -1}
 	d.completed[key] = entry
@@ -352,6 +359,7 @@ func (d *Decoder) Close() error {
 		return nil
 	}
 	d.closed = true
+	d.statistics.changePending(-int64(len(d.pending)), -int64(d.pendingShards), -int64(d.pendingBytes))
 	clear(d.pending)
 	clear(d.completed)
 	for index := range d.pendingExpiry {

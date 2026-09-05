@@ -132,9 +132,9 @@ select。
 
 ## SessionID 与诊断
 
-`Peer.Statistics()` 返回可直接 JSON 编码的有界累计统计；`CapturedAt` 用于相邻采样差分，
-例如 `ΔPaths[i].SentPackets / Δseconds` 得到 PPS。统计贯穿 Peer 生命周期，不因 Session
-关闭或 socket rebuild 清零，`Peer.Close()` 后仍可读取。各字段独立原子采样，正在收发时
+`Peer.Statistics()` 返回可直接 JSON 编码的有界诊断快照；`CapturedAt` 用于相邻采样差分，
+例如 `ΔPaths[i].SentPackets / Δseconds` 得到 PPS。累计计数和峰值贯穿 Peer 生命周期，
+不因 Session 关闭或 socket rebuild 清零，`Peer.Close()` 后仍可读取。各字段独立原子采样，正在收发时
 不是同一瞬间的一致性事务；不可用单次快照中字段之间的细微差异推断丢包。
 
 默认记录 ingress accepted/drop、delivery accepted/drop、成功写入的 Datagram 和实际
@@ -143,6 +143,32 @@ shard、pending 超时、decoder-full、pending duplicate 和 completed-cache la
 `FEC.LateShards` 包括已经恢复完成后正常抵达的剩余 parity/data shard，不等于网络丢包，
 也不覆盖 completed cache 过期或淘汰后的到达。`IngressDrops` 仅统计完整 packet ingress
 队列溢出；可恢复错误事件、鉴权拒绝及关闭时未消费的数据不计入这个数值。
+
+`FEC.CompletedCapacityEvictions` 只累计 completed cache 因容量上限产生的淘汰，不包含
+TTL 到期。`PendingBlocks`、`PendingShards`、`PendingBytes` 是所有存活 decoder 的当前
+占用总和，会在完成、超时和关闭时下降；`PendingBytes` 仅计算 decoder 持有的 shard
+payload 字节，不含 map、索引、codec 和重建过程的临时内存。对应的
+`PendingBlocksHighWater`、`PendingShardsHighWater`、`PendingBytesHighWater` 保存 Peer
+生命周期内各总和的独立峰值，关闭后仍保留；它们不是逐 Session 峰值之和。
+
+容量淘汰计数与 pending 占用不能单独证明某个 completed key 被晚到 shard 重新打开。
+以下确定性工作负载先完成 32 个已知 PacketID，再释放各自两个 parity shard；固定
+RS(3+2)、1200-byte Datagram、16 个 pending 槽，比较 completed 容量 8/16/32：
+
+```sh
+go test ./internal/fec -run TestDelayedParityCapacityDiagnostics -v
+go test ./internal/fec -run '^$' -bench BenchmarkDelayedParityCapacity -benchmem
+```
+
+| Completed 容量 | 容量淘汰 | 重新打开的 pending block | Pending shard | Pending 字节 | Decoder-full | 新 block 被拒绝 |
+|---|---|---|---|---|---|---|
+| 8 | 24 | 16 | 32 | 12800 | 17 | 是 |
+| 16 | 16 | 16 | 32 | 12800 | 1 | 是 |
+| 32 | 0 | 0 | 0 | 0 | 0 | 否 |
+
+Pending 指标在全部晚到 parity 处理后、尝试新 block 前采样；decoder-full 包含随后对新
+block 首个 shard 的尝试。测试还验证固定 decode timeout 到期后占用归零。该实验记录
+v1 当前行为并为 #18 提供基线，不修复该缺陷，也不代表网络吞吐量或生产容量建议。
 
 `Paths` 只包含配置顺序的 `carrier-N` 和可选的 `listener`：同一 Carrier 索引的多个
 Session socket 合并，listener 为单个共享 socket 的汇总，不输出地址、SessionID、PSK
