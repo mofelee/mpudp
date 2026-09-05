@@ -48,6 +48,20 @@ func TestUnavailableProtocolRejectsBeforeRuntimeDependencies(t *testing.T) {
 			if peer, err := NewPeerContext(unusedPeerContext{}, cfg); peer != nil || !errors.Is(err, ErrProtocolUnavailable) {
 				t.Fatalf("NewPeerContext() = (%v, %v)", peer, err)
 			}
+			features := cfg.Clone()
+			if protocol == config.ProtocolDatagram {
+				features.Aggregation.Enabled, features.Repair.Enabled = true, true
+			} else {
+				features.StreamMux.Enabled = true
+				features.KCP.FastRetransmit.Enabled, features.KCP.CongestionControl = false, false
+			}
+			featuresBefore := features.Clone()
+			if peer, err := newPeerWithContextAndDependencies(unusedPeerContext{}, features, unusedPeerRandom{}, deps); peer != nil || !errors.Is(err, ErrProtocolUnavailable) {
+				t.Fatalf("configured v2 features = (%v, %v)", peer, err)
+			}
+			if !reflect.DeepEqual(features, featuresBefore) {
+				t.Fatal("feature validation rewrote caller configuration")
+			}
 			cfg.Transport.MaxUDPPayload = config.MinV2MaxUDPPayload - 1
 			if peer, err := newPeerWithDependencies(cfg, unusedPeerRandom{}, deps); peer != nil || !errors.Is(err, ErrInvalidConfig) {
 				t.Fatalf("invalid v2 construction = (%v, %v), want configuration error", peer, err)
