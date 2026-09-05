@@ -29,6 +29,23 @@ after one run. Control retries and startup/measurement deadlines are bounded.
 Control messages are for an isolated benchmark network and are not authenticated;
 do not expose the control listener to an untrusted network.
 
+The same adapters support Linux v2 Datagram with fixed Session payload budgets
+and repair disabled. To compare aggregation, use matching endpoint YAML with
+the existing roles, PSK and positive FEC plus:
+
+```yaml
+protocol: datagram
+wire: {version: v2}
+aggregation: {enabled: true, max_delay: 250us}
+repair: {enabled: false}
+```
+
+Set `aggregation.enabled: false` for the v2 comparison without aggregation;
+omit the v2 declarations for the unchanged v1 comparison. `kcp-mpudp` still
+wraps Datagram/FEC experimentally: its YAML uses `protocol: datagram`, not the
+unavailable product KCP mode. The runner exposes these configurations as
+`--mpudp-profiles v1 v2 v2-aggregation`, with v1 remaining the default.
+
 Each native process uses one destination path. Multiple native flows share that
 path; UDP uses consecutive ports beginning at `-address`, while TCP and KCP use
 one listener port. Run independent native processes concurrently to calibrate
@@ -55,6 +72,16 @@ interval, fast resend 2, congestion control disabled, no KCP FEC, and delayed AC
 unless `-ack-no-delay` is set. Transient MPUDP send failures become counted
 adapter drops so KCP can recover from them.
 
+V1 retains the direct `WritePacket` path. For Sessions exposing the optional
+local `Flush(ctx)` interface, v2 `ErrResourceLimit` means the whole original
+was rejected before admission. The adapter retries that same buffer, preserving
+its verifier sequence or KCP packet, with a 100us timer between attempts and a
+one-second retry deadline starting at the first rejection. Caller cancellation
+and local shutdown interrupt the wait. The deadline bounds retry waiting; it
+does not interrupt an already-running synchronous `WritePacket`. Successful
+writes do not allocate a retry deadline timer. Exhaustion returns an explicit
+resource/deadline error, never a successful write or an adapter network drop.
+
 The receiver owns the monotonic warmup and steady-state windows. Counts are
 assigned at validation time to exact one-second buckets, excluding packets
 outside those windows. Each host emits JSONL metadata, per-second samples, its
@@ -73,6 +100,18 @@ unanswered requests or the >10-second histogram overflow bucket are null. A
 one-second drain gives the last opportunity its full deadline while throughput
 accounting remains restricted to the steady window.
 
+Startup tails are locally flushed before measurement. After the final RTT
+deadline, the receiver requests a drain over the control connection and keeps
+reading while the sender stops admissions and flushes accepted MPUDP originals.
+The receiver then stops its own admissions and flushes before either side
+closes. Each local drain has a three-second context, and a failure fails the
+run. `local_drain` summaries count supported, completed and failed Sessions;
+v1/native transports report zero supported Sessions. This proves only local
+socket attempts for already-admitted MPUDP Datagrams. It does not prove remote
+delivery or drain KCP's upper stream queues. Late bytes remain outside the
+fixed receiver throughput buckets. Periodic samples do not force Flush, so
+sampling does not change normal aggregation group boundaries.
+
 Native UDP and direct KCP sockets require verified Linux IPv4/IPv6 PMTU discovery
 with fragmentation disabled. The regular tests verify socket options and an
 IPv6 oversize rejection; `MPUDP_PERF_PRIVILEGED_TESTS=1 go test -race ./...` also
@@ -90,6 +129,22 @@ early retransmits. Sender queue and ACK correlation, host softirq/swap, and
 socket/qdisc drops require the external harness and additional diagnostic
 evidence; retransmit causes must not be inferred from a single counter.
 
+`mpudp_admission` records backpressured packets, rejected attempts, retry
+attempts, time from first rejection through completion, canceled packets and
+timed-out packets separately from `adapter_write_drops`. A packet is counted as
+backpressured only once, even when several attempts are rejected. Cancellation
+and timeout counts cover packets that encountered admission pressure.
+
+Metadata records `mpudp_profile`, wire version, protocol, normalized aggregation
+settings, directional UDP hard caps and configured path rates. Optional fields
+are read without requiring v2 Go configuration types in the v0.1.0 source build.
+No PSKs or endpoint addresses are included. V2 supports basic Peer/transport
+counters and packet-size histograms; its zero legacy FEC/Endpoint counters
+must not be interpreted as equivalent internal coverage. PPS and byte rates
+need aligned steady sample deltas; initial/final totals also include warmup and
+local drain traffic. Echoes use the configured application message size, and
+their 1ms histogram does not precisely resolve a 250us aggregation delay.
+
 `-diagnostics` enables optional MPUDP timing and packet-size histograms on both
 hosts, plus optional probe-side KCP diagnostics. Per-flow `kcp_correlation`
 snapshots contain application write duration for both KCP stacks. For
@@ -103,9 +158,11 @@ marks that sequence's history incomplete; subsequent ACKs cannot contribute an
 exact timing match, even if the retained timestamps appear unique. They increment
 `incomplete_history_acks`. Timing buckets are <=1us, <=2us, ... <=8388608us, then overflow.
 
-`adapter_call` ends when the whole MPUDP `WritePacket` call returns, after its
-shard socket attempts. It is not a timestamp of an individual shard socket
-write. `entry_to_ack` ends when the adapter receives the ACK Datagram, before
+`adapter_call` ends when the adapter's whole-Datagram write returns, including
+any admission retries. With aggregation disabled this follows local shard
+socket attempts; with v2 aggregation enabled it follows whole-original queue
+admission. It is not a timestamp of an individual shard socket write.
+`entry_to_ack` ends when the adapter receives the ACK Datagram, before
 KCP input processing; `return_to_ack` is available only when that ACK follows
 the adapter return. ACKs arriving while remaining shards are still being sent
 increment `ack_before_adapter_return`. These metrics do not separate network

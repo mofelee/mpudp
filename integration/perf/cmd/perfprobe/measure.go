@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -58,6 +59,7 @@ type summary struct {
 	ErrorExamples []string           `json:"error_examples,omitempty"`
 	Initial       telemetry          `json:"initial"`
 	Final         telemetry          `json:"final"`
+	LocalDrain    localDrainSummary  `json:"local_drain"`
 }
 
 type kcpSessionStats struct {
@@ -88,6 +90,7 @@ type telemetry struct {
 	KCPSessions              []kcpSessionStats     `json:"kcp_sessions,omitempty"`
 	KCPCorrelation           []kcpCorrelationStats `json:"kcp_correlation,omitempty"`
 	AdapterWriteDrops        uint64                `json:"adapter_write_drops"`
+	MPUDPAdmission           admissionSnapshot     `json:"mpudp_admission"`
 }
 
 func (t *transports) telemetry() telemetry {
@@ -119,6 +122,15 @@ func (t *transports) telemetry() telemetry {
 	}
 	for _, p := range t.adapters {
 		v.AdapterWriteDrops += p.drops.Load()
+	}
+	for _, w := range t.writers {
+		s := w.snapshot()
+		v.MPUDPAdmission.BackpressuredPackets += s.BackpressuredPackets
+		v.MPUDPAdmission.RejectedAttempts += s.RejectedAttempts
+		v.MPUDPAdmission.RetryAttempts += s.RetryAttempts
+		v.MPUDPAdmission.WaitNS += s.WaitNS
+		v.MPUDPAdmission.CanceledPackets += s.CanceledPackets
+		v.MPUDPAdmission.TimeoutPackets += s.TimeoutPackets
 	}
 	for i, trace := range t.kcpTraces {
 		if trace != nil {
@@ -161,7 +173,7 @@ func sumBucket(a *bucket, b bucket) {
 	a.TooOldFrames += b.TooOldFrames
 }
 
-func receive(t *transports, o options, start time.Time) (summary, error) {
+func receive(t *transports, o options, start time.Time, boundary ...func() error) (summary, error) {
 	r := resultBase(o, t, start, "receiver")
 	counters := make([]*receiverCounters, o.Flows)
 	var wg sync.WaitGroup
@@ -173,6 +185,7 @@ func receive(t *transports, o options, start time.Time) (summary, error) {
 	stopWorkers := func() {
 		stopped.Store(true)
 		stopOnce.Do(func() { close(stop) })
+		t.stopAdmissions()
 		for _, c := range t.conns {
 			_ = c.Close()
 		}
@@ -180,6 +193,7 @@ func receive(t *transports, o options, start time.Time) (summary, error) {
 	}
 	defer stopWorkers()
 	probeStart := start.Add(time.Duration(o.Warmup) * time.Second)
+	probeDeadline := probeStart.Add(time.Duration(o.Seconds+1) * time.Second)
 	for i, c := range t.conns {
 		counter := &receiverCounters{start: start, buckets: make([]bucket, o.Warmup+o.Seconds)}
 		counters[i] = counter
@@ -255,6 +269,9 @@ func receive(t *transports, o options, start time.Time) (summary, error) {
 				}
 				seq := binary.BigEndian.Uint64(b[24:])
 				if kind == kindEcho {
+					if !time.Now().Before(probeDeadline) {
+						continue
+					}
 					if seq >= uint64(len(probeSeen)) {
 						errs.add(errors.New("invalid echo sequence"), false)
 						continue
@@ -293,6 +310,22 @@ func receive(t *transports, o options, start time.Time) (summary, error) {
 	// Allow the last scheduled request its full deadline. Throughput counters
 	// already reject post-window traffic; bulk load continues during this drain.
 	time.Sleep(time.Until(start.Add(time.Duration(o.Warmup+o.Seconds+1) * time.Second)))
+	// The remote sender drains while these readers remain open. Counters have
+	// a fixed cutoff, so local tail work cannot extend the throughput window.
+	if len(boundary) > 0 {
+		if err := boundary[0](); err != nil {
+			return r, err
+		}
+	}
+	stopped.Store(true)
+	t.stopAdmissions()
+	drainContext, cancelDrain := context.WithTimeout(context.Background(), localDrainLimit)
+	var drainErr error
+	r.LocalDrain, drainErr = t.drain(drainContext)
+	cancelDrain()
+	if drainErr != nil {
+		return r, fmt.Errorf("receiver local drain: %w", drainErr)
+	}
 	stopWorkers()
 	r.EchoRTT = latency.snapshot()
 	r.Mbps = float64(r.VerifiedBytes) * 8 / float64(o.Seconds) / 1e6
@@ -406,6 +439,7 @@ func send(t *transports, o options, control net.Conn) (summary, error) {
 	stopWorkers := func() {
 		stopped.Store(true)
 		stopOnce.Do(func() { close(stop) })
+		t.stopAdmissions()
 		for _, c := range t.conns {
 			_ = c.Close()
 		}
@@ -417,7 +451,7 @@ func send(t *transports, o options, control net.Conn) (summary, error) {
 		err     error
 	}
 	result := make(chan response, 1)
-	go func() { m, err := controlRead(control, "result"); result <- response{m, err} }()
+	go func() { m, err := controlRead(control, "drain"); result <- response{m, err} }()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	second := 0
@@ -432,13 +466,30 @@ func send(t *transports, o options, control net.Conn) (summary, error) {
 			if response.err != nil {
 				return r, response.err
 			}
-			if response.message.Summary == nil {
+			stopped.Store(true)
+			stopOnce.Do(func() { close(stop) })
+			t.stopAdmissions()
+			drainContext, cancelDrain := context.WithTimeout(context.Background(), localDrainLimit)
+			var drainErr error
+			r.LocalDrain, drainErr = t.drain(drainContext)
+			cancelDrain()
+			if drainErr != nil {
+				return r, fmt.Errorf("sender local drain: %w", drainErr)
+			}
+			if err := controlWrite(control, controlMessage{Kind: "drained"}); err != nil {
+				return r, err
+			}
+			peerResult, err := controlRead(control, "result")
+			if err != nil {
+				return r, err
+			}
+			if peerResult.Summary == nil {
 				return r, fmt.Errorf("missing receiver summary")
 			}
 			stopWorkers()
 			r.SendErrors, r.ReadErrors, r.ErrorExamples = errs.sends.Load(), errs.reads.Load(), errs.examples
 			r.Final = t.telemetry()
-			if err := emit(map[string]any{"type": "remote_summary", "summary": response.message.Summary}); err != nil {
+			if err := emit(map[string]any{"type": "remote_summary", "summary": peerResult.Summary}); err != nil {
 				return r, err
 			}
 			return r, emit(r)

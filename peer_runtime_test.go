@@ -667,6 +667,10 @@ func TestAcceptQueueSaturationClosesNewSession(t *testing.T) {
 	waitForCondition(t, func() bool {
 		return errors.Is(second.WritePacket([]byte("probe")), ErrClosed)
 	}, "drop-newest Session close")
+	// The remote CLOSE can arrive before the listener's onClose callback runs.
+	waitForCondition(t, func() bool {
+		return listenerPeer.listenerState.Stats().Sessions == 1
+	}, "drop-newest listener cleanup")
 	if got := listenerPeer.listenerState.Stats().Sessions; got != 1 {
 		t.Fatalf("listener retained Sessions = %d, want 1", got)
 	}

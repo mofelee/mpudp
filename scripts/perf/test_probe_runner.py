@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import yaml
+
 from test_calibrate import network_fixture
 
 spec = importlib.util.spec_from_file_location("probe_runner", Path(__file__).with_name("run-probe.py"))
@@ -27,7 +29,40 @@ def arguments(directory, *extra):
         "--seconds", "2", "--warmup", "1", "--rounds", "1", *extra])
 
 
-def pair_records(case, worker_id):
+def config_metadata_fixture(case, side, args=None):
+    if case["protocol"] not in runner.MPUDP:
+        return None
+    args = args or arguments(Path("."))
+    profile = case.get("mpudp_profile", "v1")
+    version = "v1" if profile == "v1" else "v2"
+    cfg = {"mpudp_profile": profile, "wire_version": version, "protocol": "datagram",
+           "repair": {"enabled": False}, "aggregation": {"enabled": profile == "v2-aggregation"},
+           "configured_carriers": case["candidate_paths"] if side == "client" else 0,
+           "fec": {"DataShards": args.data_shards, "ParityShards": args.parity_shards},
+           "limits": {"MaxDatagramSize": args.max_datagram_size,
+                      "MaxPendingFECBlocks": args.pending_blocks, "ReceiveQueueCapacity": args.queue_capacity,
+                      "DeliveryQueueCapacity": args.queue_capacity},
+           "transport": {"MaxUDPPayload": args.udp_budget},
+           "udp_caps": {"send_hard_cap": args.udp_budget, "receive_hard_cap": args.udp_budget},
+           "scheduler": {"outbound_path_rates_bps": {}, "inbound_path_rates_bps": {}}}
+    if version == "v2":
+        group_bytes = min(1048576, args.data_shards * (args.udp_budget - 94))
+        cfg["limits"].update(MaxFragmentsPerDatagram=256,
+                             MaxDatagramSize=min(args.max_datagram_size, args.v2_max_original_bytes,
+                                                 256 * (group_bytes - 24)))
+        cfg["transport"].update(MaxReceiveUDPPayload=args.udp_budget, MTUDiscovery="fixed", BudgetStrategy="session")
+        cfg["aggregation"].update(max_delay_ns=args.v2_aggregation_max_delay_us * 1000,
+                                  max_records=args.v2_aggregation_max_records,
+                                  max_queued_datagrams=256, max_queued_bytes=1048576,
+                                  max_group_bytes=group_bytes)
+        rate_key = "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps"
+        cfg["scheduler"][rate_key] = {str(index): args.v2_path_rate_bps
+                                     for index in range(1, case["candidate_paths"] + 1)}
+        cfg["scheduler"]["default_path_rate_bps"] = 100000000
+    return cfg
+
+
+def pair_records(case, worker_id, args=None):
     receiver_side = "server" if case["direction"] == "upload" else "client"
     rows, summaries = {}, {}
     expected = {"run_id": worker_id, "protocol": case["protocol"], "direction": case["direction"],
@@ -38,7 +73,9 @@ def pair_records(case, worker_id):
         options = {**expected, "diagnostics": case["diagnostics"], "kcp_mtu": 1400, "kcp_window": 1024,
                    "kcp_ack_no_delay": False, "offered_mbps_per_flow": 0}
         metadata = {"type": "metadata", "side": side, "source_sha": SOURCE_SHA,
-                    "path_count": paths, "options": options}
+                    "path_count": paths, "options": options,
+                    "config": config_metadata_fixture(case, side, args),
+                    "admission_policy": dict(runner.ADMISSION_POLICY)}
         role = "receiver" if side == receiver_side else "sender"
         rows[side] = [metadata]
         size = case["message_bytes"] - 40
@@ -55,6 +92,9 @@ def pair_records(case, worker_id):
                            "send_errors": 0, "read_errors": 0, "corrupt_frames": 0, "duplicate_frames": 0,
                            "too_old_frames": 0, "initial": telemetry_fixture(case), "final": telemetry_fixture(case),
                            "worst_5_second_mbps": size * 8 / 1e6 if case["seconds"] >= 5 else None}
+        supported = case["flows_per_worker"] if case["protocol"] in runner.MPUDP and case.get("mpudp_profile", "v1") != "v1" else 0
+        summaries[side]["local_drain"] = {"scope": runner.LOCAL_DRAIN_SCOPE, "supported_sessions": supported,
+                                         "completed_sessions": supported, "failed_sessions": 0, "duration_ns": 1}
         if role == "receiver":
             summaries[side]["samples"] = [{key: value for key, value in row.items() if key not in ("type", "side", "role", "telemetry")}
                                            for row in rows[side] if row["type"] == "sample"]
@@ -71,8 +111,9 @@ def pair_records(case, worker_id):
 def telemetry_fixture(case):
     value = {"at_utc": "2026-09-05T00:00:00Z", "process": {key: 0 for key in
              ("cpu_user_seconds", "cpu_system_seconds", "max_rss_kib", "heap_alloc_bytes", "total_alloc_bytes",
-              "mallocs", "gc_count", "goroutines")}, "mpudp_statistics_available": case["protocol"] in runner.MPUDP,
-             "kcp_timeout_retransmits": 0, "adapter_write_drops": 0}
+             "mallocs", "gc_count", "goroutines")}, "mpudp_statistics_available": case["protocol"] in runner.MPUDP,
+             "kcp_timeout_retransmits": 0, "adapter_write_drops": 0,
+             "mpudp_admission": {key: 0 for key in runner.ADMISSION_COUNTERS}}
     if value["mpudp_statistics_available"]:
         value["mpudp"] = {key: 0 for key in ("ingress_accepted", "ingress_drops", "delivery_accepted", "delivery_drops",
                             "delivered_packets", "delivered_bytes", "sent_datagrams", "sent_datagram_bytes")}
@@ -267,6 +308,126 @@ class MatrixTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.payload_size("1400", "udp", args)
 
+    def test_profiles_preserve_v1_ids_and_do_not_duplicate_native_cases(self):
+        args = arguments(self.directory, "--protocols", "mpudp", "kcp-mpudp", "kcp",
+                         "--paths", "1", "2", "3", "5")
+        legacy = runner.matrix(args)
+        args.mpudp_profiles = ["v1", "v2", "v2-aggregation"]
+        cases = runner.matrix(args)
+        self.assertEqual(len(cases), 31)  # 24 MPUDP variants plus 7 native layouts.
+        self.assertEqual([case for case in cases if case.get("mpudp_profile", "v1") == "v1"], legacy)
+        self.assertEqual(len({case["case_id"] for case in cases}), len(cases))
+        for case in cases:
+            if case["protocol"] == "kcp":
+                self.assertNotIn("mpudp_profile", case)
+            elif case["mpudp_profile"] != "v1":
+                self.assertTrue(case["case_id"].endswith("-" + case["mpudp_profile"]))
+        self.assertEqual(runner.matrix(args), cases)
+
+    def test_v2_config_has_integer_role_rates_and_datagram_wire_for_both_adapters(self):
+        args = arguments(self.directory, "--protocols", "mpudp", "kcp-mpudp", "--paths", "1", "2", "3", "5",
+                         "--mpudp-profiles", "v2", "v2-aggregation", "--v2-path-rate-bps", "80000000",
+                         "--v2-aggregation-max-delay-us", "500", "--v2-aggregation-max-records", "16")
+        topology = {"server_addresses": [f"10.206.{index}.2" for index in range(1, 6)]}
+        for case in runner.matrix(args):
+            for side in ("client", "server"):
+                with self.subTest(case=case["case_id"], side=side):
+                    cfg = runner.mpudp_config(args, topology, case, side, "private-marker")
+                    encoded = runner.mpudp_config_bytes(cfg)
+                    self.assertEqual(yaml.safe_load(encoded), cfg)
+                    self.assertEqual(cfg["protocol"], "datagram")
+                    self.assertEqual(cfg["wire"], {"version": "v2"})
+                    self.assertEqual(cfg["repair"], {"enabled": False})
+                    self.assertEqual(cfg["transport"], {"max_udp_payload": 1200, "max_receive_udp_payload": 1200,
+                                                        "mtu_discovery": "fixed", "budget_strategy": "session"})
+                    self.assertEqual(cfg["aggregation"], {"enabled": case["mpudp_profile"] == "v2-aggregation",
+                        "max_delay": "500us", "max_records": 16, "max_queued_datagrams": 256,
+                        "max_queued_bytes": 1048576, "max_group_bytes": 3318})
+                    key = "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps"
+                    self.assertEqual(cfg["scheduler"], {key: {index: 80000000
+                                                              for index in range(1, case["candidate_paths"] + 1)}})
+                    self.assertTrue(all(type(index) is int for index in yaml.safe_load(encoded)["scheduler"][key]))
+                    self.assertEqual(runner.mpudp_config_bytes(cfg), encoded)
+
+    def test_v1_serialization_and_configuration_are_unchanged(self):
+        args = arguments(self.directory)
+        case, = runner.matrix(args)
+        cfg = runner.mpudp_config(args, {"server_addresses": ["10.206.1.2"]}, case, "client", "private")
+        self.assertEqual(case["case_id"], "mpudp-p1-mpudp-upload-b64-f1-diagoff-r1")
+        self.assertEqual(cfg, {"psk": "private", "fec": {"data_shards": 3, "parity_shards": 2},
+            "transport": {"max_udp_payload": 1200}, "limits": {"max_datagram_size": 65536,
+            "max_pending_fec_blocks": 8192, "receive_queue_capacity": 4096, "delivery_queue_capacity": 4096},
+            "carriers": ["10.206.1.2:29000"]})
+        self.assertEqual(runner.mpudp_config_bytes(cfg), json.dumps(cfg).encode())
+
+    def test_generated_v2_yaml_passes_actual_strict_go_configuration_parser(self):
+        args = arguments(self.directory, "--protocols", "mpudp", "kcp-mpudp", "--paths", "1", "2", "3", "5",
+                         "--mpudp-profiles", "v1", "v2", "v2-aggregation")
+        topology = {"server_addresses": [f"10.206.{index}.2" for index in range(1, 6)]}
+        configs = [runner.mpudp_config_bytes(runner.mpudp_config(args, topology, case, side, "parse-fixture-key")).decode()
+                   for case in runner.matrix(args) for side in ("client", "server")]
+        source = self.directory / "parse_configs.go"
+        source.write_text('''package main
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "github.com/mofelee/mpudp/config"
+)
+func main() {
+    var inputs []string
+    if err := json.NewDecoder(os.Stdin).Decode(&inputs); err != nil { panic(err) }
+    for index, input := range inputs {
+        if _, err := config.Parse([]byte(input)); err != nil {
+            fmt.Fprintf(os.Stderr, "config %d: %v\\n", index, err)
+            os.Exit(1)
+        }
+    }
+    fmt.Println(len(inputs))
+}
+''')
+        result = subprocess.run(["go", "run", str(source)], input=json.dumps(configs), text=True,
+                                capture_output=True, cwd=runner.ROOT, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(int(result.stdout), 48)
+
+    def test_v2_max_original_uses_fragment_capacity_and_explicit_ceiling(self):
+        args = arguments(self.directory, "--mpudp-profiles", "v2", "--payloads", "max")
+        self.assertEqual(runner.matrix(args)[0]["message_bytes"], 65536)
+        args.v2_max_original_bytes = 2048
+        self.assertEqual(runner.matrix(args)[0]["message_bytes"], 2048)
+        args.v2_max_original_bytes = args.max_datagram_size = 1048576
+        args.data_shards, args.udp_budget = 1, 512
+        self.assertEqual(runner.matrix(args)[0]["message_bytes"], 256 * (512 - 94 - 24))
+        args.max_datagram_size = 4096
+        self.assertEqual(runner.matrix(args)[0]["message_bytes"], 4096)
+        args.max_datagram_size = 1024
+        with self.assertRaisesRegex(ValueError, "original Datagram budget"):
+            runner.payload_size("1400", "mpudp", args, "v2")
+
+    def test_v2_profiles_reject_unusable_settings_before_remote_work(self):
+        for extra in (("--udp-budget", "511"), ("--v2-max-original-bytes", "1048577"),
+                      ("--v2-path-rate-bps", "999"), ("--v2-path-rate-bps", "1000000000001"),
+                      ("--v2-aggregation-max-delay-us", "0"), ("--v2-aggregation-max-delay-us", "10001"),
+                      ("--v2-aggregation-max-records", "0"), ("--v2-aggregation-max-records", "257"),
+                      ("--source-sha", runner.calibrate.BASELINE_SHA),
+                      ("--mpudp-profiles", "v2", "v2")):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                arguments(self.directory, "--mpudp-profiles", "v2", *extra)
+        args = arguments(self.directory, "--protocols", "kcp-mpudp", "--mpudp-profiles", "v2",
+                         "--v2-max-original-bytes", "1024")
+        with self.assertRaisesRegex(ValueError, "KCP MTU"):
+            runner.matrix(args)
+
+    def test_missing_yaml_dependency_keeps_v1_usable_and_fails_v2_clearly(self):
+        args = arguments(self.directory, "--mpudp-profiles", "v1", "v2")
+        configs = [runner.mpudp_config(args, {"server_addresses": ["10.206.1.2"]}, case, "client", "private")
+                   for case in runner.matrix(args)]
+        with mock.patch.dict("sys.modules", {"yaml": None}):
+            self.assertEqual(json.loads(runner.mpudp_config_bytes(configs[0])), configs[0])
+            with self.assertRaisesRegex(ValueError, "PyYAML"):
+                runner.mpudp_config_bytes(configs[1])
+
     def test_formal_window_needs_all_required_dimensions(self):
         args = arguments(self.directory, "--seconds", "300", "--warmup", "20", "--rounds", "3")
         self.assertTrue(all(c["formal_window"] for c in runner.matrix(args)))
@@ -352,6 +513,81 @@ class EvidenceTests(unittest.TestCase):
                     self.rows[side][0]["options"][key] = wrong
                     with self.assertRaisesRegex(ValueError, "probe options"):
                         self.verify()
+
+    def test_profile_metadata_and_actual_settings_are_bound_on_both_sides(self):
+        self.case["candidate_paths"] = 5
+        for profile in ("v1", "v2", "v2-aggregation"):
+            self.case["mpudp_profile"] = profile
+            self.rows = pair_records(self.case, self.worker_id)
+            self.verify()
+            for side in ("client", "server"):
+                for section, field, wrong in ((None, "mpudp_profile", "unknown"), (None, "wire_version", "unknown"),
+                        (None, "protocol", "kcp"), ("repair", "enabled", True), ("repair", "enabled", 0),
+                        ("fec", "DataShards", 1), ("limits", "MaxDatagramSize", 1),
+                        ("udp_caps", "receive_hard_cap", 512), ("transport", "MaxUDPPayload", 512),
+                        ("aggregation", "enabled", profile != "v2-aggregation"),
+                        ("aggregation", "enabled", int(profile == "v2-aggregation")),
+                        (None, "configured_carriers", 99)):
+                    with self.subTest(profile=profile, side=side, section=section, field=field):
+                        self.rows = pair_records(self.case, self.worker_id)
+                        cfg = self.rows[side][0]["config"]
+                        (cfg if section is None else cfg[section])[field] = wrong
+                        with self.assertRaisesRegex(ValueError, "MPUDP"):
+                            self.verify()
+                if profile != "v1":
+                    for section, field, wrong in (("aggregation", "max_delay_ns", 1),
+                            ("aggregation", "max_queued_bytes", 1), ("aggregation", "max_group_bytes", 1),
+                            ("transport", "MTUDiscovery", "plpmtud"), ("transport", "BudgetStrategy", "per_carrier"),
+                            ("limits", "MaxFragmentsPerDatagram", 1),
+                            ("scheduler", "default_path_rate_bps", 1),
+                            ("scheduler", "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps", {})):
+                        with self.subTest(profile=profile, side=side, section=section, field=field):
+                            self.rows = pair_records(self.case, self.worker_id)
+                            self.rows[side][0]["config"][section][field] = wrong
+                            with self.assertRaisesRegex(ValueError, "MPUDP"):
+                                self.verify()
+
+    def test_native_protocols_cannot_claim_mpudp_configuration(self):
+        self.case["protocol"] = "kcp"
+        self.rows = pair_records(self.case, self.worker_id)
+        self.verify()
+        self.rows["client"][0]["config"] = {"mpudp_profile": "v2"}
+        with self.assertRaisesRegex(ValueError, "native protocol"):
+            self.verify()
+
+    def test_bounded_admission_policy_and_successful_local_drain_are_required(self):
+        self.case["mpudp_profile"] = "v2-aggregation"
+        for side in ("client", "server"):
+            for key in runner.ADMISSION_POLICY:
+                with self.subTest(side=side, policy=key):
+                    self.rows = pair_records(self.case, self.worker_id)
+                    del self.rows[side][0]["admission_policy"][key]
+                    with self.assertRaisesRegex(ValueError, "admission retry policy"):
+                        self.verify()
+            for key, wrong in (("scope", "remote_ack"), ("supported_sessions", 0), ("completed_sessions", 0),
+                               ("failed_sessions", 1), ("duration_ns", -1), ("supported_sessions", True)):
+                with self.subTest(side=side, drain=key):
+                    self.rows = pair_records(self.case, self.worker_id)
+                    self.rows[side][-2]["local_drain"][key] = wrong
+                    self.exchange_summaries()
+                    with self.assertRaisesRegex(ValueError, "local drain"):
+                        self.verify()
+
+    def test_admission_pressure_counters_cannot_be_missing_or_transport_drops(self):
+        for key in runner.ADMISSION_COUNTERS:
+            value = telemetry_fixture(self.case)
+            del value["mpudp_admission"][key]
+            with self.subTest(missing=key), self.assertRaisesRegex(ValueError, "MPUDP admission"):
+                runner.verify_telemetry(value, self.case, SOURCE_SHA)
+        value = telemetry_fixture(self.case)
+        value["mpudp_admission"].update(backpressured_packets=1, rejected_attempts=2, retry_attempts=2, wait_ns=1000)
+        runner.verify_telemetry(value, self.case, SOURCE_SHA)
+        self.assertEqual(value["adapter_write_drops"], 0)
+        self.case["protocol"] = "kcp"
+        value = telemetry_fixture(self.case)
+        value["mpudp_admission"]["rejected_attempts"] = 1
+        with self.assertRaisesRegex(ValueError, "native protocol"):
+            runner.verify_telemetry(value, self.case, SOURCE_SHA)
 
     def test_missing_rtt_or_telemetry_cannot_pass(self):
         for field in ("echo_rtt", "initial", "final"):
@@ -453,6 +689,35 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(plan["minimum_wall_seconds"], 696 * 320)
         self.assertEqual(json.loads((self.directory / "plan" / "manifest.json").read_text())["binary_sha256"], hashlib.sha256(b"fixture-executable").hexdigest())
 
+    def test_all_profile_plan_is_deterministic_and_keeps_formal_window_requirements(self):
+        binary = self.directory / "perfprobe"
+        binary.write_bytes(b"fixture-executable")
+        matrices = []
+        for name in ("profiles-first", "profiles-second"):
+            output = self.directory / name
+            argv = ["--topology", str(Path(__file__).with_name("topology.example.json")),
+                    "--ssh-config", "unused", "--binary", str(binary), "--source-sha", SOURCE_SHA,
+                    "--output", str(output), "--mpudp-profiles", "v1", "v2", "v2-aggregation", "--plan"]
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(runner.ProbeRunner, "prepare") as prepare, \
+                    mock.patch.object(runner.calibrate, "run", return_value=SOURCE_SHA):
+                runner.main(argv)
+            prepare.assert_not_called()
+            matrices.append((output / "matrix.json").read_bytes())
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["parameters"]["mpudp_profiles"], ["v1", "v2", "v2-aggregation"])
+            self.assertEqual(manifest["data_shard_overhead_by_profile"], {"v1": 71, "v2": 94, "v2-aggregation": 94})
+            self.assertEqual(manifest["v2_fragment_manifest_overhead"], 24)
+            self.assertEqual(manifest["admission_policy"], runner.ADMISSION_POLICY)
+            self.assertNotIn("plan-only-redacted-key", (output / "manifest.json").read_text())
+            self.assertNotIn("plan-only-redacted-key", (output / "matrix.json").read_text())
+            plan = json.loads((output / "plan-summary.json").read_text())
+            self.assertEqual(plan["total_cases"], 1080)
+            self.assertEqual(plan["minimum_wall_seconds"], 1080 * 320)
+            cases = json.loads(matrices[-1])
+            self.assertEqual({case["candidate_paths"] for case in cases}, {1, 2, 3, 5})
+            self.assertTrue(all(case["formal_window"] and not case["product_acceptance"] for case in cases))
+        self.assertEqual(*matrices)
+
 
 class FakeProcess:
     def __init__(self, command, stdout, stdin, rows, dead=False):
@@ -517,7 +782,7 @@ class LifecycleTests(unittest.TestCase):
 
     def python(self, host, script, *args, data=None, timeout=30):
         if data is not None:
-            self.config_data.append((args[0], json.loads(data)))
+            self.config_data.append((args[0], yaml.safe_load(data)))
         return b""
 
     def stop(self, host, unit):
@@ -555,6 +820,20 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(all(cfg["psk"] == "private-marker" for _, cfg in self.config_data))
         self.assertNotIn("private-marker", repr(self.commands))
         self.assertTrue(all("RuntimeMaxSec=108" in cmd and "KillMode=control-group" in cmd for cmd in self.commands))
+
+    def test_v2_deploys_private_yaml_without_changing_go_probe_flags(self):
+        self.case["mpudp_profile"] = "v2-aggregation"
+        self.case["case_id"] += "-v2-aggregation"
+        summary = self.probe.case(self.case)
+        self.assertEqual(summary["pairs"][0]["receiver"]["local_drain"]["completed_sessions"], 1)
+        self.assertTrue(all(path.endswith(".yaml") for path, _ in self.config_data))
+        self.assertTrue(all(cfg["wire"] == {"version": "v2"} and cfg["aggregation"]["enabled"]
+                            for _, cfg in self.config_data))
+        self.assertNotIn("private-marker", repr(self.commands))
+        for command in self.commands:
+            if "-mode" in command:
+                self.assertIn("-config", command)
+                self.assertNotIn("-mpudp-profile", command)
 
     def test_occupied_port_stops_no_existing_service(self):
         self.occupied = True
