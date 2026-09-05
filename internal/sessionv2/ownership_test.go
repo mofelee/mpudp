@@ -94,7 +94,8 @@ func TestPendingGroupPressureDoesNotMoveHistory(t *testing.T) {
 func TestDecodedGroupRetainsOwnershipUntilAtomicOriginalAdmission(t *testing.T) {
 	p := newPair(t, 1, 1, false, 5000)
 	p.pump(t, p.ready)
-	payload := bytes.Repeat([]byte("x"), 5000)
+	// This original still exceeds the credit reclaimed from decode workspace.
+	payload := bytes.Repeat([]byte("x"), 50000)
 	packets := groupPackets(t, p, payload)
 	c := p.server.controller
 	for _, pk := range packets[:2] {
@@ -119,7 +120,10 @@ func TestDecodedGroupRetainsOwnershipUntilAtomicOriginalAdmission(t *testing.T) 
 	if err != nil || len(result.Deliveries) != 0 || c.groups[1] != nil || c.decodedGroups != 0 || c.groupHead != 0 || c.groupTail != 0 || c.groupWindow.State(1) != recvwindow.Completed || c.originals.Snapshot().Pending != 1 {
 		t.Fatalf("retry did not atomically admit first fragment group: %+v %v", result, err)
 	}
-	for _, pk := range packets[5:8] {
+	for i, pk := range packets[5:] {
+		if i%5 >= 3 {
+			continue
+		}
 		result, err = receivePacket(p, pk)
 		if err != nil {
 			t.Fatal(err)

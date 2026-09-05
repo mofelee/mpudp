@@ -33,6 +33,30 @@ Under pressure it must retain decoded-pending group ownership under that
 group's original deadline; dropping those fragments and completing the group
 would suppress later repair incorrectly.
 
+The controller reserves each incomplete group's full shard, reconstruction
+workspace, logical-output and descriptor ceilings before receiving shards.
+Once decoding returns and the controller discards its shards, it reduces that
+lease to the actual decoded logical allocation, descriptor backing capacity,
+and live group/map/list metadata. Logical bytes include the manifest prefix,
+even though returned fragment slices expose only their own payload capacities.
+It returns this discarded workspace credit before trying `AddGroup`; the
+decoded source remains charged while all new originals reserve separate storage.
+Retry never consumes this source ownership before an atomic successful admission.
+
+This prevents a decoded group from waiting for another group's expiry merely
+because it still reserves its discarded reconstruction workspace. A deterministic
+RS(3+2), 1200-byte UDP budget test retains 31 incomplete groups and allows only
+1000 free bytes during the 32nd group's decode: the released workspace admits
+the 1400-byte original and its range table immediately, without expiring the
+other groups. This is not an unconditional progress guarantee. A larger original,
+more descriptors, an exhausted original/lease count, application-held deliveries
+or another Session can still prevent the complete destination reservation;
+the decoded group then retains its reduced lease and unchanged deadline.
+Receiving each bundle also reserves temporary packet/record storage before
+servicing existing groups. If incomplete groups exhaust that scratch capacity,
+even their final shards can remain blocked until some ownership expires or is
+released; this reduction only takes effect after successful decoding.
+
 Each original owns its total declared byte length plus
 `MaxFragments * sizeof(interval)` bytes for the range table and 16 bytes for
 its two expiry-list links. Empty originals still reserve that storage, retain
@@ -62,9 +86,11 @@ do not extend deadlines. Callers schedule expiry explicitly; there are no
 timers or goroutines.
 
 Successful completions transfer immutable payloads and their independent leases
-to `Datagram` handles. The range-table and expiry-link charges are conservatively
-retained with that handle until release. Copies share release state; the owner finishes all
-borrowed reads before `Release`, which clears payloads before returning credit.
+to `Datagram` handles. After discarding the range table and removing the expiry
+links, completion reduces the lease to the surviving payload backing capacity.
+An empty delivery keeps a zero-byte lease so its reservation count remains
+bounded. Copies share release state; the owner finishes all borrowed reads
+before `Release`, which clears payloads before returning credit.
 Receiver Close clears only its own pending data and bitmaps, preserving already
 transferred payloads. The surrounding Session and application queue remain
 caller-owned and need their own lifecycle and count bounds.
@@ -74,5 +100,8 @@ overlapping metadata, immutable deadlines, empty and spanning originals,
 fragment/pending caps, uint64 exhaustion, Close and copied-handle concurrent
 release. Real RS(3+2) decoding exercises all ten three-shard recovery subsets,
 reordered groups and duplicate repair-shaped inputs without duplicate original
-delivery. These are component integration tests, not socket, repair-timer,
+delivery. Credit regressions cover discarded decode workspace, one and 256
+descriptors retaining complete logical backing, simultaneous source/destination
+copies, reduced-lease expiry and payload-only delivery ownership. These are
+component integration tests, not socket, repair-timer,
 migration-lifecycle or performance acceptance.

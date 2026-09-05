@@ -64,6 +64,16 @@ takes ownership, keeping bytes and business count charged. It is idempotent
 after success; pending-handshake and closed scopes cannot accept. It neither
 consumes receive bytes nor proves that buffers were reclaimed.
 
+`Lease.ShrinkBytes(retained)` returns only the difference between the current
+byte obligation and the smaller retained obligation. The owner must first
+discard the corresponding storage or end that reservation; taking a shorter
+slice of a still-retained backing allocation does not return byte ownership.
+Growth is rejected without changing accounting. Reductions work after Close,
+including on transferred or bound storage, and copied handles share the new
+charge. Binding still cannot be repeated or moved to another Session. A
+reduction never releases stream, accept or reservation counts: even a zero-byte
+lease retains its metadata slot until `Release`.
+
 `Lease.Release()` is idempotent, including through copied handles and after
 Close. Callers must first clear the owned storage or end the reserved window
 obligation. The Peer, Session and Lease handles refer to shared private state,
@@ -104,7 +114,8 @@ allocator overhead and caller-retained released handles.
 Focused tests cover full-capacity promotion, all-or-nothing multi-resource
 admission, independent pending counts, destination transfer refusal, separately
 charged copies, control credit protection, zero-byte metadata exhaustion,
-copied-handle idempotence, maximum byte arithmetic and concurrent reservation,
+copied-handle idempotence, monotonic byte reduction after storage disposal,
+maximum byte arithmetic and concurrent reservation,
 transfer, acceptance, promotion, release and Close. Accounting checks sum all
 live Session charges and compare them with Peer totals and ceilings.
 
