@@ -536,7 +536,8 @@ start_peer_exchange() {
 	peer_has_oversize=0
 	rm -f -- "${peer_ready_file}" "${peer_oversize_ready_file}" "${peer_oversize_continue_file}" \
 		"${peer_oversize_done_file}" "${peer_phase_file}" "${peer_continue_file}" "${peer_reply_complete_file}" \
-		"${peer_exit_file}" "${peer_final_file}" "${peer_final_file}.post-expiry-done"
+		"${peer_exit_file}" "${peer_final_file}" "${peer_final_file}.post-expiry-done" \
+		"${peer_final_file}.post-expiry-sent"
 	: >"${peer_listener_log}"
 	: >"${peer_initiator_log}"
 	listener_arguments=(

@@ -376,14 +376,7 @@ func runListener(ctx context.Context, opts options, log *eventLog, peer *mpudp.P
 				if err := waitDuration(ctx, opts.expiryWait); err != nil {
 					return err
 				}
-				postExpiry := makeDatagram(postExpiryBytes, 0x6a)
-				if err := writeExpected(log, accepted, "post-expiry", postExpiry, false); err != nil {
-					return err
-				}
-				if err := waitForMarker(ctx, opts.finalPath+".post-expiry-done"); err != nil {
-					return fmt.Errorf("wait for post-expiry delivery: %w", err)
-				}
-				if err := log.write("endpoint_expiry_verified", "post-expiry", nil, nil); err != nil {
+				if err := sendPostExpiry(ctx, log, accepted, opts.finalPath); err != nil {
 					return err
 				}
 			}
@@ -507,12 +500,8 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 	}
 	if opts.finalPath != "" {
 		if opts.flow == rebindExpiryFlow {
-			postExpiry := makeDatagram(postExpiryBytes, 0x6a)
-			if err := readExpected(ctx, log, current, "post-expiry", postExpiry); err != nil {
+			if err := receivePostExpiry(ctx, log, current, opts.finalPath); err != nil {
 				return err
-			}
-			if err := createMarker(opts.finalPath + ".post-expiry-done"); err != nil {
-				return fmt.Errorf("write post-expiry completion marker: %w", err)
 			}
 		}
 		if err := waitForMarker(ctx, opts.finalPath); err != nil {
@@ -530,6 +519,35 @@ func runInitiator(ctx context.Context, opts options, log *eventLog, peer *mpudp.
 type packetResult struct {
 	body []byte
 	err  error
+}
+
+func sendPostExpiry(ctx context.Context, log *eventLog, current mpudp.Session, finalPath string) error {
+	postExpiry := makeDatagram(postExpiryBytes, 0x6a)
+	if err := writeExpected(log, current, "post-expiry", postExpiry, false); err != nil {
+		return err
+	}
+	if err := createMarker(finalPath + ".post-expiry-sent"); err != nil {
+		return fmt.Errorf("write post-expiry sender completion marker: %w", err)
+	}
+	if err := waitForMarker(ctx, finalPath+".post-expiry-done"); err != nil {
+		return fmt.Errorf("wait for post-expiry delivery: %w", err)
+	}
+	return log.write("endpoint_expiry_verified", "post-expiry", nil, nil)
+}
+
+func receivePostExpiry(ctx context.Context, log *eventLog, current mpudp.Session, finalPath string) error {
+	postExpiry := makeDatagram(postExpiryBytes, 0x6a)
+	if err := readExpected(ctx, log, current, "post-expiry", postExpiry); err != nil {
+		return err
+	}
+	if err := createMarker(finalPath + ".post-expiry-done"); err != nil {
+		return fmt.Errorf("write post-expiry completion marker: %w", err)
+	}
+	// Decoding k shards can precede the sender's final parity writes.
+	if err := waitForMarker(ctx, finalPath+".post-expiry-sent"); err != nil {
+		return fmt.Errorf("wait for post-expiry sender completion: %w", err)
+	}
+	return nil
 }
 
 func readPacketAsync(current mpudp.Session) <-chan packetResult {
