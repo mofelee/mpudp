@@ -1,5 +1,17 @@
 package negotiationv2
 
+// Profiles returns immutable endpoint settings in local, remote order for the
+// selected role. It does not expose mutable state or perform resource admission.
+func (c Contract) Profiles(role Role) (Profile, Profile, error) {
+	if !c.valid || (role != Initiator && role != Responder) {
+		return Profile{}, Profile{}, invalid("invalid contract or sender role")
+	}
+	if role == Responder {
+		return c.server, c.client, nil
+	}
+	return c.client, c.server, nil
+}
+
 // Select constructs the listener CHALLENGE advertisement. The listener's
 // original receive capabilities are preserved; OfferedCaps becomes the known
 // intersection. The winning configured path is echoed without renumbering.

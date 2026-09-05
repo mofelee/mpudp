@@ -313,6 +313,22 @@ type Snapshot struct {
 	History recvwindow.Snapshot
 }
 
+// NextDeadline returns the earliest original admission expiry, or zero when
+// no incomplete original remains. The owner serializes this read with writes.
+func (r *Receiver) NextDeadline() time.Time {
+	if r == nil || r.closed {
+		return time.Time{}
+	}
+	var next time.Time
+	for _, a := range r.pending {
+		deadline := a.admitted.Add(r.limits.Timeout)
+		if next.IsZero() || deadline.Before(next) {
+			next = deadline
+		}
+	}
+	return next
+}
+
 func (r *Receiver) Snapshot() Snapshot {
 	if r == nil {
 		return Snapshot{History: (*recvwindow.Window)(nil).Snapshot()}
