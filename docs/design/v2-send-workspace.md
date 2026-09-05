@@ -2,6 +2,8 @@
 
 [中文版](v2-send-workspace.zh-CN.md)
 
+For the opt-in controller adapter, see [owned send intents](v2-owned-send-intents.md).
+
 The synchronous fixed-budget Datagram controller reserves enough credit for
 one sealed FEC group and one packet assembly before handshake promotion.
 Without this floor, admitted original payloads could consume every remaining
