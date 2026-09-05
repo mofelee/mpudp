@@ -64,6 +64,17 @@ func (e *Engine) disposeAttempt(a *attempt) {
 	}
 	e.releasePackets(a)
 	a.setup.Keys = wirev2.DirectionalKeys{}
+	if a.retirement != nil {
+		storage, dispose := a.retirement, a.disposeDeferred
+		a.retirement, a.disposeDeferred = nil, nil
+		a.setup.Initial, a.receiveLease = nil, nil
+		if dispose != nil {
+			dispose(storage.release)
+		} else {
+			storage.release()
+		}
+		return
+	}
 	for _, lease := range a.setup.Initial {
 		lease.Release()
 	}
@@ -237,9 +248,11 @@ func (e *Engine) CloseSession(now time.Time, id wirev2.SessionID) (Result, error
 	return result, nil
 }
 
-// Close disposes installed storage, clears protocol packets/keys, releases all
-// leases owned by Engine and retires its scopes. It does not close the shared
-// credit Peer or any transport socket. It is idempotent at nondecreasing time.
+// Close clears protocol packets/keys and starts installed storage disposal.
+// Synchronous installers finish disposal before return. Deferred installers
+// retain initial credits until their releaseStorage callback runs; their adapter
+// must join cleanup. Close does not close the shared credit Peer or any transport
+// socket. It is idempotent at nondecreasing time.
 func (e *Engine) Close(now time.Time) (Result, error) {
 	var result Result
 	if err := e.enter(now, true); err != nil {

@@ -24,6 +24,9 @@ const (
 	MaxRejections          = 256
 	MaxInitialReservations = 16
 	PacketReservationBytes = 4 * wirev2.HandshakePacketSize
+	// DeferredDisposalBytes pays for a fixed lease owner and release callback.
+	// InstallDeferred adds this one reservation before HELLO/CHALLENGE.
+	DeferredDisposalBytes = 512
 )
 
 var (
@@ -89,6 +92,16 @@ type Config struct {
 	// before Engine releases its leases. Extra adapter leases also belong to
 	// disposal. Install must not require new mandatory initial reservations.
 	Install func(Setup) (dispose func(), err error)
+	// InstallDeferred is an alternative to Install for adapters whose cleanup
+	// finishes after the engine callback returns. Exactly one installer is set.
+	// A returned disposer receives a concurrency-safe, idempotent releaseStorage
+	// callback after Scope.Close. It must stop work and clear all initial storage
+	// before calling releaseStorage, even on installation failure. Until then,
+	// Receive, Initial, the Session slot and the extra disposal claim stay owned.
+	// A nil disposer means partial storage is already cleared; success requires
+	// a nonnil disposer. Engine Close starts disposal without waiting for it.
+	// The adapter must join cleanup outside its engine/owner lock.
+	InstallDeferred func(Setup) (dispose func(releaseStorage func()), err error)
 }
 
 type DialID uint64
@@ -105,7 +118,8 @@ type DialRequest struct {
 // Setup is a copied installed contract. Engine retains ownership of its
 // initial receive/accept leases; Scope allows the adapter to reserve further
 // obligations. CloseSession/Close invoke the supplied disposer before releasing
-// initial credits. The adapter must call MarkAccepted only on public acceptance.
+// initial credits. InstallDeferred transfers their release to that disposer.
+// The adapter must call MarkAccepted only on public acceptance.
 type Setup struct {
 	ID       wirev2.SessionID
 	DialID   DialID
@@ -117,8 +131,9 @@ type Setup struct {
 	Scope    *creditv2.Session
 	Receive  creditv2.Claim
 	// Initial matches Policy.Initial order. Engine retains ownership and
-	// releases these leases after disposal; component cleanup may also release
-	// copied handles idempotently after clearing their storage.
+	// releases these leases after synchronous disposal, or through the deferred
+	// releaseStorage callback. Component cleanup may also release copied handles
+	// idempotently after clearing their storage.
 	Initial []*creditv2.Lease
 }
 

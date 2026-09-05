@@ -37,6 +37,8 @@ type attempt struct {
 	packets                   *packets
 	receiveLease, packetLease *creditv2.Lease
 	dispose                   func()
+	disposeDeferred           func(func())
+	retirement                *retiredStorage
 	closeSent                 bool
 }
 
@@ -68,7 +70,7 @@ type Engine struct {
 // New copies PSK and listener policy. No credits or protocol objects are
 // admitted until BeginDial or a valid authenticated compatible HELLO.
 func New(psk []byte, config Config) (*Engine, error) {
-	if config.Credits == nil || config.Credits.Snapshot().Closed || config.Entropy == nil || config.Emit == nil || config.Install == nil {
+	if config.Credits == nil || config.Credits.Snapshot().Closed || config.Entropy == nil || config.Emit == nil || (config.Install == nil) == (config.InstallDeferred == nil) {
 		return nil, ErrInvalid
 	}
 	key, err := wirev2.DeriveHandshakeKey(psk)
@@ -169,13 +171,13 @@ func (e *Engine) newID() (wirev2.SessionID, error) {
 	return wirev2.SessionID{}, ErrEntropy
 }
 
-func (e *Engine) reserve(policy Policy) (*creditv2.Session, *creditv2.Lease, *creditv2.Lease, []*creditv2.Lease, error) {
+func (e *Engine) reserve(policy Policy) (*creditv2.Session, *creditv2.Lease, *creditv2.Lease, []*creditv2.Lease, *retiredStorage, error) {
 	if e.pending >= MaxPending {
-		return nil, nil, nil, nil, creditv2.ErrResourceLimit
+		return nil, nil, nil, nil, nil, creditv2.ErrResourceLimit
 	}
 	scope, receive, err := e.config.Credits.BeginHandshake(policy.Receive)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	initial := make([]*creditv2.Lease, 0, len(policy.Initial))
 	rollback := func() {
@@ -189,16 +191,27 @@ func (e *Engine) reserve(policy Policy) (*creditv2.Session, *creditv2.Lease, *cr
 		lease, err := scope.Reserve(claim)
 		if err != nil {
 			rollback()
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		initial = append(initial, lease)
 	}
 	packet, err := scope.Reserve(creditv2.Claim{Bytes: PacketReservationBytes})
 	if err != nil {
 		rollback()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
-	return scope, receive, packet, initial, nil
+	var retirement *retiredStorage
+	if e.config.InstallDeferred != nil {
+		lease, err := scope.Reserve(creditv2.Claim{Bytes: DeferredDisposalBytes})
+		if err != nil {
+			packet.Release()
+			rollback()
+			return nil, nil, nil, nil, nil, err
+		}
+		retirement = &retiredStorage{receive: receive, metadata: lease}
+		copy(retirement.initial[:], initial)
+	}
+	return scope, receive, packet, initial, retirement, nil
 }
 
 func (e *Engine) orderedIDs() []wirev2.SessionID {
