@@ -21,6 +21,7 @@ type Controller struct {
 	cfg                            Config
 	remote                         negotiationv2.Profile
 	sendKey, receiveKey            wirev2.Key
+	sendAuth, receiveAuth          *wirev2.Authenticator
 	paths                          []pathState
 	queue                          *aggregationv2.Queue
 	originals                      *reassemblyv2.Receiver
@@ -97,6 +98,9 @@ func requiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	// Bounded controller/path records include exact retained control frames.
 	// The two codec profiles additionally reserve a conservative matrix budget.
 	stateBytes := uint64(unsafe.Sizeof(Controller{})) + uint64(cfg.LocalProfile.MaxPaths)*uint64(unsafe.Sizeof(pathState{})) + 16*n*n + 512*n + 16384
+	// Two directional HMAC owners are standing storage, separate from codecs
+	// and receive scratch. They never compete with packet/group admission.
+	stateBytes += 2 * wirev2.AuthenticatorStateBytes
 	// Receive calls are serialized. Keep their bounded packet/record workspace
 	// prepaid so outbound admission cannot prevent already-owned group decode.
 	receiveBytes := uint64(cfg.LocalProfile.Payload.ReceiveHardCap) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
@@ -165,6 +169,14 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 			c.Close()
 		}
 	}()
+	c.sendAuth, err = wirev2.NewAuthenticator(c.sendKey)
+	if err != nil {
+		return nil, err
+	}
+	c.receiveAuth, err = wirev2.NewAuthenticator(c.receiveKey)
+	if err != nil {
+		return nil, err
+	}
 	c.groupWindowLease, err = setup.Scope.BindBytes(setup.Initial[InitialGroupWindow], claims[InitialGroupWindow].Bytes)
 	if err != nil {
 		return nil, err
@@ -411,6 +423,9 @@ func (c *Controller) Close() {
 	c.paths, c.cfg.Carriers, c.cfg.PathRatesBPS = nil, nil, nil
 	c.receiveCodec = nil
 	c.context = controlRetry{}
+	c.sendAuth.Close()
+	c.receiveAuth.Close()
+	c.sendAuth, c.receiveAuth = nil, nil
 	c.sendKey, c.receiveKey = wirev2.Key{}, wirev2.Key{}
 	c.groupWindowLease.Release()
 	c.controlLease.Release()
@@ -491,7 +506,7 @@ func (c *Controller) Receive(now time.Time, binding handshakev2.Binding, reply t
 	if envelope.Header().SessionID != c.setup.ID || envelope.Header().Type.IsHandshake() {
 		return result, nil
 	}
-	authenticated, err := envelope.Authenticate(c.receiveKey)
+	authenticated, err := c.receiveAuth.Authenticate(envelope)
 	if err != nil {
 		return result, err
 	}
