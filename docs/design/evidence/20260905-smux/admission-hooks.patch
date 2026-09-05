@@ -1,0 +1,59 @@
+diff --git a/mux.go b/mux.go
+index f25f723..98741dd 100644
+--- a/mux.go
++++ b/mux.go
+@@ -56,6 +56,12 @@ type Config struct {
+ 	// MaxStreamBuffer is used to control the maximum
+ 	// number of data per stream
+ 	MaxStreamBuffer int
++
++	// RemoteStreamAdmission optionally validates a new remote stream ID before
++	// allocating stream state. It runs under the session stream lock and must
++	// return promptly without calling Session methods. False ignores the SYN;
++	// a negotiated external admission protocol must signal normal refusals.
++	RemoteStreamAdmission func(streamID uint32) bool
+ }
+ 
+ // DefaultConfig is used to return a default configuration
+diff --git a/session.go b/session.go
+index 085547d..197024a 100644
+--- a/session.go
++++ b/session.go
+@@ -167,6 +167,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
+ 
+ // OpenStream is used to create a new stream
+ func (s *Session) OpenStream() (*Stream, error) {
++	return s.OpenStreamWithAdmission(nil)
++}
++
++// OpenStreamWithAdmission reserves an ID and calls admit before allocating
++// stream state or sending SYN. An admission error is returned unchanged.
++// The callback owns its cancellation/deadline and must bound its wait.
++func (s *Session) OpenStreamWithAdmission(admit func(streamID uint32) error) (*Stream, error) {
+ 	if s.IsClosed() {
+ 		return nil, io.ErrClosedPipe
+ 	}
+@@ -190,6 +197,12 @@ func (s *Session) OpenStream() (*Stream, error) {
+ 	sid := s.nextStreamID
+ 	s.nextStreamIDLock.Unlock()
+ 
++	if admit != nil {
++		if err := admit(sid); err != nil {
++			return nil, err
++		}
++	}
++
+ 	stream := newStream(sid, s.config.MaxFrameSize, s)
+ 
+ 	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+@@ -431,6 +444,10 @@ func (s *Session) recvLoop() {
+ 			var accepted *stream
+ 			s.streamLock.Lock()
+ 			if _, ok := s.streams[sid]; !ok {
++				if admit := s.config.RemoteStreamAdmission; admit != nil && !admit(sid) {
++					s.streamLock.Unlock()
++					continue
++				}
+ 				stream := newStream(sid, s.config.MaxFrameSize, s)
+ 				s.streams[sid] = stream
+ 				accepted = stream

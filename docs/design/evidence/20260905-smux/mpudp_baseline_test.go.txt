@@ -1,0 +1,182 @@
+package smux
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func mpudpConfig(version int) *Config {
+	cfg := DefaultConfig()
+	cfg.Version = version
+	cfg.KeepAliveDisabled = true
+	cfg.MaxFrameSize = 128
+	cfg.MaxReceiveBuffer = 64 * 1024
+	cfg.MaxStreamBuffer = 16 * 1024
+	return cfg
+}
+
+func mpudpSessions(t *testing.T, version int) (*Session, *Session) {
+	t.Helper()
+	left, right := net.Pipe()
+	client, err := Client(left, mpudpConfig(version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := Server(right, mpudpConfig(version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+	})
+	return client, server
+}
+
+func mpudpStreams(t *testing.T, client, server *Session) (*Stream, *Stream) {
+	t.Helper()
+	left, err := client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetDeadline(time.Now().Add(3 * time.Second))
+	right, err := server.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	left.SetDeadline(time.Now().Add(3 * time.Second))
+	right.SetDeadline(time.Now().Add(3 * time.Second))
+	return left, right
+}
+
+func mpudpWrite(t *testing.T, stream *Stream, data []byte) {
+	t.Helper()
+	if n, err := stream.Write(data); err != nil || n != len(data) {
+		t.Fatalf("Write = %d, %v; want %d bytes", n, err, len(data))
+	}
+}
+
+func mpudpFINBarrier(t *testing.T, client, server *Session, left, right *Stream) {
+	t.Helper()
+	if err := left.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	// net.Pipe completes each write after its bytes are read. Reading the next
+	// header proves recvLoop finished handling the preceding ordered FIN.
+	for _, session := range []*Session{client, server} {
+		if _, err := session.writeControlFrame(newFrame(byte(session.config.Version), cmdNOP, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func mpudpReadAll(stream *Stream) ([]byte, error) {
+	var got []byte
+	buf := make([]byte, 37)
+	for {
+		n, err := stream.Read(buf)
+		got = append(got, buf[:n]...)
+		if err == io.EOF {
+			return got, nil
+		}
+		if err != nil {
+			return got, err
+		}
+	}
+}
+
+func TestMPUDPBothFINPreservesUnreadTail(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		for _, method := range []string{"Read", "WriteTo"} {
+			t.Run(fmt.Sprintf("v%d_%s", version, method), func(t *testing.T) {
+				client, server := mpudpSessions(t, version)
+				left, right := mpudpStreams(t, client, server)
+				leftData := bytes.Repeat([]byte("client-tail-"), 256)
+				rightData := bytes.Repeat([]byte("server-tail-"), 256)
+				mpudpWrite(t, left, leftData)
+				mpudpWrite(t, right, rightData)
+				mpudpFINBarrier(t, client, server, left, right)
+				for i, target := range []*Stream{left, right} {
+					want := rightData
+					if i == 1 {
+						want = leftData
+					}
+					var got []byte
+					var err error
+					if method == "WriteTo" {
+						var dst bytes.Buffer
+						_, err = target.WriteTo(&dst)
+						got = dst.Bytes()
+						if err == io.EOF {
+							err = nil
+						}
+					} else {
+						got, err = mpudpReadAll(target)
+					}
+					t.Logf("peer=%d want=%d read=%d error=%v", i, len(want), len(got), err)
+					if err != nil || !bytes.Equal(got, want) {
+						t.Errorf("unread tail lost or failed: peer=%d want=%d read=%d error=%v", i, len(want), len(got), err)
+					}
+				}
+				if client.NumStreams() != 0 || server.NumStreams() != 0 {
+					t.Errorf("drained streams retained: client=%d server=%d", client.NumStreams(), server.NumStreams())
+				}
+				if atomic.LoadInt32(&client.bucket) != int32(client.config.MaxReceiveBuffer) ||
+					atomic.LoadInt32(&server.bucket) != int32(server.config.MaxReceiveBuffer) {
+					t.Error("receive byte tokens were not returned exactly once")
+				}
+			})
+		}
+	}
+}
+
+func TestMPUDPRemoteSYNAllocatesBeforeAccept(t *testing.T) {
+	peer, conn := net.Pipe()
+	cfg := mpudpConfig(2)
+	server, err := Server(conn, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		server.Close()
+		peer.Close()
+	})
+	peer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	const count = 32
+	var frames []byte
+	for i := 0; i < count; i++ {
+		var hdr rawHeader
+		hdr[0] = 2
+		hdr[1] = cmdSYN
+		binary.LittleEndian.PutUint32(hdr[4:], uint32(i*2+3))
+		frames = append(frames, hdr[:]...)
+	}
+	// A following header establishes that the last SYN was fully handled.
+	frames = append(frames, 2, cmdNOP, 0, 0, 0, 0, 0, 0)
+	if n, err := peer.Write(frames); err != nil || n != len(frames) {
+		t.Fatalf("SYN write = %d, %v", n, err)
+	}
+	server.streamLock.Lock()
+	allocated := len(server.streams)
+	initialRingSlots := 0
+	for _, stream := range server.streams {
+		initialRingSlots += len(stream.bufferRing.bufs)
+	}
+	server.streamLock.Unlock()
+	queued := len(server.chAccepts)
+	bucket := atomic.LoadInt32(&server.bucket)
+	t.Logf("Accept calls=0 allocated=%d queued=%d initial_ring_slots=%d receive_byte_tokens=%d", allocated, queued, initialRingSlots, bucket)
+	if allocated != count || queued != count || initialRingSlots != count*8 || bucket != int32(cfg.MaxReceiveBuffer) {
+		t.Fatalf("unexpected pre-Accept allocation: allocated=%d queued=%d slots=%d bucket=%d", allocated, queued, initialRingSlots, bucket)
+	}
+}
+

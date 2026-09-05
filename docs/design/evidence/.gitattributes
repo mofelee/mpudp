@@ -1,0 +1,4 @@
+# Preserve byte-exact external patches and fixture/license snapshots.
+*.patch -whitespace
+*.go.txt whitespace=-blank-at-eof
+UPSTREAM-LICENSE.txt whitespace=-blank-at-eof

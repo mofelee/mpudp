@@ -1,0 +1,294 @@
+package kcp
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"sync"
+	"testing"
+)
+
+type mpudpPolicySetter interface {
+	SetFastRetransmit(bool)
+}
+
+type mpudpFixture struct {
+	t                 *testing.T
+	sender, receiver  *KCP
+	sendWire, ackWire [][]byte
+	messages          [][]byte
+}
+
+func mpudpCapture(t *testing.T, queue *[][]byte) output_callback {
+	return func(buf []byte, size int) {
+		data := buf[:size]
+		for len(data) > 0 {
+			if len(data) < IKCP_OVERHEAD {
+				t.Fatalf("truncated KCP header: %d", len(data))
+			}
+			n := IKCP_OVERHEAD + int(binary.LittleEndian.Uint32(data[20:]))
+			if n > len(data) {
+				t.Fatalf("truncated KCP segment: %d > %d", n, len(data))
+			}
+			*queue = append(*queue, bytes.Clone(data[:n]))
+			data = data[n:]
+		}
+	}
+}
+
+func mpudpNewFixture(t *testing.T, threshold, count int) *mpudpFixture {
+	t.Helper()
+	f := &mpudpFixture{t: t}
+	f.sender = NewKCP(42, mpudpCapture(t, &f.sendWire))
+	f.receiver = NewKCP(42, mpudpCapture(t, &f.ackWire))
+	// Disable cwnd only in this fixture to create several outstanding segments.
+	f.sender.NoDelay(0, 10, threshold, 1)
+	f.receiver.NoDelay(0, 10, threshold, 1)
+	f.sender.rx_rto = 60000
+	for i := 0; i < count; i++ {
+		f.messages = append(f.messages, []byte(fmt.Sprintf("message-%d", i)))
+	}
+	return f
+}
+
+func (f *mpudpFixture) start() [][]byte {
+	f.t.Helper()
+	for _, message := range f.messages {
+		if rc := f.sender.Send(message); rc != 0 {
+			f.t.Fatalf("Send: %d", rc)
+		}
+	}
+	f.sender.flush(IKCP_FLUSH_FULL)
+	wire := f.sendWire
+	f.sendWire = nil
+	if len(wire) != len(f.messages) {
+		f.t.Fatalf("initial segments: got %d, want %d", len(wire), len(f.messages))
+	}
+	return wire
+}
+
+func (f *mpudpFixture) deliver(segments ...[]byte) {
+	f.t.Helper()
+	for _, data := range segments {
+		if rc := f.receiver.Input(data, IKCP_PACKET_REGULAR, true); rc != 0 {
+			f.t.Fatalf("receiver Input: %d", rc)
+		}
+	}
+}
+
+func (f *mpudpFixture) acknowledge() {
+	f.t.Helper()
+	acks := bytes.Join(f.ackWire, nil)
+	f.ackWire = nil
+	if len(acks) == 0 {
+		f.t.Fatal("no receiver-generated ACKs")
+	}
+	if rc := f.sender.Input(acks, IKCP_PACKET_REGULAR, false); rc != 0 {
+		f.t.Fatalf("sender Input: %d", rc)
+	}
+}
+
+func (f *mpudpFixture) expire(sn uint32) {
+	f.t.Helper()
+	for seg := range f.sender.snd_buf.ForEach {
+		if seg.sn == sn && seg.acked == 0 {
+			seg.resendts = currentMs() - 1
+			f.sender.flush(IKCP_FLUSH_FULL)
+			return
+		}
+	}
+	f.t.Fatalf("no outstanding segment %d", sn)
+}
+
+func (f *mpudpFixture) oneRetransmit(sn uint32) []byte {
+	f.t.Helper()
+	if len(f.sendWire) != 1 {
+		f.t.Fatalf("retransmitted segments: got %d, want 1", len(f.sendWire))
+	}
+	data := f.sendWire[0]
+	f.sendWire = nil
+	if data[4] != IKCP_CMD_PUSH || binary.LittleEndian.Uint32(data[12:]) != sn {
+		f.t.Fatalf("unexpected retransmitted segment: %x", data)
+	}
+	return data
+}
+
+func (f *mpudpFixture) receiveAll() {
+	f.t.Helper()
+	buf := make([]byte, 1024)
+	for i, want := range f.messages {
+		n := f.receiver.Recv(buf)
+		if n < 0 || !bytes.Equal(buf[:n], want) {
+			f.t.Fatalf("message %d: length %d, want %q", i, n, want)
+		}
+	}
+	if n := f.receiver.Recv(buf); n != -1 {
+		f.t.Fatalf("duplicate delivery: Recv returned %d", n)
+	}
+}
+
+func mpudpSetPolicy(t *testing.T, target any, enabled bool) {
+	t.Helper()
+	setter, ok := target.(mpudpPolicySetter)
+	if !ok {
+		t.Skip("baseline dependency has no explicit fast+early policy API")
+	}
+	setter.SetFastRetransmit(enabled)
+}
+
+func mpudpAssertCounters(t *testing.T, before *Snmp, fast, early, rto uint64) {
+	t.Helper()
+	after := DefaultSnmp.Copy()
+	gotFast := after.FastRetransSegs - before.FastRetransSegs
+	gotEarly := after.EarlyRetransSegs - before.EarlyRetransSegs
+	gotRTO := after.LostSegs - before.LostSegs
+	gotTotal := after.RetransSegs - before.RetransSegs
+	if gotFast != fast || gotEarly != early || gotRTO != rto || gotTotal != fast+early+rto {
+		t.Fatalf("retransmissions fast/early/RTO/total = %d/%d/%d/%d; want %d/%d/%d/%d",
+			gotFast, gotEarly, gotRTO, gotTotal, fast, early, rto, fast+early+rto)
+	}
+	t.Logf("fast=%d early=%d rto=%d total=%d", gotFast, gotEarly, gotRTO, gotTotal)
+}
+
+func TestMPUDPLegacyResendZeroStillEarlyRetransmits(t *testing.T) {
+	f := mpudpNewFixture(t, 0, 2)
+	wire := f.start()
+	before := DefaultSnmp.Copy()
+	f.deliver(wire[1])
+	f.acknowledge()
+	mpudpAssertCounters(t, before, 0, 1, 0)
+	f.deliver(f.oneRetransmit(0))
+	f.receiveAll()
+	f.acknowledge()
+	if n := f.sender.WaitSnd(); n != 0 {
+		t.Fatalf("outstanding segments: %d", n)
+	}
+}
+
+func TestMPUDPEnabledFastRetransmit(t *testing.T) {
+	f := mpudpNewFixture(t, 2, 3)
+	wire := f.start()
+	before := DefaultSnmp.Copy()
+	f.deliver(wire[1:]...)
+	f.acknowledge()
+	mpudpAssertCounters(t, before, 1, 0, 0)
+	f.deliver(f.oneRetransmit(0))
+	f.receiveAll()
+	f.acknowledge()
+	if n := f.sender.WaitSnd(); n != 0 {
+		t.Fatalf("outstanding segments: %d", n)
+	}
+}
+
+func TestMPUDPDisabledGapPreservesRTO(t *testing.T) {
+	for _, threshold := range []int{0, 2} {
+		t.Run(fmt.Sprintf("threshold_%d", threshold), func(t *testing.T) {
+			f := mpudpNewFixture(t, threshold, 3)
+			mpudpSetPolicy(t, f.sender, false)
+			// Later tuning must preserve the independently selected policy.
+			f.sender.NoDelay(1, 20, threshold, 1)
+			wire := f.start()
+			before := DefaultSnmp.Copy()
+			f.deliver(wire[1:]...)
+			f.acknowledge()
+			f.sender.flush(IKCP_FLUSH_FULL)
+			mpudpAssertCounters(t, before, 0, 0, 0)
+			if len(f.sendWire) != 0 {
+				t.Fatal("gap triggered output before RTO")
+			}
+			f.expire(0)
+			mpudpAssertCounters(t, before, 0, 0, 1)
+			f.deliver(f.oneRetransmit(0))
+			f.receiveAll()
+			f.acknowledge()
+			if n := f.sender.WaitSnd(); n != 0 {
+				t.Fatalf("outstanding segments: %d", n)
+			}
+		})
+	}
+}
+
+func TestMPUDPDisabledTailAndLostACK(t *testing.T) {
+	f := mpudpNewFixture(t, 2, 2)
+	mpudpSetPolicy(t, f.sender, false)
+	wire := f.start()
+	f.deliver(wire[0])
+	f.acknowledge()
+	before := DefaultSnmp.Copy()
+	f.expire(1)
+	f.deliver(f.oneRetransmit(1))
+	f.receiveAll()
+	f.ackWire = nil // Lose the first ACK of the repaired tail.
+	f.expire(1)
+	f.deliver(f.oneRetransmit(1))
+	if n := f.receiver.Recv(make([]byte, 1024)); n != -1 {
+		t.Fatalf("tail retransmission duplicated application delivery: %d", n)
+	}
+	f.acknowledge()
+	mpudpAssertCounters(t, before, 0, 0, 2)
+	if n := f.sender.WaitSnd(); n != 0 {
+		t.Fatalf("outstanding segments after repeated tail ACK: %d", n)
+	}
+}
+
+func TestMPUDPPolicyToggleDiscardsPriorGapEvidence(t *testing.T) {
+	f := mpudpNewFixture(t, 2, 3)
+	if _, ok := any(f.sender).(mpudpPolicySetter); !ok {
+		t.Skip("baseline dependency has no explicit fast+early policy API")
+	}
+	wire := f.start()
+	before := DefaultSnmp.Copy()
+	f.deliver(wire[1])
+	f.acknowledge()
+	if len(f.sendWire) != 0 {
+		t.Fatal("one gap unexpectedly reached the fast threshold")
+	}
+	mpudpSetPolicy(t, f.sender, false)
+	mpudpSetPolicy(t, f.sender, true)
+	f.sender.flush(IKCP_FLUSH_FULL)
+	if len(f.sendWire) != 0 {
+		t.Fatal("old gap evidence survived policy toggle")
+	}
+	// Fresh evidence after re-enabling can trigger the existing early path.
+	f.deliver(wire[2])
+	f.acknowledge()
+	f.sender.flush(IKCP_FLUSH_FULL)
+	mpudpAssertCounters(t, before, 0, 1, 0)
+	f.deliver(f.oneRetransmit(0))
+	f.receiveAll()
+	f.acknowledge()
+	if n := f.sender.WaitSnd(); n != 0 {
+		t.Fatalf("outstanding segments: %d", n)
+	}
+}
+
+func TestMPUDPUDPSessionPolicyIsSynchronized(t *testing.T) {
+	f := mpudpNewFixture(t, 2, 3)
+	session := &UDPSession{kcp: f.sender}
+	setter, ok := any(session).(mpudpPolicySetter)
+	if !ok {
+		t.Skip("baseline dependency has no UDPSession policy API")
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				setter.SetFastRetransmit(j%2 == 0)
+				session.SetNoDelay(0, 10, 2, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	setter.SetFastRetransmit(false)
+	wire := f.start()
+	before := DefaultSnmp.Copy()
+	f.deliver(wire[1:]...)
+	f.acknowledge()
+	f.sender.flush(IKCP_FLUSH_FULL)
+	mpudpAssertCounters(t, before, 0, 0, 0)
+	if len(f.sendWire) != 0 {
+		t.Fatal("UDPSession policy did not reach its KCP engine")
+	}
+}

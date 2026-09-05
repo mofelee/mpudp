@@ -1,0 +1,95 @@
+diff --git a/kcp.go b/kcp.go
+index b2d506a..3791fce 100644
+--- a/kcp.go
++++ b/kcp.go
+@@ -225,10 +225,11 @@ type KCP struct {
+ 	updated  uint32 // whether Update() has been called at least once
+ 
+ 	// Reliability
+-	dead_link  uint32 // max retransmit count before link is considered dead
+-	fastresend int32  // fast retransmit trigger count, 0 = disabled
+-	nocwnd     int32  // 1 = disable congestion control
+-	stream     int32  // 1 = stream mode (no message boundaries), 0 = message mode
++	dead_link              uint32 // max retransmit count before link is considered dead
++	fastresend             int32  // fast retransmit trigger count, 0 = disabled
++	fastRetransmitDisabled bool   // suppress both fast and early retransmits, retaining RTO
++	nocwnd                 int32  // 1 = disable congestion control
++	stream                 int32  // 1 = stream mode (no message boundaries), 0 = message mode
+ 
+ 	// Logging
+ 	logmask KCPLogType
+@@ -505,6 +506,9 @@ func (kcp *KCP) parse_ack(sn uint32) {
+ // parse_fastack increments the fast-ack counter for segments with sn < the given sn.
+ // Returns 1 if any segment's fastack counter has reached the fast retransmit threshold.
+ func (kcp *KCP) parse_fastack(sn, ts uint32) int {
++	if kcp.fastRetransmitDisabled {
++		return 0
++	}
+ 	shouldFastAck := 0
+ 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
+ 		return 0
+@@ -898,14 +902,14 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
+ 				needsend = true
+ 				segment.rto = kcp.rx_rto
+ 				segment.resendts = current + segment.rto
+-			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
++			} else if !kcp.fastRetransmitDisabled && segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
+ 				needsend = true
+ 				segment.fastack = 0xFFFFFFFF // must wait until RTO to reset
+ 				segment.rto = kcp.rx_rto
+ 				segment.resendts = current + segment.rto
+ 				change++
+ 				fastRetransSegs++
+-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
++			} else if !kcp.fastRetransmitDisabled && segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
+ 				needsend = true
+ 				segment.fastack = 0xFFFFFFFF
+ 				segment.rto = kcp.rx_rto
+@@ -1088,11 +1092,27 @@ func (kcp *KCP) SetMtu(mtu int) int {
+ 	return 0
+ }
+ 
++// SetFastRetransmit enables or disables both fast and early retransmissions.
++// Enabled is the default. Disabling preserves initial sends, ACK processing,
++// RTO retransmissions and congestion control. NoDelay does not change this policy.
++// Changing the policy discards accumulated gap evidence. As with other KCP
++// methods, callers must synchronize access to the state machine.
++func (kcp *KCP) SetFastRetransmit(enabled bool) {
++	if kcp.fastRetransmitDisabled == !enabled {
++		return
++	}
++	kcp.fastRetransmitDisabled = !enabled
++	for seg := range kcp.snd_buf.ForEach {
++		seg.fastack = 0
++	}
++}
++
+ // NoDelay options
+ // fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
+ // nodelay: 0:disable(default), 1:enable
+ // interval: internal update timer interval in millisec, default is 100ms
+ // resend: 0:disable fast resend(default), 1:enable fast resend
++// SetFastRetransmit(false) disables early retransmission as well as fast resend.
+ // nc: 0:normal congestion control(default), 1:disable congestion control
+ func (kcp *KCP) NoDelay(nodelay, interval, resend, nc int) int {
+ 	if nodelay >= 0 {
+diff --git a/sess.go b/sess.go
+index 4b7d611..4315f50 100644
+--- a/sess.go
++++ b/sess.go
+@@ -575,6 +575,15 @@ func (s *UDPSession) SetDUP(dup int) {
+ 	s.mu.Unlock()
+ }
+ 
++// SetFastRetransmit enables or disables both fast and early retransmissions.
++// Enabled is the default. RTO retransmissions remain active when disabled.
++// SetNoDelay does not change this policy.
++func (s *UDPSession) SetFastRetransmit(enabled bool) {
++	s.mu.Lock()
++	s.kcp.SetFastRetransmit(enabled)
++	s.mu.Unlock()
++}
++
+ // SetNoDelay calls nodelay() of kcp
+ // https://github.com/skywind3000/kcp/blob/master/README.en.md#protocol-configuration
+ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
