@@ -10,6 +10,9 @@ The subsequent [receive-credit comparison](v2-credit-20260905.md) fixes a
 deterministic reservation stall but records continuing network failure.
 The [receive-state diagnostic](v2-receive-20260905.md) adds live credit/group
 evidence and fresh profiles of the remaining upload failure.
+The [negotiated-path comparison](v2-paths-20260905.md) removes the observed
+short-run upload stall and publishes matching profiles and local benchmarks;
+formal throughput and capacity acceptance remain open.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.
