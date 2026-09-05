@@ -17,6 +17,7 @@ type ListenerOptions struct {
 	OnPacket    PacketHandler
 	OnError     ErrorHandler
 	RequirePMTU bool
+	Statistics  *Counters
 }
 
 // Listener owns one unconnected UDP socket. Every ReplyPath created by its
@@ -32,6 +33,7 @@ type Listener struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	pmtuEnabled bool
+	statistics  *Counters
 
 	mu        sync.RWMutex
 	writeMu   sync.Mutex
@@ -114,6 +116,7 @@ func newListener(conn net.PacketConn, options ListenerOptions, pmtuEnabled bool)
 		done:        make(chan struct{}),
 		closeDone:   make(chan struct{}),
 		pmtuEnabled: pmtuEnabled,
+		statistics:  options.Statistics,
 	}
 	go listener.readLoop()
 	return listener, nil
@@ -143,6 +146,7 @@ func (l *Listener) readLoop() {
 			}
 			return
 		}
+		l.statistics.receive(n, l.maxPayload)
 		if n > l.maxPayload {
 			l.reportError(&PathError{
 				PathID: l.id, Generation: l.generation, Operation: "read",
@@ -194,7 +198,7 @@ func (l *Listener) reportError(err error) {
 	}
 }
 
-func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Addr, payload []byte) error {
+func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters) error {
 	if ctx == nil {
 		return invalidArgument("nil send context")
 	}
@@ -214,7 +218,13 @@ func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Add
 	if len(payload) > l.maxPayload {
 		return &PayloadSizeError{Size: len(payload), Limit: l.maxPayload}
 	}
+	queuedAt := l.statistics.start()
+	pathQueuedAt := statistics.start()
 	l.writeMu.Lock()
+	var acquired time.Time
+	if !queuedAt.IsZero() || !pathQueuedAt.IsZero() {
+		acquired = time.Now()
+	}
 	defer l.writeMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -229,7 +239,23 @@ func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Add
 		_ = l.conn.SetWriteDeadline(time.Now())
 		close(callbackDone)
 	})
+	var writeStarted time.Time
+	if !acquired.IsZero() {
+		writeStarted = time.Now()
+	}
 	n, err := l.conn.WriteTo(payload, remote)
+	var elapsed time.Duration
+	if !writeStarted.IsZero() {
+		elapsed = time.Since(writeStarted)
+	}
+	if !queuedAt.IsZero() {
+		l.statistics.WriteQueue.Observe(acquired.Sub(queuedAt))
+	}
+	if !pathQueuedAt.IsZero() {
+		statistics.WriteQueue.Observe(acquired.Sub(pathQueuedAt))
+	}
+	l.statistics.wroteElapsed(n, err == nil && n == len(payload), err, !queuedAt.IsZero(), elapsed)
+	statistics.wroteElapsed(n, err == nil && n == len(payload), err, !pathQueuedAt.IsZero(), elapsed)
 	if !stop() {
 		<-callbackDone
 	}
@@ -284,6 +310,7 @@ type listenerReplyPath struct {
 	pathID     string
 	local      net.Addr
 	remote     net.Addr
+	statistics *Counters
 }
 
 func (r listenerReplyPath) PathID() string       { return r.pathID }
@@ -292,5 +319,18 @@ func (r listenerReplyPath) LocalAddr() net.Addr  { return cloneAddr(r.local) }
 func (r listenerReplyPath) RemoteAddr() net.Addr { return cloneAddr(r.remote) }
 func (r listenerReplyPath) Available() bool      { return r.listener.Available() }
 func (r listenerReplyPath) Send(ctx context.Context, payload []byte) error {
-	return r.listener.sendTo(ctx, r.generation, r.remote, payload)
+	return r.listener.sendTo(ctx, r.generation, r.remote, payload, r.statistics)
+}
+
+// WithReplyStatistics attaches an accepted listener path's collector at the
+// actual socket boundary. Other ReplyPath implementations are left unchanged.
+func WithReplyStatistics(path ReplyPath, counters *Counters) ReplyPath {
+	if counters == nil {
+		return path
+	}
+	if reply, ok := path.(listenerReplyPath); ok {
+		reply.statistics = counters
+		return reply
+	}
+	return path
 }

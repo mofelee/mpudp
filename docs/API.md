@@ -132,6 +132,86 @@ select。
 
 ## SessionID 与诊断
 
+`Peer.Statistics()` 返回可直接 JSON 编码的有界诊断快照；`CapturedAt` 用于相邻采样差分，
+例如 `ΔPaths[i].SentPackets / Δseconds` 得到 PPS。累计计数和峰值贯穿 Peer 生命周期，
+不因 Session 关闭或 socket rebuild 清零，`Peer.Close()` 后仍可读取。各字段独立原子采样，正在收发时
+不是同一瞬间的一致性事务；不可用单次快照中字段之间的细微差异推断丢包。
+
+默认记录 ingress accepted/drop、delivery accepted/drop、成功写入的 Datagram 和实际
+`ReadPacket` 返回的 payload 字节，以及 FEC 完成、需要 parity 的恢复 block/缺失 data
+shard、pending 超时、decoder-full、pending duplicate 和 completed-cache late shard。
+`FEC.LateShards` 包括已经恢复完成后正常抵达的剩余 parity/data shard，不等于网络丢包，
+也不覆盖 completed cache 过期或淘汰后的到达。`IngressDrops` 仅统计完整 packet ingress
+队列溢出；可恢复错误事件、鉴权拒绝及关闭时未消费的数据不计入这个数值。
+
+`FEC.CompletedCapacityEvictions` 只累计 completed cache 因容量上限产生的淘汰，不包含
+TTL 到期。`PendingBlocks`、`PendingShards`、`PendingBytes` 是所有存活 decoder 的当前
+占用总和，会在完成、超时和关闭时下降；`PendingBytes` 仅计算 decoder 持有的 shard
+payload 字节，不含 map、索引、codec 和重建过程的临时内存。对应的
+`PendingBlocksHighWater`、`PendingShardsHighWater`、`PendingBytesHighWater` 保存 Peer
+生命周期内各总和的独立峰值，关闭后仍保留；它们不是逐 Session 峰值之和。
+
+容量淘汰计数与 pending 占用不能单独证明某个 completed key 被晚到 shard 重新打开。
+以下确定性工作负载先完成 32 个已知 PacketID，再释放各自两个 parity shard；固定
+RS(3+2)、1200-byte Datagram、16 个 pending 槽，比较 completed 容量 8/16/32：
+
+```sh
+go test ./internal/fec -run TestDelayedParityCapacityDiagnostics -v
+go test ./internal/fec -run '^$' -bench BenchmarkDelayedParityCapacity -benchmem
+```
+
+| Completed 容量 | 容量淘汰 | 重新打开的 pending block | Pending shard | Pending 字节 | Decoder-full | 新 block 被拒绝 |
+|---|---|---|---|---|---|---|
+| 8 | 24 | 16 | 32 | 12800 | 17 | 是 |
+| 16 | 16 | 16 | 32 | 12800 | 1 | 是 |
+| 32 | 0 | 0 | 0 | 0 | 0 | 否 |
+
+Pending 指标在全部晚到 parity 处理后、尝试新 block 前采样；decoder-full 包含随后对新
+block 首个 shard 的尝试。测试还验证固定 decode timeout 到期后占用归零。该实验记录
+v1 当前行为并为 #18 提供基线，不修复该缺陷，也不代表网络吞吐量或生产容量建议。
+
+`Paths` 只包含配置顺序的 `carrier-N` 和可选的 `listener`：同一 Carrier 索引的多个
+Session socket 合并，listener 为单个共享 socket 的汇总，不输出地址、SessionID、PSK
+或业务内容。计数是 UDP payload 层，包括 MPUDP 头部、FEC 和控制报文，不含 IP/UDP/L2
+头部。接收字节使用 `Read`/`ReadFrom` 返回的长度；超大报文可能已被内核截断至接收
+buffer，因此该情况另计 `ReceiveOversizeDrops`。`SentBytes` 只累计 socket write 返回
+的已写入字节，`SentPackets` 仅计完整成功的 socket write，`SendErrors` 计 socket write
+错误或 short write；写前校验、设置 deadline 失败和内核/qdisc 后续丢弃不在其中。
+
+`ListenerPaths` 单独统计监听端已认证且协议语义接受的 Endpoint 流量，路径名称按首次
+接受顺序分配为 `listener-path-N`。Peer 生命周期内最多保留 256 个匿名路径槽，之后
+的新路径合并至 `listener-overflow`，不再保留新地址索引。身份包含监听 socket generation
+和本地/远端 Endpoint，不含 SessionID；同一路径跨 Session、Endpoint TTL 到期后仍复用
+已有槽，计数不会清零，也不回收槽。统计快照不输出地址或身份哈希。
+
+无效认证、未知 Session 非 HELLO、不兼容握手、Endpoint/Session/decoder 容量拒绝和
+不匹配的 PONG 不分配槽，也不增加路径接收计数；已接受的 duplicate/late shard 仍计入。
+CLOSE 只归入该 Session 已有的源 Endpoint，不为未知源分配槽。发送包含该路径上的
+HELLO_ACK、PONG、keepalive、DATA 和 CLOSE 的实际 socket 写入。因接收范围不同，
+`ListenerPaths` 总和不必等于包含无效/超大报文的 `Paths` 中 `listener` 汇总；路径行的
+`ReceiveOversizeDrops` 为零，超大报文只计入原始 socket 行。
+
+`Peer.SetDiagnosticsEnabled(true)` 打开额外诊断，默认关闭：
+
+- `IngressQueue`：callback enqueue 到 dispatcher 处理之间的队列时间。
+- `SendLatency`：公共 Session 写入通过生命周期检查后，内部 Datagram 写入的总耗时，
+  包括编码、调度和 socket send；不是接收确认时间。
+- 每路径 `WriteQueue`：socket 写锁的实际等待时间，不包含 deadline 等写前准备；
+  `SocketWrite` 为实际 socket 调用耗时，不包含写后计数和 deadline 清理。
+  listener socket 汇总与匿名路径使用同一次 socket 调用测量，不计上层 `Send` 包装耗时。
+- 每路径 `SentPacketSizes` / `ReceivedPacketSizes`：完整 UDP payload 长度的固定分桶，
+  `UpperBounds` 为包含上界，`Counts` 为各桶独立计数。
+
+延迟使用固定 24 桶：`<=1us, <=2us, ..., <=4194304us, overflow`，同样为独立计数；
+`TotalNS` 和 `MaxNS` 单位为纳秒。关闭诊断保留已有样本；开关切换前启动的在途操作仍可
+完成统计。关闭状态保留基本原子计数，但不读取额外时钟或记录包长分布；
+`go test -run '^$' -bench BenchmarkIngressDiagnostics -benchmem .` 可比较 ingress 局部
+开销，不代替完整负载下的开启/关闭实验。
+
+这些统计不声称在 256 个槽以外逐一覆盖监听端远端、socket receive overflow、qdisc drop、KCP
+RTT/RTO/重传、业务 ACK 返回排队、per-Carrier MTU epoch/probe/padding 等指标。它们需要
+基准工具的相应内核/上层采样或后续协议实现，不能以零值替代缺失证据。
+
 `SessionID` 是 `[16]byte`。`NewSessionID()` 和公开 `NewPeer()` 始终使用
 `crypto/rand.Reader`；全零结果有限重试，随机源失败不会返回可用 ID。配置和公共 API 没有
 设置固定 SessionID 的入口。

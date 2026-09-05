@@ -33,6 +33,7 @@ type endpointState struct {
 	rtt          time.Duration
 	hasRTT       bool
 	healthy      bool
+	statistics   *transport.Counters
 }
 
 type outstandingProbe struct {
@@ -238,7 +239,7 @@ func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket
 			err = makeErr
 			break
 		}
-		response = &sendPlan{message: ack, path: packet.Reply, budget: s.sendMaxUDPPayload}
+		response = &sendPlan{message: ack, path: s.endpoints[key].path, budget: s.sendMaxUDPPayload}
 	case wire.TypeHelloAck:
 		if s.role != RoleInitiator || (s.state != StateHandshaking && s.state != StateEstablished) {
 			err = ErrUnexpectedPacket
@@ -300,7 +301,7 @@ func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket
 			err = makeErr
 			break
 		}
-		response = &sendPlan{message: pong, path: packet.Reply, budget: s.sendMaxUDPPayload}
+		response = &sendPlan{message: pong, path: s.endpoints[key].path, budget: s.sendMaxUDPPayload}
 	case wire.TypePong:
 		if s.state != StateEstablished {
 			err = ErrNotEstablished
@@ -325,6 +326,7 @@ func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket
 			endpoint.hasRTT = true
 		}
 	case wire.TypeClose:
+		s.receiveEndpointLocked(key, len(packet.Payload))
 		decoderToClose = s.decoder
 		s.decoder = nil
 		s.encoder = nil
@@ -337,6 +339,7 @@ func (s *Session) handleAuthenticated(ctx context.Context, packet ReceivedPacket
 		s.mu.Unlock()
 		return result, err
 	}
+	s.receiveEndpointLocked(key, len(packet.Payload))
 	if response != nil {
 		s.active.Add(1)
 	}
@@ -542,6 +545,7 @@ func (s *Session) establishLocked(handshake wire.Handshake, now time.Time) error
 		Params: s.settings.params, Budget: budget, DecodeTimeout: s.settings.decodeTimeout,
 		CompletionTTL: s.settings.completionTTL, MaxPendingBlocks: s.settings.maxPendingFECBlocks,
 		MaxCompletedBlocks: s.settings.maxCompletedFECBlocks, Clock: s.settings.clock,
+		Statistics: s.settings.fecStatistics,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrHandshakeIncompatible, err)
@@ -771,8 +775,18 @@ func (s *Session) learnEndpointLocked(key string, path ReplyPath, now time.Time)
 	if err := s.canLearnEndpointLocked(key, path, now); err != nil {
 		return false, false, err
 	}
+	var counters *transport.Counters
+	if s.role == RoleListener {
+		if endpoint := s.endpoints[key]; endpoint != nil {
+			counters = endpoint.statistics
+		} else {
+			counters = s.settings.listenerPathStatistics.Learn(key)
+		}
+		path = transport.WithReplyStatistics(path, counters)
+	}
 	if endpoint := s.endpoints[key]; endpoint != nil {
 		endpoint.path = path
+		endpoint.statistics = counters
 		endpoint.lastActivity = now
 		endpoint.healthy = true
 		if carrier := s.carrierByID[path.PathID()]; carrier != nil {
@@ -780,11 +794,17 @@ func (s *Session) learnEndpointLocked(key string, path ReplyPath, now time.Time)
 		}
 		return false, true, nil
 	}
-	s.endpoints[key] = &endpointState{key: key, path: path, lastActivity: now, healthy: true}
+	s.endpoints[key] = &endpointState{key: key, path: path, lastActivity: now, healthy: true, statistics: counters}
 	if carrier := s.carrierByID[path.PathID()]; carrier != nil {
 		carrier.healthy = true
 	}
 	return true, false, nil
+}
+
+func (s *Session) receiveEndpointLocked(key string, size int) {
+	if endpoint := s.endpoints[key]; endpoint != nil {
+		endpoint.statistics.ReceiveAccepted(size)
+	}
 }
 
 func (s *Session) sweepEndpointsLocked(now time.Time) int {

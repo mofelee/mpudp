@@ -219,6 +219,7 @@ sudo env PATH="${PATH}" GOFLAGS=-buildvcs=false \
 - [Wire 协议](docs/WIRE_PROTOCOL.md)
 - [FEC 与调度](docs/FEC.md)
 - [集成测试](docs/INTEGRATION.md)
+- [单流性能基准与证据](docs/PERFORMANCE.md)
 - [完整配置示例](docs/MPUDP_CONFIG_EXAMPLE.md)
 - [v0.1 需求](docs/MPUDP_REQUIREMENTS.md)
 - [需求追踪矩阵](docs/TRACEABILITY.md)

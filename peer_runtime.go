@@ -76,6 +76,7 @@ type ingressEvent struct {
 	target       *session
 	listener     bool
 	transportErr error
+	queuedAt     time.Time
 }
 
 // session wraps the socket-free state machine with bounded delivery and public
@@ -177,6 +178,7 @@ func (p *Peer) newInitiatorSession() (Session, error) {
 	carrierAddresses := append([]string(nil), p.config.Carriers...)
 	maxPayload := p.config.Transport.MaxUDPPayload
 	stateConfig := mapSessionConfig(p.config)
+	stateConfig.FECStatistics = &p.statistics.fec
 	p.mu.Unlock()
 
 	succeeded := false
@@ -192,6 +194,7 @@ func (p *Peer) newInitiatorSession() (Session, error) {
 		pathID := fmt.Sprintf("carrier-%d", index)
 		carrier, err := p.deps.openCarrier(p.ctx, pathID, remote, transport.CarrierOptions{
 			MaxPayload: maxPayload,
+			Statistics: p.statistics.carriers[index],
 			OnPacket: func(packet transport.ReceivedPacket) {
 				p.enqueue(ingressEvent{packet: packet, target: s})
 			},
@@ -321,8 +324,19 @@ func (s *session) WritePacket(payload []byte) error {
 	s.mu.Unlock()
 	defer s.active.Done()
 
+	var sendStarted time.Time
+	if owner != nil && owner.statistics.enabled.Load() {
+		sendStarted = time.Now()
+	}
 	_, err := controller.WritePacket(context.Background(), payload)
 	if owner != nil {
+		if err == nil {
+			owner.statistics.sentDatagrams.Add(1)
+			owner.statistics.sentDatagramBytes.Add(uint64(len(payload)))
+		}
+		if !sendStarted.IsZero() {
+			owner.statistics.sendLatency.Observe(time.Since(sendStarted))
+		}
 		owner.wakeDriver()
 	}
 	return mapRuntimeError(err)
@@ -337,6 +351,7 @@ func (s *session) ReadPacket() ([]byte, error) {
 		}
 		delivery := s.delivery
 		done := s.done
+		owner := s.owner
 		s.mu.Unlock()
 
 		select {
@@ -346,6 +361,10 @@ func (s *session) ReadPacket() ([]byte, error) {
 			s.mu.Unlock()
 			if closed {
 				return nil, ErrClosed
+			}
+			if owner != nil {
+				owner.statistics.deliveredPackets.Add(1)
+				owner.statistics.deliveredBytes.Add(uint64(len(packet)))
 			}
 			return packet, nil
 		case <-done:
@@ -412,11 +431,18 @@ func (s *session) deliver(packet []byte) {
 		return
 	}
 	delivery := s.delivery
+	owner := s.owner
 	s.mu.Unlock()
 	select {
 	case delivery <- packet:
+		if owner != nil {
+			owner.statistics.deliveryAccepted.Add(1)
+		}
 	default:
 		// Deterministic drop-newest keeps a slow consumer bounded.
+		if owner != nil {
+			owner.statistics.deliveryDrops.Add(1)
+		}
 	}
 }
 
@@ -493,10 +519,19 @@ func (p *Peer) enqueue(event ingressEvent) {
 		return
 	default:
 	}
+	if event.transportErr == nil && p.statistics.enabled.Load() {
+		event.queuedAt = time.Now()
+	}
 	select {
 	case p.ingress <- event:
+		if event.transportErr == nil {
+			p.statistics.ingressAccepted.Add(1)
+		}
 	default:
 		// Transport callbacks never block. Full ingress drops the newest packet.
+		if event.transportErr == nil {
+			p.statistics.ingressDrops.Add(1)
+		}
 	}
 }
 
@@ -599,6 +634,9 @@ func (p *Peer) run() {
 }
 
 func (p *Peer) handleIngress(event ingressEvent) {
+	if !event.queuedAt.IsZero() {
+		p.statistics.ingressQueue.Observe(time.Since(event.queuedAt))
+	}
 	if event.transportErr != nil {
 		p.reportRuntimeError("MPUDP transport failed", event.transportErr)
 		if isRecoverableRuntimeTransportError(event.transportErr) {

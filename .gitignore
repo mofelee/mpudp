@@ -1,0 +1,5 @@
+/integration/perf/artifacts/
+/integration/perf/bin/
+/integration/perf/perfprobe
+/scripts/perf/__pycache__/
+**/.lab/

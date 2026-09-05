@@ -107,6 +107,10 @@ func (l *Listener) HandlePacket(ctx context.Context, packet ReceivedPacket) (*Se
 	}
 	session.onClose = l.removeSession
 	l.sessions[message.Header.SessionID] = session
+	session.mu.Lock()
+	session.receiveEndpointLocked(key, len(packet.Payload))
+	reply := session.endpoints[key].path
+	session.mu.Unlock()
 	l.mu.Unlock()
 
 	result := HandleResult{Message: message, Created: true, Established: true, EndpointAdded: true}
@@ -121,7 +125,7 @@ func (l *Listener) HandlePacket(ctx context.Context, packet ReceivedPacket) (*Se
 	}
 	session.active.Add(1)
 	session.mu.Unlock()
-	attempts := session.executePlans(ctx, []sendPlan{{message: ack, path: packet.Reply, budget: session.sendMaxUDPPayload}})
+	attempts := session.executePlans(ctx, []sendPlan{{message: ack, path: reply, budget: session.sendMaxUDPPayload}})
 	session.active.Done()
 	result.Response = &attempts[0]
 	return session, result, nil

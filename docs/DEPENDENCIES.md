@@ -88,6 +88,37 @@ change when imports, tags, or build constraints change.
 
 ## CI and system tooling
 
+### Isolated performance probe
+
+`integration/perf` is a separate Go module for experimental comparisons. Its
+`replace` directive builds the checked-out MPUDP source by default. Its kcp-go
+adapter is not linked into the product CLI and does not implement the native
+KCP mode tracked by #24. Run the audit commands above from that directory too.
+
+The probe additionally compiles the following modules (alongside the production
+reedsolomon, cpuid and YAML dependencies already listed):
+
+| Component | Version | Upstream license |
+|---|---:|---|
+| `github.com/xtaci/kcp-go/v5` | v5.6.72 | [MIT](https://github.com/xtaci/kcp-go/blob/v5.6.72/LICENSE) |
+| `github.com/pkg/errors` | v0.9.1 | [BSD-2-Clause](https://github.com/pkg/errors/blob/v0.9.1/LICENSE) |
+| `github.com/tjfoc/gmsm` | v1.4.1 | [Apache-2.0](https://github.com/tjfoc/gmsm/blob/v1.4.1/LICENSE) |
+| `golang.org/x/crypto` | v0.45.0 | [BSD-3-Clause](https://github.com/golang/crypto/blob/v0.45.0/LICENSE) |
+| `golang.org/x/net` | v0.47.0 | [BSD-3-Clause](https://github.com/golang/net/blob/v0.47.0/LICENSE) |
+| `golang.org/x/sys` | v0.38.0 | [BSD-3-Clause](https://github.com/golang/sys/blob/v0.38.0/LICENSE) |
+| `golang.org/x/time` | v0.14.0 | [BSD-3-Clause](https://github.com/golang/time/blob/v0.14.0/LICENSE) |
+
+The probe does not enable KCP encryption or KCP FEC, even though kcp-go's compiled
+implementation includes the corresponding dependencies. Its modules remain
+outside the current release binary archives. Distribution of a probe binary
+requires retaining these modules' applicable licenses and notices as well.
+
+The capacity and measurement runners also require Python 3, SSH, iperf3 and
+systemd on the test infrastructure. They are environment tools, not bundled
+product runtime dependencies.
+
+### Hosted workflows
+
 GitHub Actions are executed build tooling, not shipped MPUDP dependencies. The
 workflow pins each action to a full commit and the license at each checked pin
 is MIT:

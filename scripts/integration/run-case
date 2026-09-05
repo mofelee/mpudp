@@ -2771,12 +2771,17 @@ wait_shutdown_helper() {
 finish_shutdown_pair() {
 	local phase=$1 action=$2 events
 	if [[ ${action} == signal ]]; then
-		kill -TERM "${shutdown_listener_pid}" "${shutdown_initiator_pid}"
+		# The listener must finish its pending read under its own signal before
+		# the initiator can send CLOSE and end that read remotely.
+		kill -TERM "${shutdown_listener_pid}"
+		wait_shutdown_helper "${shutdown_listener_pid}" "${shutdown_listener_log}" "${phase} listener"
+		kill -TERM "${shutdown_initiator_pid}"
+		wait_shutdown_helper "${shutdown_initiator_pid}" "${shutdown_initiator_log}" "${phase} initiator"
 	else
 		printf 'close\n' >"${shutdown_close_file}"
+		wait_shutdown_helper "${shutdown_initiator_pid}" "${shutdown_initiator_log}" "${phase} initiator"
+		wait_shutdown_helper "${shutdown_listener_pid}" "${shutdown_listener_log}" "${phase} listener"
 	fi
-	wait_shutdown_helper "${shutdown_initiator_pid}" "${shutdown_initiator_log}" "${phase} initiator"
-	wait_shutdown_helper "${shutdown_listener_pid}" "${shutdown_listener_log}" "${phase} listener"
 	for events in "${shutdown_listener_events}" "${shutdown_initiator_events}"; do
 		grep -q "\"event\":\"phase_ready\".*\"phase\":\"${phase}\"" "${events}" || {
 			mpudp_it_die "${phase} helper did not record phase readiness"

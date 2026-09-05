@@ -67,6 +67,8 @@ type Config struct {
 	HandshakeRetryInterval    time.Duration
 	HandshakeRetryJitterLimit time.Duration
 	Clock                     Clock
+	FECStatistics             *fec.Counters
+	ListenerPathStatistics    *transport.ListenerPathCounters
 }
 
 // ListenerConfig adds the global authenticated Session bound.

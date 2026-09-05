@@ -37,8 +37,9 @@ type ciWorkflowTrigger struct {
 }
 
 type ciWorkflowStep struct {
-	If  string `yaml:"if"`
-	Run string `yaml:"run"`
+	If               string `yaml:"if"`
+	Run              string `yaml:"run"`
+	WorkingDirectory string `yaml:"working-directory"`
 }
 
 type canonicalCaseContract struct {
@@ -98,9 +99,10 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 		"build-unit":  "build-unit",
 		"race":        "race",
 		"integration": "integration / ${{ matrix.case }}",
+		"perf-tools":  "perf-tools",
 	}
 	if len(workflow.Jobs) != len(wantJobs) {
-		t.Fatalf("CI jobs = %v, want exactly build-unit, race, and integration", workflow.Jobs)
+		t.Fatalf("CI has %d jobs, want build-unit, race, integration, and perf-tools", len(workflow.Jobs))
 	}
 	for id, name := range wantJobs {
 		job, ok := workflow.Jobs[id]
@@ -134,6 +136,25 @@ func TestCIWorkflowSecurityAndCleanupContract(t *testing.T) {
 	for command, found := range alwaysCleanup {
 		if !found {
 			t.Errorf("integration %s step is not guarded by exact always() cleanup", command)
+		}
+	}
+
+	perfChecks := map[string]string{
+		"python3 -m unittest discover -s scripts/perf": "",
+		"go mod verify": "integration/perf",
+		"go vet ./...":  "integration/perf",
+		"go test -race -count=1 -timeout 3m ./...": "integration/perf",
+		"MPUDP_PERF_PRIVILEGED_TESTS=1":            "integration/perf",
+	}
+	for command, directory := range perfChecks {
+		found := false
+		for _, step := range workflow.Jobs["perf-tools"].Steps {
+			if strings.Contains(step.Run, command) && step.WorkingDirectory == directory {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("perf-tools is missing %q in directory %q", command, directory)
 		}
 	}
 
