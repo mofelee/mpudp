@@ -131,7 +131,17 @@ func AppendFECBundle(dst []byte, bundle FECBundle, lookup ContextLookup, key Key
 		}
 		typedBytes += recordBytes
 	}
-	body := make([]byte, RouteSize+typedBytes)
+	bodyBytes := RouteSize + typedBytes
+	var body []byte
+	if dst == nil {
+		// Place the body at its final offset so AppendEnvelope can frame and
+		// authenticate this allocation without moving it or growing dst.
+		packet := make([]byte, EnvelopeOverhead+bodyBytes)
+		dst, body = packet[:0], packet[PrefixSize:PrefixSize+bodyBytes]
+	} else {
+		// Caller-owned destination capacity may overlap any input record.
+		body = make([]byte, bodyBytes)
+	}
 	encodeRoute(body, bundle.Route)
 	binary.BigEndian.PutUint16(body[RouteSize:RouteSize+2], uint16(len(bundle.Records)))
 	offset := RouteSize + FECBundlePrefixSize
