@@ -84,7 +84,7 @@ func (l *Listener) HandlePacket(ctx context.Context, packet ReceivedPacket) (*Se
 	}
 	if existing := l.sessions[message.Header.SessionID]; existing != nil {
 		l.mu.Unlock()
-		result, handleErr := existing.handleAuthenticated(ctx, packet, message)
+		result, handleErr := existing.handleAuthenticatedWithIdentity(ctx, packet, message, key)
 		return existing, result, handleErr
 	}
 	if message.Header.Type != wire.TypeHello {

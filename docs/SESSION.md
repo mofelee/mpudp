@@ -76,6 +76,10 @@ Endpoint identity 包含 transport PathID、socket generation、local address �
 address，记录 generation-bound ReplyPath、最后认证活动时间、health 和最近 RTT。发送
 候选按完整 identity 排序，绝不依赖 Go map iteration 顺序。
 
+Listener 认证后只计算一次报文的 immutable ReplyPath identity，并传给查找到的 Session。
+Session 在处理前再次检查 ReplyPath 当前可用性，避免 registry lookup 期间失效的路径
+刷新 Endpoint；直接调用 Session 时仍自行验证并计算 identity。
+
 新增 Endpoint 前先清除已经达到 TTL 的记录。若仍达到 `MaxEndpoints`，采用固定的
 reject-new 策略；现有 Endpoint 仍可刷新，不因攻击者提供的新来源而被驱逐。Endpoint
 达到 TTL 后从调度候选和 probe state 删除，但 SessionID、已建立状态和其他路径不变。
