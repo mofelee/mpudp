@@ -68,7 +68,7 @@ func (l *Listener) HandlePacket(ctx context.Context, packet ReceivedPacket) (*Se
 	if err := ctx.Err(); err != nil {
 		return nil, HandleResult{}, err
 	}
-	message, err := wire.DecodeAuthenticated(packet.Payload, l.settings.psk, l.settings.localMaxUDPPayload)
+	message, err := l.settings.authenticator.Decode(packet.Payload, l.settings.localMaxUDPPayload)
 	if err != nil {
 		return nil, HandleResult{}, err
 	}

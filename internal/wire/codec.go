@@ -35,6 +35,10 @@ func EncodedLen(message Message) (int, error) {
 // AppendAuthenticated appends the canonical authenticated encoding of message
 // to dst. It returns dst unchanged on every validation error.
 func AppendAuthenticated(dst []byte, message Message, psk []byte, budget int) ([]byte, error) {
+	return appendAuthenticated(dst, message, psk, budget, nil)
+}
+
+func appendAuthenticated(dst []byte, message Message, psk []byte, budget int, authenticator *Authenticator) ([]byte, error) {
 	if len(psk) == 0 {
 		return dst, ErrInvalidKey
 	}
@@ -78,9 +82,13 @@ func AppendAuthenticated(dst []byte, message Message, psk []byte, budget int) ([
 	case TypeClose:
 	}
 
-	mac := hmac.New(sha256.New, psk)
-	_, _ = mac.Write(packet[:PrefixSize+bodySize])
-	copy(packet[PrefixSize+bodySize:], mac.Sum(nil))
+	if authenticator == nil {
+		mac := hmac.New(sha256.New, psk)
+		_, _ = mac.Write(packet[:PrefixSize+bodySize])
+		copy(packet[PrefixSize+bodySize:], mac.Sum(nil))
+	} else {
+		authenticator.sign(packet, PrefixSize+bodySize)
+	}
 	return dst, nil
 }
 
@@ -88,6 +96,10 @@ func AppendAuthenticated(dst []byte, message Message, psk []byte, budget int) ([
 // The returned DATA_SHARD Payload aliases datagram; callers retaining it must
 // keep datagram alive or copy the payload after this function succeeds.
 func DecodeAuthenticated(datagram, psk []byte, receiveLimit int) (Message, error) {
+	return decodeAuthenticated(datagram, psk, receiveLimit, nil)
+}
+
+func decodeAuthenticated(datagram, psk []byte, receiveLimit int, authenticator *Authenticator) (Message, error) {
 	if len(psk) == 0 {
 		return Message{}, ErrInvalidKey
 	}
@@ -122,9 +134,15 @@ func DecodeAuthenticated(datagram, psk []byte, receiveLimit int) (Message, error
 		return Message{}, ErrInvalidSessionID
 	}
 
-	mac := hmac.New(sha256.New, psk)
-	_, _ = mac.Write(datagram[:tagOffset])
-	if !hmac.Equal(mac.Sum(nil), datagram[tagOffset:]) {
+	authenticated := false
+	if authenticator == nil {
+		mac := hmac.New(sha256.New, psk)
+		_, _ = mac.Write(datagram[:tagOffset])
+		authenticated = hmac.Equal(mac.Sum(nil), datagram[tagOffset:])
+	} else {
+		authenticated = authenticator.verify(datagram, tagOffset)
+	}
+	if !authenticated {
 		return Message{}, ErrAuthentication
 	}
 
