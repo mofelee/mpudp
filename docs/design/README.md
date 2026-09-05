@@ -19,6 +19,7 @@ nor change the currently implemented [v1 protocol](../WIRE_PROTOCOL.md).
 | [Configuration/API](v2-configuration-api.md) | Concrete defaults/bounds, strict compatibility matrix, scheduling profile, public operation semantics |
 | [KCP evidence](evidence/20260905-kcp/README.md) | Pinned resend=0 early-retransmit reproduction and explicit-policy candidate patch |
 | [smux evidence](evidence/20260905-smux/README.md) | Pinned unread-tail loss and pre-SYN admission/isolation candidate hooks |
+| [FEC group codec foundation](fecv2-group-codec.md) | Implemented logical manifest and equal-size RS recovery primitives; runtime integration pending |
 
 The dependency evidence includes exact upstream SHAs, patches, fixture source,
 commands, results and limitations. Fixtures use `.go.txt` so the root module
