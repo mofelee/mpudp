@@ -122,6 +122,8 @@ these increase the matrix size. A formal baseline must include those comparisons
 For a deployment smoke test, select `--paths 5 --payloads 1400 --rounds 1
 --warmup 1 --seconds 5`. A smoke run only verifies the tool and traffic workflow.
 The runner records all resolved dimensions and never declares product acceptance.
+The [26-case protocol smoke report](performance/protocol-smoke-20260905.md)
+records the first real-lab replay and its measurement limits.
 
 The runner deploys the exact hashed executable into a new private remote workspace
 and verifies the bytes on disk. It sends secret configuration through SSH stdin
