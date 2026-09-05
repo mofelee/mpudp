@@ -1,4 +1,4 @@
-# MPUDP v0.1 公共 API
+# MPUDP 公共 API
 
 公共包为 `github.com/mofelee/mpudp`，严格配置模型位于
 `github.com/mofelee/mpudp/config`。公共数据面只提供 Datagram Session，不暴露 shard、
@@ -36,6 +36,13 @@ Peer 级 dispatcher。initiator-only 不绑定 listener；每次 `NewSession` �
 Carrier 打开一个长期 UDP socket，并立即发起认证 HELLO。任一 Carrier 打开失败时，本次
 调用已经打开的 socket 会全部关闭，且不会保留半初始化 Session。
 
+配置层识别 `protocol: datagram|kcp` 和 `wire.version: v1|v2`，但当前仅实现 v1 Datagram
+运行时。合法的 v2 配置在 `NewPeer` / `NewPeerContext` 中返回 `ErrProtocolUnavailable`，
+Peer 为 nil；拒绝发生在访问 context、随机源、socket/timer 依赖和启动 goroutine 之前。
+非法配置仍先返回 `ErrInvalidConfig`，例如 KCP 配 v1、非零 FEC 或 v2 UDP 上限小于 512。
+`Parse` / `Validate` 成功只表示配置合法，不表示运行时可用；没有自动降级或 KCP packet adapter。
+两个错误均通过 `errors.Is` 区分，错误不回显协议输入值或 PSK。
+
 `NewPeerContext` 提供相同的启动路径，并允许 context 取消 listener bind、Carrier dial 和
 运行时网络操作。context 取消会阻止或中止工作，但调用方仍须调用 `Peer.Close`，才能同步
 关闭 socket 并等待 dispatcher、receive loop 和在途 callback 全部退出。
@@ -45,7 +52,12 @@ Session，然后持续运行直到 SIGINT 或 SIGTERM；启动失败或收到信
 
 YAML 解析只对真正省略的可选字段应用默认值。Go 调用方直接组装配置时必须先调用
 `config.Default()`，再覆盖角色、FEC、PSK 和需要调整的选项；零值 `config.Config` 不会由
-`Validate` 或 `NewPeer` 隐式补默认。
+`Validate` 或 `NewPeer` 隐式补数值默认。新增 `Config.Protocol` 与 `Config.Wire.Version`
+使用 `config.Protocol` / `config.WireVersion` 类型；`Default()` 填入 `ProtocolDatagram`
+与 `WireVersionV1`。为兼容旧 Go struct literal，只有这两个新增字段的空字符串按
+datagram/v1 解释，并可通过 `EffectiveProtocol()` / `EffectiveWireVersion()` 查询；原配置
+不被改写。显式 YAML 空字符串仍无效。KCP 选择必须显式使用 `WireVersionV2` 并保持 FEC 0/0，
+目前构造仍返回 `ErrProtocolUnavailable`。
 
 `Peer.NewSession()` 只在 initiator/dual 模式可用；`Peer.Listener()` 只在 listener/dual
 模式可用，错误角色返回 `ErrModeUnavailable`。一个 dual Peer 的

@@ -10,6 +10,8 @@ import (
 )
 
 type rawConfig struct {
+	Protocol  *Protocol    `yaml:"protocol,omitempty"`
+	Wire      rawWire      `yaml:"wire,omitempty"`
 	Carriers  []string     `yaml:"carriers,omitempty"`
 	Listen    string       `yaml:"listen,omitempty"`
 	FEC       *rawFEC      `yaml:"fec"`
@@ -19,9 +21,27 @@ type rawConfig struct {
 	Timers    rawTimers    `yaml:"timers,omitempty"`
 }
 
+type rawWire struct {
+	Version *WireVersion `yaml:"version"`
+}
+
 type rawFEC struct {
-	DataShards   *int `yaml:"data_shards"`
-	ParityShards *int `yaml:"parity_shards"`
+	DataShards   *yamlShardCount `yaml:"data_shards"`
+	ParityShards *yamlShardCount `yaml:"parity_shards"`
+}
+
+type yamlShardCount int
+
+func (c *yamlShardCount) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!int" {
+		return fmt.Errorf("FEC shard count must be an integer")
+	}
+	var value int
+	if err := node.Decode(&value); err != nil {
+		return fmt.Errorf("FEC shard count exceeds the integer range")
+	}
+	*c = yamlShardCount(value)
+	return nil
 }
 
 type rawTransport struct {
@@ -47,6 +67,32 @@ type rawTimers struct {
 
 type yamlDuration struct {
 	time.Duration
+}
+
+// UnmarshalYAML rejects implicit scalar conversion and explicit empty values.
+func (p *Protocol) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return fmt.Errorf("protocol must be a string: datagram or kcp")
+	}
+	value := Protocol(node.Value)
+	if value != ProtocolDatagram && value != ProtocolKCP {
+		return fmt.Errorf("protocol must be datagram or kcp")
+	}
+	*p = value
+	return nil
+}
+
+// UnmarshalYAML accepts only explicit supported version names, never numbers.
+func (v *WireVersion) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return fmt.Errorf("wire.version must be a string: v1 or v2")
+	}
+	value := WireVersion(node.Value)
+	if value != WireVersionV1 && value != WireVersionV2 {
+		return fmt.Errorf("wire.version must be v1 or v2")
+	}
+	*v = value
+	return nil
 }
 
 func (d *yamlDuration) UnmarshalYAML(node *yaml.Node) error {
@@ -108,15 +154,21 @@ func parseBytes(data []byte) (Config, error) {
 	}
 
 	cfg := Default()
+	if raw.Protocol != nil {
+		cfg.Protocol = *raw.Protocol
+	}
+	if raw.Wire.Version != nil {
+		cfg.Wire.Version = *raw.Wire.Version
+	}
 	cfg.Carriers = append([]string(nil), raw.Carriers...)
 	cfg.Listen = raw.Listen
 	cfg.PSK = raw.PSK.clone()
 	if raw.FEC != nil {
 		if raw.FEC.DataShards != nil {
-			cfg.FEC.DataShards = *raw.FEC.DataShards
+			cfg.FEC.DataShards = int(*raw.FEC.DataShards)
 		}
 		if raw.FEC.ParityShards != nil {
-			cfg.FEC.ParityShards = *raw.FEC.ParityShards
+			cfg.FEC.ParityShards = int(*raw.FEC.ParityShards)
 		}
 	}
 	if raw.Transport.MaxUDPPayload != nil {

@@ -544,7 +544,8 @@ psk: "correct horse battery staple"
 
 func assertDefaults(t *testing.T, cfg config.Config) {
 	t.Helper()
-	if cfg.Transport.MaxUDPPayload != config.DefaultMaxUDPPayload ||
+	if cfg.Protocol != config.ProtocolDatagram || cfg.Wire.Version != config.WireVersionV1 ||
+		cfg.Transport.MaxUDPPayload != config.DefaultMaxUDPPayload ||
 		cfg.Limits.MaxDatagramSize != config.DefaultMaxDatagramSize ||
 		cfg.Limits.MaxPendingFECBlocks != config.DefaultMaxPendingFECBlocks ||
 		cfg.Limits.ReceiveQueueCapacity != config.DefaultReceiveQueueCapacity ||
