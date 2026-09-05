@@ -50,10 +50,13 @@ Peer 为 nil；拒绝发生在访问 context、随机源、socket/timer 依赖�
 CLI `cmd/mpudp` 读取 `-config` 后创建 Peer。initiator/dual 模式还会自动创建一个 outbound
 Session，然后持续运行直到 SIGINT 或 SIGTERM；启动失败或收到信号时都会执行受控 Close。
 
-YAML 解析只对真正省略的可选字段应用默认值。Go 调用方直接组装配置时必须先调用
-`config.Default()`，再覆盖角色、FEC、PSK 和需要调整的选项；零值 `config.Config` 不会由
-`Validate` 或 `NewPeer` 隐式补数值默认。新增 `Config.Protocol` 与 `Config.Wire.Version`
-使用 `config.Protocol` / `config.WireVersion` 类型；`Default()` 填入 `ProtocolDatagram`
+YAML 解析只对真正省略的可选字段应用默认值。Go 调用方直接组装 v1 配置时先调用
+`config.Default()`，再覆盖角色、FEC、PSK 和需要调整的选项；v2 使用
+`config.DefaultV2(protocol)` 初始化共享 transport/资源默认值，仍会由 Peer 构造函数返回
+`ErrProtocolUnavailable`。零值 `config.Config` 不会由 `Validate` 或 `NewPeer` 隐式补数值
+默认；直接 Go literal 必须显式满足全部 v2 校验。`Clone()` 同时深复制方向路径预算和 rate
+map。`Config.Protocol` 与 `Config.Wire.Version` 使用 `config.Protocol` /
+`config.WireVersion` 类型；`Default()` 填入 `ProtocolDatagram`
 与 `WireVersionV1`。为兼容旧 Go struct literal，只有这两个新增字段的空字符串按
 datagram/v1 解释，并可通过 `EffectiveProtocol()` / `EffectiveWireVersion()` 查询；原配置
 不被改写。显式 YAML 空字符串仍无效。KCP 选择必须显式使用 `WireVersionV2` 并保持 FEC 0/0，

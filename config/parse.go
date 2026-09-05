@@ -10,15 +10,16 @@ import (
 )
 
 type rawConfig struct {
-	Protocol  *Protocol    `yaml:"protocol,omitempty"`
-	Wire      rawWire      `yaml:"wire,omitempty"`
-	Carriers  []string     `yaml:"carriers,omitempty"`
-	Listen    string       `yaml:"listen,omitempty"`
-	FEC       *rawFEC      `yaml:"fec"`
-	PSK       Secret       `yaml:"psk"`
-	Transport rawTransport `yaml:"transport,omitempty"`
-	Limits    rawLimits    `yaml:"limits,omitempty"`
-	Timers    rawTimers    `yaml:"timers,omitempty"`
+	Protocol  *Protocol     `yaml:"protocol,omitempty"`
+	Wire      rawWire       `yaml:"wire,omitempty"`
+	Carriers  []string      `yaml:"carriers,omitempty"`
+	Listen    string        `yaml:"listen,omitempty"`
+	FEC       *rawFEC       `yaml:"fec"`
+	PSK       Secret        `yaml:"psk"`
+	Transport rawTransport  `yaml:"transport,omitempty"`
+	Scheduler *rawScheduler `yaml:"scheduler,omitempty"`
+	Limits    rawLimits     `yaml:"limits,omitempty"`
+	Timers    rawTimers     `yaml:"timers,omitempty"`
 }
 
 type rawWire struct {
@@ -45,10 +46,12 @@ func (c *yamlInteger) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type rawTransport struct {
-	MaxUDPPayload *yamlInteger `yaml:"max_udp_payload"`
+	MaxUDPPayload  *yamlInteger `yaml:"max_udp_payload"`
+	rawV2Transport `yaml:",inline"`
 }
 
 type rawLimits struct {
+	rawV2Limits            `yaml:",inline"`
 	MaxDatagramSize        *yamlInteger `yaml:"max_datagram_size"`
 	MaxPendingFECBlocks    *yamlInteger `yaml:"max_pending_fec_blocks"`
 	ReceiveQueueCapacity   *yamlInteger `yaml:"receive_queue_capacity"`
@@ -59,10 +62,12 @@ type rawLimits struct {
 }
 
 type rawTimers struct {
-	DecodeTimeout          *yamlDuration `yaml:"decode_timeout"`
-	EndpointTTL            *yamlDuration `yaml:"endpoint_ttl"`
-	KeepaliveInterval      *yamlDuration `yaml:"keepalive_interval"`
-	HandshakeRetryInterval *yamlDuration `yaml:"handshake_retry_interval"`
+	DatagramReassemblyTimeout *yamlDuration `yaml:"datagram_reassembly_timeout"`
+	GroupDecodeTimeout        *yamlDuration `yaml:"group_decode_timeout"`
+	DecodeTimeout             *yamlDuration `yaml:"decode_timeout"`
+	EndpointTTL               *yamlDuration `yaml:"endpoint_ttl"`
+	KeepaliveInterval         *yamlDuration `yaml:"keepalive_interval"`
+	HandshakeRetryInterval    *yamlDuration `yaml:"handshake_retry_interval"`
 }
 
 type yamlDuration struct {
@@ -160,6 +165,9 @@ func parseBytes(data []byte) (Config, error) {
 	if raw.Wire.Version != nil {
 		cfg.Wire.Version = *raw.Wire.Version
 	}
+	if cfg.Wire.Version == WireVersionV2 {
+		cfg = DefaultV2(cfg.Protocol)
+	}
 	cfg.Carriers = append([]string(nil), raw.Carriers...)
 	cfg.Listen = raw.Listen
 	cfg.PSK = raw.PSK.clone()
@@ -206,6 +214,9 @@ func parseBytes(data []byte) (Config, error) {
 	}
 	if raw.Timers.HandshakeRetryInterval != nil {
 		cfg.Timers.HandshakeRetryInterval = raw.Timers.HandshakeRetryInterval.Duration
+	}
+	if err := applyRawV2(raw, &cfg); err != nil {
+		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

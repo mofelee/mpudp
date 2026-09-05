@@ -47,6 +47,7 @@ type Config struct {
 	FEC       FECConfig       `yaml:"fec"`
 	PSK       Secret          `yaml:"psk"`
 	Transport TransportConfig `yaml:"transport,omitempty"`
+	Scheduler SchedulerConfig `yaml:"scheduler,omitempty"`
 	Limits    LimitsConfig    `yaml:"limits,omitempty"`
 	Timers    TimerConfig     `yaml:"timers,omitempty"`
 }
@@ -59,27 +60,51 @@ type FECConfig struct {
 
 // TransportConfig owns limits that apply to complete UDP payloads.
 type TransportConfig struct {
-	MaxUDPPayload int `yaml:"max_udp_payload"`
+	MaxUDPPayload        int            `yaml:"max_udp_payload"`
+	MaxReceiveUDPPayload int            `yaml:"max_receive_udp_payload,omitempty"`
+	MTUDiscovery         MTUDiscovery   `yaml:"mtu_discovery,omitempty"`
+	BudgetStrategy       BudgetStrategy `yaml:"budget_strategy,omitempty"`
+	OutboundPathBudgets  []PathBudget   `yaml:"outbound_path_budgets,omitempty"`
+	InboundPathBudgets   []PathBudget   `yaml:"inbound_path_budgets,omitempty"`
+	PLPMTUD              PLPMTUDConfig  `yaml:"plpmtud,omitempty"`
+	MaxRetainedEpochs    int            `yaml:"max_retained_epochs,omitempty"`
+	MaxEpochAge          time.Duration  `yaml:"max_epoch_age,omitempty"`
+	MaxMigrations        int            `yaml:"max_migrations,omitempty"`
 }
 
 // LimitsConfig owns bounded memory and queue resource settings.
 type LimitsConfig struct {
-	MaxDatagramSize        int `yaml:"max_datagram_size"`
-	MaxPendingFECBlocks    int `yaml:"max_pending_fec_blocks"`
-	ReceiveQueueCapacity   int `yaml:"receive_queue_capacity"`
-	DeliveryQueueCapacity  int `yaml:"delivery_queue_capacity"`
-	MaxSessions            int `yaml:"max_sessions"`
-	MaxEndpointsPerSession int `yaml:"max_endpoints_per_session"`
-	MaxHandshakeAttempts   int `yaml:"max_handshake_attempts"`
+	MaxDatagramSize              int `yaml:"max_datagram_size"`
+	MaxPendingFECBlocks          int `yaml:"max_pending_fec_blocks"`
+	ReceiveQueueCapacity         int `yaml:"receive_queue_capacity"`
+	DeliveryQueueCapacity        int `yaml:"delivery_queue_capacity"`
+	MaxSessions                  int `yaml:"max_sessions"`
+	MaxEndpointsPerSession       int `yaml:"max_endpoints_per_session"`
+	MaxHandshakeAttempts         int `yaml:"max_handshake_attempts"`
+	MaxPendingHandshakes         int `yaml:"max_pending_handshakes,omitempty"`
+	MaxPendingAccepts            int `yaml:"max_pending_accepts,omitempty"`
+	MaxPeerRetainedBytes         int `yaml:"max_peer_retained_bytes,omitempty"`
+	MaxSessionRetainedBytes      int `yaml:"max_session_retained_bytes,omitempty"`
+	MaxDatagramReassemblies      int `yaml:"max_datagram_reassemblies,omitempty"`
+	MaxFragmentsPerDatagram      int `yaml:"max_fragments_per_datagram,omitempty"`
+	MaxMigrationTransactionBytes int `yaml:"max_migration_transaction_bytes,omitempty"`
+	MaxStreamsPerSession         int `yaml:"max_streams_per_session,omitempty"`
+	MaxPeerStreams               int `yaml:"max_peer_streams,omitempty"`
+	MaxStreamRetainedBytes       int `yaml:"max_stream_retained_bytes,omitempty"`
+	MaxPathQueuedPackets         int `yaml:"max_path_queued_packets,omitempty"`
+	MaxPathQueuedBytes           int `yaml:"max_path_queued_bytes,omitempty"`
+	MaxSendWorkers               int `yaml:"max_send_workers,omitempty"`
 }
 
 // TimerConfig owns protocol timing settings. YAML values use Go duration
 // strings such as "500ms", "15s", or "2m".
 type TimerConfig struct {
-	DecodeTimeout          time.Duration `yaml:"decode_timeout"`
-	EndpointTTL            time.Duration `yaml:"endpoint_ttl"`
-	KeepaliveInterval      time.Duration `yaml:"keepalive_interval"`
-	HandshakeRetryInterval time.Duration `yaml:"handshake_retry_interval"`
+	DecodeTimeout             time.Duration `yaml:"decode_timeout"`
+	EndpointTTL               time.Duration `yaml:"endpoint_ttl"`
+	KeepaliveInterval         time.Duration `yaml:"keepalive_interval"`
+	HandshakeRetryInterval    time.Duration `yaml:"handshake_retry_interval"`
+	DatagramReassemblyTimeout time.Duration `yaml:"datagram_reassembly_timeout,omitempty"`
+	GroupDecodeTimeout        time.Duration `yaml:"group_decode_timeout,omitempty"`
 }
 
 // EffectiveProtocol preserves Datagram behavior for Go Config literals that
@@ -203,7 +228,7 @@ func (c Config) Validate() error {
 	if err := durationRange("timers.handshake_retry_interval", c.Timers.HandshakeRetryInterval, MinHandshakeRetryInterval, MaxHandshakeRetryInterval); err != nil {
 		return err
 	}
-	return nil
+	return c.validateV2()
 }
 
 // Clone returns a deep copy suitable for retaining beyond the call boundary.
@@ -211,6 +236,7 @@ func (c Config) Clone() Config {
 	cloned := c
 	cloned.Carriers = append([]string(nil), c.Carriers...)
 	cloned.PSK = c.PSK.clone()
+	cloneV2(&cloned)
 	return cloned
 }
 

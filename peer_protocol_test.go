@@ -16,9 +16,10 @@ func TestUnavailableProtocolRejectsBeforeRuntimeDependencies(t *testing.T) {
 	for _, protocol := range []config.Protocol{config.ProtocolDatagram, config.ProtocolKCP} {
 		t.Run(string(protocol), func(t *testing.T) {
 			t.Parallel()
-			cfg := baseConfig()
+			cfg := config.DefaultV2(protocol)
+			legacy := baseConfig()
+			cfg.PSK, cfg.FEC = legacy.PSK, legacy.FEC
 			cfg.Listen, cfg.Carriers = "127.0.0.1:9000", []string{"example.invalid:9001"}
-			cfg.Protocol, cfg.Wire.Version = protocol, config.WireVersionV2
 			if protocol == config.ProtocolKCP {
 				cfg.FEC = config.FECConfig{}
 			}
