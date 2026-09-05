@@ -267,6 +267,20 @@ func (q *Queue) Ready(now time.Time) (bool, error) {
 // backing plus shard-slice storage before encoding; errors retain queue IDs,
 // payloads and cursors. This is not a Flush/socket-completion fence.
 func (q *Queue) Seal(now time.Time, force bool) (*Output, error) {
+	return q.seal(now, force, nil)
+}
+
+// SealWithWorkspace uses a dedicated prepaid output slot instead of reserving
+// group credit during sealing. A live Output keeps the slot busy until Release.
+// Ordinary Seal remains independently reserved and permits multiple live outputs.
+func (q *Queue) SealWithWorkspace(now time.Time, force bool, workspace *OutputWorkspace) (*Output, error) {
+	if workspace == nil || workspace.state == nil {
+		return nil, invalid("nil output workspace")
+	}
+	return q.seal(now, force, workspace.state)
+}
+
+func (q *Queue) seal(now time.Time, force bool, workspace *outputWorkspaceState) (*Output, error) {
 	if q == nil {
 		return nil, ErrClosed
 	}
@@ -290,20 +304,32 @@ func (q *Queue) Seal(now time.Time, force bool) (*Output, error) {
 	if planned.count == 0 {
 		return nil, invalid("admitted Datagram cannot make encoding progress")
 	}
-	lease, err := q.session.Reserve(creditv2.Claim{Bytes: q.outputBytes})
+	var lease *creditv2.Lease
+	var err error
+	if workspace == nil {
+		lease, err = q.session.Reserve(creditv2.Claim{Bytes: q.outputBytes})
+	} else {
+		err = workspace.acquire(q)
+	}
 	if err != nil {
 		return nil, err
 	}
 	group, cursor, err := q.codec.EncodePrefix(planned.fragments[:planned.count])
 	if err != nil || cursor != planned.cursor {
+		for _, shard := range group.Shards {
+			clear(shard)
+		}
 		group.Shards = nil
 		lease.Release()
+		if workspace != nil {
+			workspace.releaseOutput()
+		}
 		if err != nil {
 			return nil, err
 		}
 		return nil, invalid("packing cursor differs from admission plan")
 	}
-	output := &Output{state: &outputState{group: SealedGroup{EncodingEpoch: q.epoch.ID, GroupID: q.nextGroupID, Group: group}, lease: lease}}
+	output := &Output{state: &outputState{group: SealedGroup{EncodingEpoch: q.epoch.ID, GroupID: q.nextGroupID, Group: group}, lease: lease, workspace: workspace}}
 	for range cursor.Next {
 		q.dropHeadLocked()
 	}
@@ -411,10 +437,11 @@ type SealedGroup struct {
 type Output struct{ state *outputState }
 
 type outputState struct {
-	mu       sync.Mutex
-	group    SealedGroup
-	lease    *creditv2.Lease
-	released bool
+	mu        sync.Mutex
+	group     SealedGroup
+	lease     *creditv2.Lease
+	workspace *outputWorkspaceState
+	released  bool
 }
 
 func (o *Output) View() (SealedGroup, bool) {
@@ -435,8 +462,15 @@ func (o *Output) Release() {
 	if o.state.released {
 		return
 	}
+	for _, shard := range o.state.group.Group.Shards {
+		clear(shard)
+	}
 	o.state.group = SealedGroup{}
 	o.state.released = true
 	o.state.lease.Release()
 	o.state.lease = nil
+	if o.state.workspace != nil {
+		o.state.workspace.releaseOutput()
+		o.state.workspace = nil
+	}
 }

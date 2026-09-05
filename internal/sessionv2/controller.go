@@ -24,6 +24,8 @@ type Controller struct {
 	sendAuth, receiveAuth          *wirev2.Authenticator
 	paths                          []pathState
 	queue                          *aggregationv2.Queue
+	outputWorkspace                *aggregationv2.OutputWorkspace
+	assemblyLease                  *creditv2.Lease
 	originals                      *reassemblyv2.Receiver
 	groups                         map[uint64]*pendingGroup
 	groupHead, groupTail           uint64
@@ -104,10 +106,14 @@ func requiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	// Receive calls are serialized. Keep their bounded packet/record workspace
 	// prepaid so outbound admission cannot prevent already-owned group decode.
 	receiveBytes := uint64(cfg.LocalProfile.Payload.ReceiveHardCap) + wirev2.MaxFECRecords*uint64(unsafe.Sizeof(wirev2.FECRecord{}))
-	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes + receiveBytes}}, nil
+	outputBytes, err := aggregationv2.RequiredOutputWorkspaceBytes(int(n), int(cfg.FixedPayloadBudget)-94)
+	if err != nil {
+		return nil, err
+	}
+	return []creditv2.Claim{{Bytes: queueBytes}, {Bytes: originalBytes}, {Bytes: 16 * ((uint64(cfg.LocalProfile.Datagram.GroupWindow) + 63) / 64)}, {Bytes: stateBytes + receiveBytes}, {Bytes: outputBytes}, {Bytes: 2 * uint64(cfg.FixedPayloadBudget)}}, nil
 }
 
-// New consumes four prepaid initial leases after handshake promotion. It
+// New consumes six prepaid initial leases after handshake promotion. It
 // constructs storage without emitting packets; Start runs after READY returns.
 // On failure it disposes all component storage already constructed.
 func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
@@ -183,6 +189,14 @@ func New(setup handshakev2.Setup, cfg Config) (*Controller, error) {
 	}
 	c.groupWindow, _ = recvwindow.New(local.Datagram.GroupWindow)
 	c.queue, err = aggregationv2.NewPrepaid(setup.Scope, cfg.Queue, aggregationv2.Epoch{ID: 1, Parameters: parameters(context, cfg.Queue.MaxDatagramBytes)}, setup.Initial[InitialQueue])
+	if err != nil {
+		return nil, err
+	}
+	c.outputWorkspace, err = c.queue.NewPrepaidOutputWorkspace(setup.Initial[InitialOutput])
+	if err != nil {
+		return nil, err
+	}
+	c.assemblyLease, err = setup.Scope.BindBytes(setup.Initial[InitialAssembly], claims[InitialAssembly].Bytes)
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +431,10 @@ func (c *Controller) Close() {
 		c.out.Release()
 		c.out = nil
 	}
+	c.outputWorkspace.Close()
+	c.outputWorkspace = nil
+	c.assemblyLease.Release()
+	c.assemblyLease = nil
 	if c.groupWindow != nil {
 		c.groupWindow.Close()
 	}

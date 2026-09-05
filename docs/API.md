@@ -192,6 +192,10 @@ capacity and Endpoint TTL. V2's independent terminal windows, queue backing,
 FEC output, receive state and pending deliveries use Session/Peer credits.
 Disposal clears storage before returning credit; global byte pressure can
 reject admission before the configured Session count is reached.
+The synchronous v2 controller prepays one sealed FEC output and one packet
+assembly allowance before handshake completion. Accepted originals cannot
+consume this [send progress workspace](design/v2-send-workspace.md), including
+when their retained prefixes fill the remaining Session or Peer credit.
 Credits measure reserved obligations and Peer/Session-owned storage, not
 process RSS. Go allocator/GC retention and shared codec lookup tables are
 outside these ownership counters.

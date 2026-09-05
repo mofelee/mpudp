@@ -22,6 +22,8 @@ const (
 	InitialOriginalWindow
 	InitialGroupWindow
 	InitialControl
+	InitialOutput
+	InitialAssembly
 	InitialCount
 )
 
@@ -117,11 +119,13 @@ type Snapshot struct {
 	Paths                             []PathSnapshot
 }
 
-// RequiredInitialClaims is called before handshake admission. Its four
+// RequiredInitialClaims is called before handshake admission. Its six
 // dedicated byte-only claims map to the Initial* indexes above. New consumes
 // matching prepaid handles after handshake promotion, without re-reserving.
 // InitialControl includes one serialized receive workspace at the local hard
-// cap; this obligation remains charged until Controller.Close.
+// cap. InitialOutput and InitialAssembly protect one sealed group and one
+// synchronous packet assembly from original admission pressure. These standing
+// obligations remain charged until their owners are disposed at Controller.Close.
 func RequiredInitialClaims(cfg Config) ([]creditv2.Claim, error) {
 	return requiredInitialClaims(cfg)
 }

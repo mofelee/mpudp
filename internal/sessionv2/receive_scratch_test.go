@@ -65,13 +65,18 @@ func TestPrepaidReceiveScratchSurvivesOutboundQueuePressure(t *testing.T) {
 			if outgoing {
 				var result Result
 				var err error
+				// The prepaid send workspace can seal the first original even
+				// at this pressure. Queue another while its paced group is live.
+				if _, _, err = c.Write(p.now, payload); err != nil || c.out == nil {
+					t.Fatalf("prepaid output did not start: %v", err)
+				}
 				receipt, result, err = c.Write(p.now, payload)
 				if err != nil || receipt == 0 || result.CompletedThrough != 0 || len(result.Sends) != 0 || c.queue.Snapshot().QueuedDatagrams != 1 {
 					t.Fatalf("outbound pressure setup: receipt %d, result %+v, %v", receipt, result, err)
 				}
 				before := c.setup.Scope.Snapshot()
 				if output, err := c.queue.Seal(p.now, true); output != nil || !errors.Is(err, creditv2.ErrResourceLimit) || c.setup.Scope.Snapshot() != before {
-					t.Fatal("outbound encoding should remain blocked without changing ownership")
+					t.Fatal("ordinary output cannot borrow the protected send workspace")
 				}
 				if free := limit - before.Bytes; free != scratch-1400 || free >= scratch {
 					t.Fatal("outbound payload did not consume transient receive headroom")
