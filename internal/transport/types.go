@@ -15,16 +15,17 @@ const (
 )
 
 var (
-	ErrClosed             = errors.New("MPUDP transport closed")
-	ErrInvalidArgument    = errors.New("MPUDP transport invalid argument")
-	ErrPathUnavailable    = errors.New("MPUDP path unavailable")
-	ErrGenerationReplaced = errors.New("MPUDP path generation replaced")
-	ErrPayloadTooLarge    = errors.New("MPUDP transport payload too large")
-	ErrPathMTUExceeded    = errors.New("MPUDP path MTU exceeded")
-	ErrPMTUUnsupported    = errors.New("MPUDP path MTU discovery unsupported")
-	ErrNoAvailablePaths   = errors.New("MPUDP has no available send path")
-	ErrPartialSend        = errors.New("MPUDP block partially sent")
-	ErrAllSendsFailed     = errors.New("MPUDP block send failed on every shard")
+	ErrClosed                 = errors.New("MPUDP transport closed")
+	ErrInvalidArgument        = errors.New("MPUDP transport invalid argument")
+	ErrPathUnavailable        = errors.New("MPUDP path unavailable")
+	ErrGenerationReplaced     = errors.New("MPUDP path generation replaced")
+	ErrPayloadTooLarge        = errors.New("MPUDP transport payload too large")
+	ErrPathMTUExceeded        = errors.New("MPUDP path MTU exceeded")
+	ErrPMTUUnsupported        = errors.New("MPUDP path MTU discovery unsupported")
+	ErrDestinationUnsupported = errors.New("MPUDP destination capture unsupported")
+	ErrNoAvailablePaths       = errors.New("MPUDP has no available send path")
+	ErrPartialSend            = errors.New("MPUDP block partially sent")
+	ErrAllSendsFailed         = errors.New("MPUDP block send failed on every shard")
 )
 
 // Path is one current Carrier or learned listener Endpoint. Send must make one

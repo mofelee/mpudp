@@ -13,28 +13,36 @@ import (
 )
 
 type ListenerOptions struct {
-	PathID      string
-	MaxPayload  int
-	OnPacket    PacketHandler
-	OnError     ErrorHandler
-	RequirePMTU bool
-	Statistics  *Counters
+	PathID     string
+	MaxPayload int
+	// MaxReceivePayload defaults to MaxPayload when zero, independently of sends.
+	MaxReceivePayload int
+	OnPacket          PacketHandler
+	OnError           ErrorHandler
+	RequirePMTU       bool
+	// RequireDestination captures the actual packet destination and pins replies
+	// to that source. It requires a native Linux UDP socket.
+	RequireDestination bool
+	Statistics         *Counters
 }
 
 // Listener owns one unconnected UDP socket. Every ReplyPath created by its
-// read loop writes back through this same socket with WriteTo.
+// read loop writes back through this same socket, preserving the captured
+// destination as the reply source when RequireDestination is enabled.
 type Listener struct {
-	id          string
-	conn        net.PacketConn
-	maxPayload  int
-	onPacket    PacketHandler
-	onError     ErrorHandler
-	generation  uint64
-	ctx         context.Context
-	cancel      context.CancelFunc
-	done        chan struct{}
-	pmtuEnabled bool
-	statistics  *Counters
+	id                string
+	conn              net.PacketConn
+	maxPayload        int
+	maxReceivePayload int
+	destination       *destinationCapture
+	onPacket          PacketHandler
+	onError           ErrorHandler
+	generation        uint64
+	ctx               context.Context
+	cancel            context.CancelFunc
+	done              chan struct{}
+	pmtuEnabled       bool
+	statistics        *Counters
 
 	mu        sync.RWMutex
 	writeMu   sync.Mutex
@@ -101,23 +109,40 @@ func newListener(conn net.PacketConn, options ListenerOptions, pmtuEnabled bool)
 	if maxPayload < 1 || maxPayload > MaxUDPPayload {
 		return nil, &PayloadSizeError{Size: maxPayload, Limit: MaxUDPPayload}
 	}
+	maxReceivePayload := options.MaxReceivePayload
+	if maxReceivePayload == 0 {
+		maxReceivePayload = maxPayload
+	}
+	if maxReceivePayload < 1 || maxReceivePayload > MaxUDPPayload {
+		return nil, &PayloadSizeError{Size: maxReceivePayload, Limit: MaxUDPPayload}
+	}
 	if options.RequirePMTU && !pmtuEnabled {
 		return nil, ErrPMTUUnsupported
 	}
+	var destination *destinationCapture
+	if options.RequireDestination {
+		var err error
+		destination, err = newDestinationCapture(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	lifetime, cancel := context.WithCancel(context.Background())
 	listener := &Listener{
-		id:          options.PathID,
-		conn:        conn,
-		maxPayload:  maxPayload,
-		onPacket:    options.OnPacket,
-		onError:     options.OnError,
-		generation:  1,
-		ctx:         lifetime,
-		cancel:      cancel,
-		done:        make(chan struct{}),
-		closeDone:   make(chan struct{}),
-		pmtuEnabled: pmtuEnabled,
-		statistics:  options.Statistics,
+		id:                options.PathID,
+		conn:              conn,
+		maxPayload:        maxPayload,
+		maxReceivePayload: maxReceivePayload,
+		destination:       destination,
+		onPacket:          options.OnPacket,
+		onError:           options.OnError,
+		generation:        1,
+		ctx:               lifetime,
+		cancel:            cancel,
+		done:              make(chan struct{}),
+		closeDone:         make(chan struct{}),
+		pmtuEnabled:       pmtuEnabled,
+		statistics:        options.Statistics,
 	}
 	go listener.readLoop()
 	return listener, nil
@@ -135,7 +160,11 @@ func (l *Listener) Available() bool {
 
 func (l *Listener) readLoop() {
 	defer close(l.done)
-	buffer := make([]byte, l.maxPayload+1)
+	buffer := make([]byte, l.maxReceivePayload+1)
+	var oob []byte
+	if l.destination != nil {
+		oob = make([]byte, l.destination.controlSize())
+	}
 	// Only native UDP sockets promise the value-based receive path. Injected
 	// connections keep their ReadFrom overrides and address ownership contract.
 	udp, nativeUDP := l.conn.(*net.UDPConn)
@@ -143,8 +172,11 @@ func (l *Listener) readLoop() {
 		var n int
 		var remote net.Addr
 		var remoteValue netip.AddrPort
+		var oobn, flags int
 		var err error
-		if nativeUDP {
+		if l.destination != nil {
+			n, oobn, flags, remoteValue, err = udp.ReadMsgUDPAddrPort(buffer, oob)
+		} else if nativeUDP {
 			n, remoteValue, err = udp.ReadFromUDPAddrPort(buffer)
 		} else {
 			n, remote, err = l.conn.ReadFrom(buffer)
@@ -158,17 +190,26 @@ func (l *Listener) readLoop() {
 			}
 			return
 		}
-		l.statistics.receive(n, l.maxPayload)
-		if n > l.maxPayload {
+		l.statistics.receive(n, l.maxReceivePayload)
+		if n > l.maxReceivePayload {
 			l.reportError(&PathError{
 				PathID: l.id, Generation: l.generation, Operation: "read",
-				Err: &PayloadSizeError{Size: n, Limit: l.maxPayload},
+				Err: &PayloadSizeError{Size: n, Limit: l.maxReceivePayload},
 			})
 			continue
 		}
 		if (nativeUDP && !remoteValue.IsValid()) || (!nativeUDP && remote == nil) {
 			l.reportError(&PathError{PathID: l.id, Generation: l.generation, Operation: "read", Err: invalidArgument("nil remote endpoint")})
 			continue
+		}
+		var local net.Addr
+		var sourceControl []byte
+		if l.destination != nil {
+			local, sourceControl, err = l.destination.parseControl(oob[:oobn], flags, remoteValue)
+			if err != nil {
+				l.reportError(&PathError{PathID: l.id, Generation: l.generation, Operation: "read destination", Err: err})
+				continue
+			}
 		}
 		if l.onPacket == nil {
 			continue
@@ -178,13 +219,19 @@ func (l *Listener) readLoop() {
 		} else {
 			remote = cloneAddr(remote)
 		}
-		local := cloneAddr(l.conn.LocalAddr())
+		if local == nil {
+			local = cloneAddr(l.conn.LocalAddr())
+		}
 		reply := listenerReplyPath{
-			listener:   l,
-			generation: l.generation,
-			local:      local,
-			remote:     remote,
-			pathID:     fmt.Sprintf("%s/%s", l.id, remote.String()),
+			listener:      l,
+			generation:    l.generation,
+			local:         local,
+			remote:        remote,
+			pathID:        fmt.Sprintf("%s/%s", l.id, remote.String()),
+			sourceControl: sourceControl,
+		}
+		if l.destination != nil {
+			reply.local, reply.remote = cloneAddr(local), cloneAddr(remote)
 		}
 		packet := ReceivedPacket{
 			Payload:    append([]byte(nil), buffer[:n]...),
@@ -215,6 +262,10 @@ func (l *Listener) reportError(err error) {
 }
 
 func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters) error {
+	return l.sendToWithControl(ctx, generation, remote, payload, statistics, nil)
+}
+
+func (l *Listener) sendToWithControl(ctx context.Context, generation uint64, remote net.Addr, payload []byte, statistics *Counters, sourceControl []byte) error {
 	if ctx == nil {
 		return invalidArgument("nil send context")
 	}
@@ -259,7 +310,19 @@ func (l *Listener) sendTo(ctx context.Context, generation uint64, remote net.Add
 	if !acquired.IsZero() {
 		writeStarted = time.Now()
 	}
-	n, err := l.conn.WriteTo(payload, remote)
+	var n int
+	var err error
+	if sourceControl == nil {
+		n, err = l.conn.WriteTo(payload, remote)
+	} else {
+		udp, socketOK := l.conn.(*net.UDPConn)
+		address, addressOK := remote.(*net.UDPAddr)
+		if !socketOK || !addressOK || address == nil {
+			err = ErrDestinationUnsupported
+		} else {
+			n, _, err = udp.WriteMsgUDPAddrPort(payload, sourceControl, address.AddrPort())
+		}
+	}
 	var elapsed time.Duration
 	if !writeStarted.IsZero() {
 		elapsed = time.Since(writeStarted)
@@ -321,12 +384,13 @@ func (l *Listener) Close() error {
 }
 
 type listenerReplyPath struct {
-	listener   *Listener
-	generation uint64
-	pathID     string
-	local      net.Addr
-	remote     net.Addr
-	statistics *Counters
+	listener      *Listener
+	generation    uint64
+	pathID        string
+	local         net.Addr
+	remote        net.Addr
+	statistics    *Counters
+	sourceControl []byte
 }
 
 func (r listenerReplyPath) PathID() string       { return r.pathID }
@@ -335,6 +399,9 @@ func (r listenerReplyPath) LocalAddr() net.Addr  { return cloneAddr(r.local) }
 func (r listenerReplyPath) RemoteAddr() net.Addr { return cloneAddr(r.remote) }
 func (r listenerReplyPath) Available() bool      { return r.listener.Available() }
 func (r listenerReplyPath) Send(ctx context.Context, payload []byte) error {
+	if r.sourceControl != nil {
+		return r.listener.sendToWithControl(ctx, r.generation, r.remote, payload, r.statistics, r.sourceControl)
+	}
 	return r.listener.sendTo(ctx, r.generation, r.remote, payload, r.statistics)
 }
 
