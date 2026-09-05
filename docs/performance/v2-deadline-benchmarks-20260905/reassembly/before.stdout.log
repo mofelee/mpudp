@@ -1,0 +1,36 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mofelee/mpudp/internal/reassemblyv2
+cpu: Intel(R) Xeon(R) CPU E3-1245 v5 @ 3.50GHz
+BenchmarkReceiverNextDeadline/pending-0         	11916896	        20.88 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-0         	12147699	        20.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-0         	11780287	        20.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-128       	   50522	      4807 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-128       	   52371	      4646 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-128       	   52208	      4662 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-512       	   12876	     20849 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-512       	   10000	     21590 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-512       	   10000	     21959 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-1024      	    5888	     43295 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-1024      	    5637	     41859 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-1024      	    6022	     42792 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-8192      	     710	    314857 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-8192      	     820	    292626 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverNextDeadline/pending-8192      	     787	    299637 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-0         	 7349163	        31.83 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-0         	 7416644	        31.91 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-0         	 7575152	        31.93 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-128       	   41500	      6009 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-128       	   43504	      5577 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-128       	   43278	      5580 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-512       	   10000	     22949 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-512       	   10000	     22973 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-512       	   10000	     22491 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-1024      	    5552	     45493 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-1024      	    5294	     46973 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-1024      	    5113	     47894 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-8192      	     584	    358431 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-8192      	     678	    366115 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReceiverExpireNotDue/pending-8192      	     670	    375559 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mofelee/mpudp/internal/reassemblyv2	8.307s
