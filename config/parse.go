@@ -10,16 +10,20 @@ import (
 )
 
 type rawConfig struct {
-	Protocol  *Protocol     `yaml:"protocol,omitempty"`
-	Wire      rawWire       `yaml:"wire,omitempty"`
-	Carriers  []string      `yaml:"carriers,omitempty"`
-	Listen    string        `yaml:"listen,omitempty"`
-	FEC       *rawFEC       `yaml:"fec"`
-	PSK       Secret        `yaml:"psk"`
-	Transport rawTransport  `yaml:"transport,omitempty"`
-	Scheduler *rawScheduler `yaml:"scheduler,omitempty"`
-	Limits    rawLimits     `yaml:"limits,omitempty"`
-	Timers    rawTimers     `yaml:"timers,omitempty"`
+	Protocol    *Protocol       `yaml:"protocol,omitempty"`
+	Wire        rawWire         `yaml:"wire,omitempty"`
+	Carriers    []string        `yaml:"carriers,omitempty"`
+	Listen      string          `yaml:"listen,omitempty"`
+	FEC         *rawFEC         `yaml:"fec"`
+	Aggregation *rawAggregation `yaml:"aggregation,omitempty"`
+	Repair      *rawRepair      `yaml:"repair,omitempty"`
+	KCP         *rawKCP         `yaml:"kcp,omitempty"`
+	StreamMux   *rawStreamMux   `yaml:"stream_mux,omitempty"`
+	PSK         Secret          `yaml:"psk"`
+	Transport   rawTransport    `yaml:"transport,omitempty"`
+	Scheduler   *rawScheduler   `yaml:"scheduler,omitempty"`
+	Limits      rawLimits       `yaml:"limits,omitempty"`
+	Timers      rawTimers       `yaml:"timers,omitempty"`
 }
 
 type rawWire struct {
@@ -216,6 +220,9 @@ func parseBytes(data []byte) (Config, error) {
 		cfg.Timers.HandshakeRetryInterval = raw.Timers.HandshakeRetryInterval.Duration
 	}
 	if err := applyRawV2(raw, &cfg); err != nil {
+		return Config{}, err
+	}
+	if err := applyRawV2Protocol(raw, &cfg); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {

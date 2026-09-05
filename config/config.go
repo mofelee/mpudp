@@ -40,16 +40,20 @@ type WireConfig struct {
 // before the runtime implements them.
 // Carriers are remote UDP entries; they are never local bind addresses.
 type Config struct {
-	Protocol  Protocol        `yaml:"protocol,omitempty"`
-	Wire      WireConfig      `yaml:"wire,omitempty"`
-	Carriers  []string        `yaml:"carriers,omitempty"`
-	Listen    string          `yaml:"listen,omitempty"`
-	FEC       FECConfig       `yaml:"fec"`
-	PSK       Secret          `yaml:"psk"`
-	Transport TransportConfig `yaml:"transport,omitempty"`
-	Scheduler SchedulerConfig `yaml:"scheduler,omitempty"`
-	Limits    LimitsConfig    `yaml:"limits,omitempty"`
-	Timers    TimerConfig     `yaml:"timers,omitempty"`
+	Protocol    Protocol          `yaml:"protocol,omitempty"`
+	Wire        WireConfig        `yaml:"wire,omitempty"`
+	Carriers    []string          `yaml:"carriers,omitempty"`
+	Listen      string            `yaml:"listen,omitempty"`
+	FEC         FECConfig         `yaml:"fec"`
+	Aggregation AggregationConfig `yaml:"aggregation,omitempty"`
+	Repair      RepairConfig      `yaml:"repair,omitempty"`
+	KCP         KCPConfig         `yaml:"kcp,omitempty"`
+	StreamMux   StreamMuxConfig   `yaml:"stream_mux,omitempty"`
+	PSK         Secret            `yaml:"psk"`
+	Transport   TransportConfig   `yaml:"transport,omitempty"`
+	Scheduler   SchedulerConfig   `yaml:"scheduler,omitempty"`
+	Limits      LimitsConfig      `yaml:"limits,omitempty"`
+	Timers      TimerConfig       `yaml:"timers,omitempty"`
 }
 
 // FECConfig selects k data shards and r parity shards.

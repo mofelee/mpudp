@@ -55,11 +55,11 @@ host 不能为空，也不能是 `0.0.0.0`/`::`；支持 DNS 名、IPv4 和带�
 | `datagram` + `v2` | 必须显式提供正数 k/r；UDP 上限至少 512 | `ErrProtocolUnavailable` |
 | `kcp` + `v2` | 省略 FEC 得到 0/0；显式非零或负数 FEC 无效；UDP 上限至少 512 | 合法配置返回 `ErrProtocolUnavailable` |
 
-当前增量只实现配置边界，尚未实现 v2 握手、数据面或 KCP Session。配置解析成功不表示
+当前增量只实现配置边界，尚未接入 v2 握手运行时、数据面或 KCP Session。配置解析成功不表示
 该协议可运行。两个构造函数先验证配置，再拒绝尚未实现的 v2，且不访问运行时 context、
 随机源、socket 或 timer 依赖，也不启动 goroutine。不会静默回退到 v1。
-共享 v2 transport、scheduler、资源上限和接收超时已经支持严格解析；aggregation、repair、
-KCP tuning 和 mux 配置字段仍是未知字段。配置上限验证不表示已经分配资源或启用数据面。
+共享 v2 transport、scheduler、资源上限、接收超时、aggregation、repair、KCP tuning 和 mux
+配置已经支持严格解析。配置上限验证不表示已经分配资源或启用数据面。
 
 ### V2 共享配置
 
@@ -87,7 +87,7 @@ KCP tuning 和 mux 配置字段仍是未知字段。配置上限验证不表示�
 | `limits.max_migration_transaction_bytes` | 8388608 | 1..8 MiB，且不超过 Session |
 | `limits.max_streams_per_session` | 128 | 1..4096 |
 | `limits.max_peer_streams` | 4096 | 1..65536 |
-| `limits.max_stream_retained_bytes` | 278528 | 正数且不超过 Session；mux 最低窗口约束在后续增量实现 |
+| `limits.max_stream_retained_bytes` | KCP 为 262144 + 配置的 MaxFrameSize；默认 278528 | 正数且不超过 Session；启用 mux 时至少为该初始窗口值 |
 | `limits.max_path_queued_packets` | 256 | 1..4096 |
 | `limits.max_path_queued_bytes` | 1048576 | 512..Session 上限 |
 | `limits.max_send_workers` | 8 | 1..32 |
@@ -110,6 +110,54 @@ Carrier 索引；listener 的 inbound 列表独立覆盖连续 1..N 索引，并
 所有字节上限都是配置约束，不代表最大值同时获得预留。降低 Session 上限时，可能需要
 同步显式降低 migration/path/stream 等默认上限；解析器不会暗中裁剪这些配置值。UDP
 发送和接收硬上限互相独立，不能把反向接收能力当作本地已验证的路径 MTU。
+
+### V2 协议配置
+
+默认值只填入所选协议的 section。Datagram 的 aggregation/repair 默认关闭；KCP 的 mux
+默认关闭，但 fast/early retransmit 和 congestion control 默认开启。布尔值严格要求 YAML
+boolean，拒绝数字、字符串 `"false"`、`yes`/`no` 等隐式转换；显式 `false` 不会被默认值覆盖。
+
+| 字段 | 默认值 | 范围或约束 |
+|---|---:|---|
+| `aggregation.enabled` | false | v2 Datagram |
+| `aggregation.max_delay` | `250us` | `1us`..`10ms` |
+| `aggregation.max_records` | 32 | 1..256 |
+| `aggregation.max_queued_datagrams` | 256 | 1..65536 |
+| `aggregation.max_queued_bytes` | 1048576 | 1..Session 上限 |
+| `aggregation.max_group_bytes` | 1048576 | 24..16777216，运行时还受 k*ShardBytes 限制 |
+| `repair.enabled` | false | v2 Datagram，保持正数 FEC |
+| `repair.max_age` | `5s` | `100ms`..`60s` |
+| `repair.max_attempts` | 3 | 1..16 |
+| `repair.max_cached_blocks` | 1024 | 1..65536，且不超过 outstanding group span |
+| `repair.max_cached_bytes` | 8388608 | 1..Session 上限 |
+| `repair.max_outstanding_datagram_span` | 65536 | 1..65536，运行时还受对端窗口限制 |
+| `repair.max_outstanding_group_span` | 65536 | 1..65536，运行时还受对端窗口限制 |
+| `kcp.fast_retransmit.enabled` | true | false 同时禁用 fast/early，保留 RTO |
+| `kcp.fast_retransmit.threshold` | 2 | 1..255；不自动开启已禁用策略 |
+| `kcp.update_interval` | `10ms` | `10ms`..`100ms` |
+| `kcp.send_window_segments` | 1024 | 32..65535 |
+| `kcp.receive_window_segments` | 1024 | 32..65535 |
+| `kcp.congestion_control` | true | 只有显式 false 才关闭 |
+| `stream_mux.enabled` | false | v2 KCP |
+| `stream_mux.max_frame_size` | 16384 | 128..65535 |
+| `stream_mux.max_pending_opens` | 128 | 1..128 |
+| `stream_mux.open_timeout` | `5s` | `100ms`..`5s` |
+| `stream_mux.max_control_record_bytes` | 256 | 必须为 256 |
+| `stream_mux.max_queued_control_bytes` | 32768 | 256..32768，且受 Session 上限约束 |
+
+所选协议中的 tuning 数值即使在 optional feature 关闭时也会检查范围。另一协议或 v1 中
+只允许 `aggregation: {enabled: false}`、`repair: {enabled: false}` 和
+`stream_mux: {enabled: false}` 这类不带其他字段的中性声明；空 mapping 或额外参数均
+无效。`kcp` 没有顶层 `enabled` 字段，任何显式 KCP section 都要求 `protocol: kcp` 和 v2。
+
+启用 repair 时，两个接收超时都必须至少覆盖 `repair.max_age`。启用 mux 时，stream
+保留字节至少覆盖 `262144 + MaxFrameSize`，Session 还须容纳独立 control 初始窗口、
+一个 business 初始窗口和 queued control。省略 stream 字节上限时按最终配置的 frame size
+计算默认值，显式提供的值不会被覆盖。
+
+这些只是配置必要条件，实际 KCP backend、协商窗口及同时保留的控制队列副本必须由运行时
+在宣告能力前统一获得 Session/Peer credits。这里不使用 `window_segments * 1500` 伪装成
+后端真实内存预留，也不因窗口配置验证通过而自动创建 KCP、mux 或 v2 Session。
 
 ## 最小示例
 

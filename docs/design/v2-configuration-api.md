@@ -1,13 +1,14 @@
-# Proposed V2 Configuration And API Contract
+# V2 Configuration And Proposed API Contract
 
 Status: concrete proposal for #20 review. Strict `protocol` and `wire.version`
 recognition, protocol-specific FEC validation, shared v2 transport/resource
-settings, directional path budgets/rates and receive deadlines are implemented.
+settings, directional path budgets/rates, receive deadlines, aggregation,
+repair, KCP tuning and mux configuration validation are implemented.
 `config.DefaultV2(protocol)` supplies the recognized v2 defaults for Go callers;
 `config.Default()` preserves v1 defaults. A valid v2 configuration still returns
 `ErrProtocolUnavailable` from Peer construction before runtime side effects.
-Aggregation, repair, KCP tuning, mux settings and new runtime APIs below remain
-proposals; the runnable data plane remains v1 Datagram. The
+New runtime APIs and data-plane behavior below remain proposals; the runnable
+data plane remains v1 Datagram. The
 maintained [configuration](../CONFIGURATION.md) and [API](../API.md) describe
 the implemented parser/runtime boundary. Wire values are assigned in the
 [registry](v2-registry.md); behavior and capacity are in the
@@ -35,14 +36,28 @@ only when that discovery strategy is selected. Shared configured maxima are
 validated against Session/Peer ceilings; reducing a Session ceiling may also
 require explicitly reducing dependent maxima rather than silently clamping
 their defaults. `Clone` copies both directional profile slices and rate maps.
+Protocol-specific defaults populate only the selected protocol. An explicit
+false boolean is preserved, including KCP congestion control and fast/early
+retransmit policy; changing the retransmit threshold never enables it. Within
+the selected protocol, all configured tuning values are range checked even
+when the optional feature is disabled. Configuration defaults for disabled
+features do not imply offered wire capabilities or resource allocation.
 
-| Field | Proposed Default | Legal Range / Rule |
+The bare `enabled: false` exception applies only to `aggregation`, `repair`
+and `stream_mux`, which define that field. It permits neutral sections on v1
+or the unrelated v2 protocol; empty mappings and additional tuning fields
+reject there. `kcp` has no top-level `enabled` field: any explicit KCP section
+requires v2 KCP. Omitted `limits.max_stream_retained_bytes` in KCP is computed
+after the configured mux frame size as `262144 + MaxFrameSize`; an explicit
+value is never replaced.
+
+| Field | Configuration Default | Legal Range / Rule |
 |---|---|---|
 | protocol | datagram | datagram or kcp |
 | wire.version | v1 | v1 or v2; v1 permits existing Datagram only |
 | fec.data_shards, parity_shards | Required in Datagram; both 0 in KCP | Datagram each1..255, sum<=256 and codec-supported; KCP explicit positive values conflict |
 | aggregation.enabled | false | v2 Datagram only when true |
-| aggregation.max_delay | 250us | 1us..10ms when enabled |
+| aggregation.max_delay | 250us | 1us..10ms; checked even when disabled in Datagram |
 | aggregation.max_records | 32 | 1..256 fragment descriptors/group |
 | aggregation.max_queued_datagrams | 256 | 1..65536 whole admitted Datagrams |
 | aggregation.max_queued_bytes | 1048576 | 1..Peer/Session retained-byte limits; insufficient whole-packet reservation rejects admission |
@@ -153,7 +168,7 @@ reached when byte credits are exhausted. Existing v1 limits remain unchanged.
 | limits.max_migration_transaction_bytes | 8388608 | 1..8388608, also Session/Peer ceilings; all aliases and replacement storage charged |
 | limits.max_streams_per_session | 128 | 1..4096 business streams, excluding one charged reserved control stream |
 | limits.max_peer_streams | 4096 | 1..65536 business streams across all Sessions |
-| limits.max_stream_retained_bytes | 262144+configured MaxFrameSize (278528 at default) | At least262144+negotiated MaxFrameSize for stock initial smux window, at most Session ceiling |
+| limits.max_stream_retained_bytes | 262144+configured MaxFrameSize in KCP (278528 at default) | Positive and at most Session ceiling; enabled mux requires at least262144+configured MaxFrameSize before negotiation |
 | limits.max_path_queued_packets | 256 | 1..4096 per active path |
 | limits.max_path_queued_bytes | 1048576 | 512..Session ceiling per path, with global charge |
 | limits.max_send_workers | 8 | 1..32 Peer-wide; not a goroutine per queued send |
@@ -187,7 +202,16 @@ For smux, reserve the control stream's 262144+MaxFrameSize separately and keep
 business windows from consuming that shared receive-bucket floor. Business
 stream reservation includes the same initial-window/accepted-frame bound.
 The library's MaxStreamBuffer value does not reduce its initial 262144-byte
-peer window. Teardown clears actual owned buffers before returning leases;
+peer window. Config validation checks the necessary control plus one initial
+business window and queued-control capacity against the Session ceiling.
+This lower bound is not a backend allocation formula or an admission proof.
+KCP send/receive window segment counts are validated as configured ceilings;
+there is no invented `segments * 1500` memory estimate. Before advertising
+receive capabilities or creating the backend, runtime admission must reserve
+the actual KCP buffers, independently owned control storage, negotiated stream
+credits and any simultaneously retained queue copies under Session and Peer
+ceilings. Datagram sizes also require the selected encoding budget and actual
+retained-byte reservation. Teardown clears actual owned buffers before returning leases;
 a count decrement alone is not proof of byte reclamation.
 
 ## Compatibility Matrix

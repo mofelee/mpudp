@@ -85,6 +85,7 @@ func DefaultV2(protocol Protocol) Config {
 	c.Limits.MaxSendWorkers = 8
 	c.Timers.DatagramReassemblyTimeout = 10 * time.Second
 	c.Timers.GroupDecodeTimeout = 10 * time.Second
+	applyV2ProtocolDefaults(&c)
 	return c
 }
 
@@ -101,7 +102,7 @@ func (c Config) validateV2() error {
 		if t.MaxReceiveUDPPayload != 0 || t.MTUDiscovery != "" || t.BudgetStrategy != "" || t.OutboundPathBudgets != nil || t.InboundPathBudgets != nil || t.PLPMTUD != (PLPMTUDConfig{}) || t.MaxRetainedEpochs != 0 || t.MaxEpochAge != 0 || t.MaxMigrations != 0 || c.Scheduler.OutboundPathRatesBPS != nil || c.Scheduler.InboundPathRatesBPS != nil || c.hasV2Limits() || c.Timers.DatagramReassemblyTimeout != 0 || c.Timers.GroupDecodeTimeout != 0 {
 			return invalidf("v2 settings require wire.version v2")
 		}
-		return nil
+		return c.validateV2Protocol()
 	}
 	t := c.Transport
 	if err := intRange("transport.max_receive_udp_payload", t.MaxReceiveUDPPayload, 512, 65507); err != nil {
@@ -143,7 +144,10 @@ func (c Config) validateV2() error {
 	if err := durationRange("timers.group_decode_timeout", c.Timers.GroupDecodeTimeout, 100*time.Millisecond, time.Minute); err != nil {
 		return err
 	}
-	return c.validateV2Paths()
+	if err := c.validateV2Paths(); err != nil {
+		return err
+	}
+	return c.validateV2Protocol()
 }
 
 func (c Config) hasV2Limits() bool {

@@ -52,7 +52,7 @@ Session，然后持续运行直到 SIGINT 或 SIGTERM；启动失败或收到信
 
 YAML 解析只对真正省略的可选字段应用默认值。Go 调用方直接组装 v1 配置时先调用
 `config.Default()`，再覆盖角色、FEC、PSK 和需要调整的选项；v2 使用
-`config.DefaultV2(protocol)` 初始化共享 transport/资源默认值，仍会由 Peer 构造函数返回
+`config.DefaultV2(protocol)` 初始化共享 transport/资源和所选协议的配置默认值，仍会由 Peer 构造函数返回
 `ErrProtocolUnavailable`。零值 `config.Config` 不会由 `Validate` 或 `NewPeer` 隐式补数值
 默认；直接 Go literal 必须显式满足全部 v2 校验。`Clone()` 同时深复制方向路径预算和 rate
 map。`Config.Protocol` 与 `Config.Wire.Version` 使用 `config.Protocol` /

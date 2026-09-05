@@ -63,8 +63,6 @@ func TestProtocolAndWireRejectStrictYAML(t *testing.T) {
 		"wire: {version: v3}", "wire: {version: V2}", "wire: {version: 'v2 '}",
 		"wire: {version: v1, version: v2}", "wire: {version: v2, mystery: 1}",
 		"protocol: kcp", "protocol: kcp\nwire: {version: v1}",
-		"wire: {version: v2}\nrepair: {enabled: true}",
-		"wire: {version: v2}\naggregation: {enabled: true}",
 		"wire: {version: v2}\nkcp: {send_window_segments: 1024}",
 	} {
 		t.Run(field, func(t *testing.T) {
