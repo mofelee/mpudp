@@ -67,9 +67,9 @@ const (
 	MaxHandshakeRetryInterval     = time.Minute
 )
 
-// Default returns a Config populated with every optional runtime default.
+// Default returns a Config populated with the existing v1 runtime defaults.
 // Callers must still provide a role, positive FEC values for Datagram, and a
-// non-empty PSK. KCP requires explicit v2 selection and zero FEC values.
+// non-empty PSK. Use DefaultV2 for the recognized but unavailable v2 protocol.
 func Default() Config {
 	return Config{
 		Protocol: ProtocolDatagram,

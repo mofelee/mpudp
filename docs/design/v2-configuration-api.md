@@ -1,10 +1,13 @@
 # Proposed V2 Configuration And API Contract
 
 Status: concrete proposal for #20 review. Strict `protocol` and `wire.version`
-recognition, protocol-specific FEC validation and the v2 512-byte minimum are
-implemented. A valid v2 configuration still returns `ErrProtocolUnavailable`
-from Peer construction before runtime side effects. Other new fields and APIs
-below remain proposals; the runnable data plane remains v1 Datagram. The
+recognition, protocol-specific FEC validation, shared v2 transport/resource
+settings, directional path budgets/rates and receive deadlines are implemented.
+`config.DefaultV2(protocol)` supplies the recognized v2 defaults for Go callers;
+`config.Default()` preserves v1 defaults. A valid v2 configuration still returns
+`ErrProtocolUnavailable` from Peer construction before runtime side effects.
+Aggregation, repair, KCP tuning, mux settings and new runtime APIs below remain
+proposals; the runnable data plane remains v1 Datagram. The
 maintained [configuration](../CONFIGURATION.md) and [API](../API.md) describe
 the implemented parser/runtime boundary. Wire values are assigned in the
 [registry](v2-registry.md); behavior and capacity are in the
@@ -17,6 +20,21 @@ Do not change Mode: it still means initiator/listener/dual. YAML remains strict
 about unknown fields, duplicates, null, scalar types, trailing documents and
 the existing 1 MiB file limit. Explicit zero means zero, not omitted/default.
 Check duration conversion and all products before sockets or allocation.
+Explicit v2-only transport/resource/scheduler fields reject on v1, including
+zero values or empty maps. Static path budgets must be absent outside
+fixed/per_carrier mode. Path-rate keys and values must be YAML integers;
+normalized duplicate keys such as `1` and `0x1` reject. Rate maps may be sparse:
+unlisted valid PathIDs use 100000000 bits/s. Outbound IDs fit the configured
+Carrier count; inbound IDs fit the static reverse profile when present,
+otherwise `limits.max_endpoints_per_session`. Each role's maps are independent.
+
+Only YAML omission applies defaults. Direct Go v2 literals must contain all
+required invariants; `Validate` does not rewrite zeros. YAML receive hard cap
+defaults to the final local send cap after overrides. PLPMTUD defaults apply
+only when that discovery strategy is selected. Shared configured maxima are
+validated against Session/Peer ceilings; reducing a Session ceiling may also
+require explicitly reducing dependent maxima rather than silently clamping
+their defaults. `Clone` copies both directional profile slices and rate maps.
 
 | Field | Proposed Default | Legal Range / Rule |
 |---|---|---|

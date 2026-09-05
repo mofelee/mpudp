@@ -111,8 +111,9 @@ func TestV2UDPPayloadBoundaries(t *testing.T) {
 		for _, size := range []int{0, 71, 72, 511, 512, 1200, 65507, 65508} {
 			t.Run(fmt.Sprintf("%s/%d", protocol, size), func(t *testing.T) {
 				t.Parallel()
-				cfg := validConfig()
-				cfg.Protocol, cfg.Wire.Version = protocol, config.WireVersionV2
+				cfg := config.DefaultV2(protocol)
+				legacy := validConfig()
+				cfg.Carriers, cfg.PSK, cfg.FEC = legacy.Carriers, legacy.PSK, legacy.FEC
 				if protocol == config.ProtocolKCP {
 					cfg.FEC = config.FECConfig{}
 				}

@@ -13,7 +13,9 @@
 内存。任何位置的显式 YAML `null`（包括 `~` 和空 mapping value）都是错误，不能借此
 把已提供但类型错误的字段伪装成“省略”；只有真正未出现的可选字段会应用默认值。
 
-Go 代码直接构造配置时应从 `cfg := config.Default()` 开始，再设置角色、FEC 和 PSK；
+Go 代码直接构造 v1 配置时应从 `cfg := config.Default()` 开始；v2 使用
+`config.DefaultV2(config.ProtocolDatagram)` 或 `config.DefaultV2(config.ProtocolKCP)`，
+再设置角色、FEC 和 PSK。v2 helper 仅提供配置默认值，不会启用尚不可用的运行时。
 `Config` 的零值不会在 `Validate`/`NewPeer` 中被静默改写为默认值。这样配置文件中的显式
 数值零和程序中的数值零具有同样的严格语义。兼容旧版 Go struct literal 时，新增的
 `Protocol == ""` 和 `Wire.Version == ""` 分别按 `datagram` 和 `v1` 解释，原对象不被
@@ -56,8 +58,58 @@ host 不能为空，也不能是 `0.0.0.0`/`::`；支持 DNS 名、IPv4 和带�
 当前增量只实现配置边界，尚未实现 v2 握手、数据面或 KCP Session。配置解析成功不表示
 该协议可运行。两个构造函数先验证配置，再拒绝尚未实现的 v2，且不访问运行时 context、
 随机源、socket 或 timer 依赖，也不启动 goroutine。不会静默回退到 v1。
-aggregation、repair、KCP tuning、mux 和其他计划中的 v2 配置字段仍是未知字段。
-下面的资源和时间字段仍按既有语法验证，不表示已实现 v2 的资源模型。
+共享 v2 transport、scheduler、资源上限和接收超时已经支持严格解析；aggregation、repair、
+KCP tuning 和 mux 配置字段仍是未知字段。配置上限验证不表示已经分配资源或启用数据面。
+
+### V2 共享配置
+
+以下字段仅在 `wire.version: v2` 下有效；v1 显式提供这些字段，即使是零值或空 map，也会
+被拒绝。省略新字段的 v1 默认值保持不变。完整范围与后续协议字段见
+[v2 配置设计表](design/v2-configuration-api.md)。
+
+| 字段 | v2 默认值 | 范围 |
+|---|---:|---|
+| `transport.max_receive_udp_payload` | 最终 `max_udp_payload` | 512..65507 |
+| `transport.mtu_discovery` | `fixed` | `fixed` 或 `plpmtud` |
+| `transport.budget_strategy` | `session` | `session` 或 `per_carrier` |
+| `transport.max_retained_epochs` | 2 | 1..8 |
+| `transport.max_epoch_age` | `5s` | `100ms`..`60s` |
+| `transport.max_migrations` | 2 | 1..2；配置值不自动启用迁移 |
+| `transport.plpmtud.base_udp_payload` | 512 | 必须为 512 |
+| `transport.plpmtud.probe_interval` | `1s` | `100ms`..`60s` |
+| `transport.plpmtud.max_outstanding_per_path` | 1 | 必须为 1 |
+| `limits.max_pending_handshakes` | 256 | 1..4096 |
+| `limits.max_pending_accepts` | 256 | 1..65536 |
+| `limits.max_peer_retained_bytes` | 268435456 | 1 MiB..1 GiB |
+| `limits.max_session_retained_bytes` | 16777216 | 1 MiB..Peer 上限 |
+| `limits.max_datagram_reassemblies` | 1024 | 1..65536 |
+| `limits.max_fragments_per_datagram` | 256 | 1..4096 |
+| `limits.max_migration_transaction_bytes` | 8388608 | 1..8 MiB，且不超过 Session |
+| `limits.max_streams_per_session` | 128 | 1..4096 |
+| `limits.max_peer_streams` | 4096 | 1..65536 |
+| `limits.max_stream_retained_bytes` | 278528 | 正数且不超过 Session；mux 最低窗口约束在后续增量实现 |
+| `limits.max_path_queued_packets` | 256 | 1..4096 |
+| `limits.max_path_queued_bytes` | 1048576 | 512..Session 上限 |
+| `limits.max_send_workers` | 8 | 1..32 |
+| `timers.datagram_reassembly_timeout` | `10s` | `100ms`..`60s` |
+| `timers.group_decode_timeout` | `10s` | `100ms`..`60s` |
+
+`transport.plpmtud` 只允许在 `plpmtud` 模式出现；fixed 模式下连空配置块也会拒绝。
+`outbound_path_budgets` / `inbound_path_budgets` 只用于 fixed/per_carrier，元素形如
+`{path_id: 1, max_udp_payload: 1200}`。initiator 的 outbound 列表必须完整覆盖配置的
+Carrier 索引；listener 的 inbound 列表独立覆盖连续 1..N 索引，并受 endpoint 上限约束。
+双角色的两个列表互不补全，未使用角色必须省略对应列表。索引可按任意顺序列出，但不能
+重复、缺失或重编号；每个预算必须在 512..本地发送硬上限之间。
+
+`scheduler.outbound_path_rates_bps` / `inbound_path_rates_bps` 是可省略的 PathID map，
+例如 `{1: 100000000, 2: 50000000}`。每个 rate 范围为 1000..1000000000000 bit/s，未列出
+的合法 PathID 使用 100000000。键和值均严格要求 YAML integer，`1.5` 键或 `1` 与 `0x1`
+形成的重复键会被拒绝。outbound 键必须在 Carrier 范围内；inbound 键受反向静态列表或
+`limits.max_endpoints_per_session` 限制。Go `Clone()` 深复制两个列表和两个 rate map。
+
+所有字节上限都是配置约束，不代表最大值同时获得预留。降低 Session 上限时，可能需要
+同步显式降低 migration/path/stream 等默认上限；解析器不会暗中裁剪这些配置值。UDP
+发送和接收硬上限互相独立，不能把反向接收能力当作本地已验证的路径 MTU。
 
 ## 最小示例
 
