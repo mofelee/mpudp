@@ -41,7 +41,7 @@ Check duration conversion and all products before sockets or allocation.
 | transport.plpmtud.base_udp_payload | 512 | exactly512 in this profile |
 | transport.plpmtud.probe_interval | 1s | 100ms..60s |
 | transport.plpmtud.max_outstanding_per_path | 1 | exactly1 |
-| transport.max_retained_epochs | 2 | 1..8, negotiated minimum |
+| transport.max_retained_epochs | 2 | 1..8 OLD contexts excluding current, negotiated minimum; pinned pending contexts count |
 | transport.max_epoch_age | 5s | 100ms..60s, negotiated minimum |
 | transport.max_migrations | 2 | 1..2 attempts/original group; replacement groups per attempt<=256 |
 | kcp.fast_retransmit.enabled | true | local sender policy; false disables both fast and early, retains RTO |
@@ -128,7 +128,7 @@ reached when byte credits are exhausted. Existing v1 limits remain unchanged.
 | limits.max_datagram_size | 65536 | 1..16777216, also effective fragment/budget limit |
 | limits.max_datagram_reassemblies | 1024 | 1..65536 and Datagram ID span |
 | limits.max_fragments_per_datagram | 256 | 1..4096 |
-| limits.max_migration_transaction_bytes | 8388608 | 1..Session/Peer ceilings; all aliases and replacement storage charged |
+| limits.max_migration_transaction_bytes | 8388608 | 1..8388608, also Session/Peer ceilings; all aliases and replacement storage charged |
 | limits.max_streams_per_session | 128 | 1..4096 business streams, excluding one charged reserved control stream |
 | limits.max_peer_streams | 4096 | 1..65536 business streams across all Sessions |
 | limits.max_stream_retained_bytes | 262144+configured MaxFrameSize (278528 at default) | At least262144+negotiated MaxFrameSize for stock initial smux window, at most Session ceiling |
