@@ -6,6 +6,14 @@ group has decoded. It consumes the [group codec](fecv2-group-codec.md),
 [terminal receive window](v2-receive-window.md). Public v2 runtime activation,
 pending-shard decoding, repair, migration and delivery queues remain pending.
 
+`RequiredInitialBytes(limits)` validates bounds and computes both terminal
+bitmap arrays' combined charge without allocation. `New` reserves that charge;
+`NewPrepaid(scope, limits, lease)` consumes a dedicated byte-only lease reserved
+before handshake completion. Both require an open promoted Session. Prepaid
+installation binds the existing lease without another reservation, rejects
+invalid inputs without consuming it, and releases it only after Close clears
+the bitmaps. Pending originals retain their separate admission-time leases.
+
 The caller authenticates and reconstructs one canonical original group before
 calling `AddGroup`. It keeps the decoded group's own charged storage until
 admission succeeds. A migration must first verify its whole transaction and

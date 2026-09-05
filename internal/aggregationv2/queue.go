@@ -66,35 +66,74 @@ type Queue struct {
 	haveNow, closed bool
 }
 
-func New(session *creditv2.Session, limits Limits, epoch Epoch) (*Queue, error) {
+// RequiredInitialBytes validates limits and reports the ring backing bytes to
+// reserve before handshake completion. Payloads and output use separate leases.
+func RequiredInitialBytes(limits Limits) (uint64, error) {
+	if limits.MaxQueuedDatagrams < 1 || limits.MaxQueuedDatagrams > 65536 || limits.MaxQueuedBytes == 0 || limits.MaxQueuedBytes > creditv2.MaxRetainedBytes || limits.MaxDatagramBytes == 0 || limits.MaxDatagramBytes > fecv2.MaxDatagramBytes || limits.MaxFragmentsPerDatagram < 1 || limits.MaxFragmentsPerDatagram > 4096 || limits.MaxDelay < time.Microsecond || limits.MaxDelay > 10*time.Millisecond {
+		return 0, invalid("limits outside bounds")
+	}
+	// Sizeof measures actual fixed backing storage, not allocator overhead.
+	slotBytes := uint64(unsafe.Sizeof(entry{}))
+	if uint64(limits.MaxQueuedDatagrams) > math.MaxUint64/slotBytes {
+		return 0, invalid("ring size overflow")
+	}
+	return uint64(limits.MaxQueuedDatagrams) * slotBytes, nil
+}
+
+func prepare(session *creditv2.Session, limits Limits, epoch Epoch) (*fecv2.Codec, uint64, error) {
 	state := session.Snapshot()
 	if state.Closed || state.PendingHandshake {
-		return nil, invalid("an open established credit scope is required")
+		return nil, 0, invalid("an open established credit scope is required")
 	}
-	if limits.MaxQueuedDatagrams < 1 || limits.MaxQueuedDatagrams > 65536 || limits.MaxQueuedBytes == 0 || limits.MaxQueuedBytes > creditv2.MaxRetainedBytes || limits.MaxDatagramBytes == 0 || limits.MaxDatagramBytes > fecv2.MaxDatagramBytes || limits.MaxFragmentsPerDatagram < 1 || limits.MaxFragmentsPerDatagram > 4096 || limits.MaxDelay < time.Microsecond || limits.MaxDelay > 10*time.Millisecond || epoch.ID == 0 {
-		return nil, invalid("limits or epoch outside bounds")
+	ringBytes, err := RequiredInitialBytes(limits)
+	if err != nil {
+		return nil, 0, err
+	}
+	if epoch.ID == 0 {
+		return nil, 0, invalid("zero epoch")
 	}
 	codec, err := fecv2.New(epoch.Parameters)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if limits.MaxDatagramBytes > uint32(epoch.Parameters.MaxDatagramBytes) {
-		return nil, invalid("Datagram limit exceeds encoding context")
+		return nil, 0, invalid("Datagram limit exceeds encoding context")
 	}
-	// Sizeof measures the ring's actual fixed backing storage, not allocator
-	// overhead. Payloads and encoded output have separate concurrent leases.
-	slotBytes := uint64(unsafe.Sizeof(entry{}))
-	if uint64(limits.MaxQueuedDatagrams) > math.MaxUint64/slotBytes {
-		return nil, invalid("ring size overflow")
+	return codec, ringBytes, nil
+}
+
+// New reserves the initial ring storage in an established Session.
+func New(session *creditv2.Session, limits Limits, epoch Epoch) (*Queue, error) {
+	codec, ringBytes, err := prepare(session, limits, epoch)
+	if err != nil {
+		return nil, err
 	}
-	ringBytes := uint64(limits.MaxQueuedDatagrams) * slotBytes
 	ringLease, err := session.Reserve(creditv2.Claim{Bytes: ringBytes})
 	if err != nil {
 		return nil, err
 	}
+	return newQueue(session, limits, epoch, codec, ringLease), nil
+}
+
+// NewPrepaid consumes a dedicated, already-reserved byte-only ring lease from
+// this established Session. Failure leaves prepaid unchanged. Close clears the
+// ring before releasing the lease; retained caller handles may release afterward.
+func NewPrepaid(session *creditv2.Session, limits Limits, epoch Epoch, prepaid *creditv2.Lease) (*Queue, error) {
+	codec, ringBytes, err := prepare(session, limits, epoch)
+	if err != nil {
+		return nil, err
+	}
+	ringLease, err := session.BindBytes(prepaid, ringBytes)
+	if err != nil {
+		return nil, err
+	}
+	return newQueue(session, limits, epoch, codec, ringLease), nil
+}
+
+func newQueue(session *creditv2.Session, limits Limits, epoch Epoch, codec *fecv2.Codec, ringLease *creditv2.Lease) *Queue {
 	n := uint64(epoch.Parameters.DataShards + epoch.Parameters.ParityShards)
 	outputBytes := n * (uint64(epoch.Parameters.ShardBytes) + uint64(unsafe.Sizeof([]byte{})))
-	return &Queue{session: session, limits: limits, epoch: epoch, codec: codec, ring: make([]entry, limits.MaxQueuedDatagrams), ringLease: ringLease, nextDatagramID: 1, nextGroupID: 1, outputBytes: outputBytes}, nil
+	return &Queue{session: session, limits: limits, epoch: epoch, codec: codec, ring: make([]entry, limits.MaxQueuedDatagrams), ringLease: ringLease, nextDatagramID: 1, nextGroupID: 1, outputBytes: outputBytes}
 }
 
 func invalid(reason string) error { return fmt.Errorf("%w: %s", ErrInvalid, reason) }

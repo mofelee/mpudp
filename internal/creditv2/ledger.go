@@ -94,6 +94,7 @@ type leaseState struct {
 	owner          *sessionState
 	claim          Claim
 	acceptReserved bool
+	bound          bool
 	released       bool
 }
 
@@ -209,6 +210,40 @@ func (s *Session) Reserve(claim Claim) (*Lease, error) {
 	return lease, nil
 }
 
+// BindBytes dedicates an existing byte-only lease to one storage owner without
+// reserving again. The lease must belong to this open, established Session and
+// cover required bytes. Copies share the one-time binding; a bound lease cannot
+// move to another Session. Failure leaves the caller's lease unchanged.
+// The returned handle shares release state with the original. The caller must
+// dispose of the storage owner before releasing any retained original handle.
+func (s *Session) BindBytes(lease *Lease, required uint64) (*Lease, error) {
+	if s == nil || s.state == nil || lease == nil || lease.state == nil || required == 0 || required > MaxRetainedBytes {
+		return nil, invalid("nil Session, lease or invalid required bytes")
+	}
+	state := s.state
+	p := state.peer
+	if lease.state.peer != p {
+		return nil, invalid("lease belongs to another Peer")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state.closed || p.usage.Closed {
+		return nil, ErrClosed
+	}
+	if state.pendingHandshake {
+		return nil, invalid("an established Session is required")
+	}
+	l := lease.state
+	if l.released {
+		return nil, ErrReleased
+	}
+	if l.owner != state || l.bound || l.claim.BusinessStream || l.claim.PendingAccept || l.claim.Bytes < required {
+		return nil, invalid("lease is not dedicated byte storage for this Session")
+	}
+	l.bound = true
+	return &Lease{state: l}, nil
+}
+
 func newLease(s *sessionState, claim Claim) *Lease {
 	return &Lease{state: &leaseState{peer: s.peer, owner: s, claim: claim, acceptReserved: claim.PendingAccept}}
 }
@@ -261,6 +296,7 @@ func (p *peerState) chargeLocked(s *sessionState, claim Claim) {
 // Peer. The destination is checked before any debit; Peer usage is unchanged.
 // A closed source may transfer live storage to an open destination. Transfer
 // is not a copy and must not be used while both owners retain separate copies.
+// A lease dedicated by BindBytes cannot transfer to another Session.
 func (l *Lease) Transfer(destination *Session) error {
 	if l == nil || l.state == nil || destination == nil || destination.state == nil {
 		return invalid("nil lease or destination")
@@ -282,6 +318,9 @@ func (l *Lease) Transfer(destination *Session) error {
 	source := state.owner
 	if source == target {
 		return nil
+	}
+	if state.bound {
+		return invalid("bound storage cannot change Session")
 	}
 	if err := p.checkSessionClaimLocked(target, state.claim); err != nil {
 		return err

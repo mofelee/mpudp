@@ -55,24 +55,54 @@ type Receiver struct {
 	closed      bool
 }
 
+// RequiredInitialBytes validates limits and reports the two terminal bitmap
+// backing arrays to reserve before handshake completion.
+func RequiredInitialBytes(limits Limits) (uint64, error) {
+	if limits.MaxDatagrams < 1 || limits.MaxDatagrams > 65536 || limits.MaxDatagramBytes < 1 || limits.MaxDatagramBytes > fecv2.MaxDatagramBytes || limits.MaxFragments < 1 || limits.MaxFragments > 4096 || limits.Span < 1 || limits.Span > recvwindow.MaxSpan || limits.MaxDatagrams > int(limits.Span) || limits.Timeout < 100*time.Millisecond || limits.Timeout > time.Minute {
+		return 0, invalid("limits outside bounds")
+	}
+	return uint64((limits.Span+63)/64) * 16, nil
+}
+
 // New reserves the bitmap storage before constructing terminal history.
 // The Session scope remains owned by the caller and is never closed here.
 func New(scope *creditv2.Session, limits Limits) (*Receiver, error) {
-	if scope == nil || limits.MaxDatagrams < 1 || limits.MaxDatagrams > 65536 || limits.MaxDatagramBytes < 1 || limits.MaxDatagramBytes > fecv2.MaxDatagramBytes || limits.MaxFragments < 1 || limits.MaxFragments > 4096 || limits.Span < 1 || limits.Span > recvwindow.MaxSpan || limits.MaxDatagrams > int(limits.Span) || limits.Timeout < 100*time.Millisecond || limits.Timeout > time.Minute {
-		return nil, invalid("limits outside bounds")
+	bytes, err := RequiredInitialBytes(limits)
+	if err != nil {
+		return nil, err
 	}
 	if state := scope.Snapshot(); state.Closed || state.PendingHandshake {
 		return nil, invalid("an open established credit scope is required")
 	}
-	lease, err := scope.Reserve(creditv2.Claim{Bytes: uint64((limits.Span+63)/64) * 16})
+	lease, err := scope.Reserve(creditv2.Claim{Bytes: bytes})
 	if err != nil {
 		return nil, err
 	}
-	window, err := recvwindow.New(limits.Span)
+	receiver, err := NewPrepaid(scope, limits, lease)
 	if err != nil {
 		lease.Release()
+	}
+	return receiver, err
+}
+
+// NewPrepaid consumes a dedicated byte-only bitmap lease already reserved by
+// this established Session. Failure leaves prepaid unchanged. Close disposes
+// of the bitmaps before release; retained caller handles may release afterward.
+func NewPrepaid(scope *creditv2.Session, limits Limits, prepaid *creditv2.Lease) (*Receiver, error) {
+	bytes, err := RequiredInitialBytes(limits)
+	if err != nil {
 		return nil, err
 	}
+	if state := scope.Snapshot(); state.Closed || state.PendingHandshake {
+		return nil, invalid("an open established credit scope is required")
+	}
+	lease, err := scope.BindBytes(prepaid, bytes)
+	if err != nil {
+		return nil, err
+	}
+	// RequiredInitialBytes already proved recvwindow.New's only error condition
+	// impossible. Allocate only after the existing lease is bound successfully.
+	window, _ := recvwindow.New(limits.Span)
 	return &Receiver{scope: scope, limits: limits, window: window, windowLease: lease, pending: make(map[uint64]*assembly)}, nil
 }
 

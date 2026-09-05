@@ -113,6 +113,13 @@ func TestConstructorCannotInstallBeforePromotion(t *testing.T) {
 	if p.Snapshot() != before {
 		t.Fatal("rejected constructor retained ownership")
 	}
+	bytes, _ := RequiredInitialBytes(r.limits)
+	prepaid, err := r.scope.Reserve(creditv2.Claim{Bytes: bytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepaid.Release()
+	before, beforeLease := p.Snapshot(), prepaid.Snapshot()
 	for _, change := range []func(*Limits){
 		func(l *Limits) { l.MaxDatagrams = 0 }, func(l *Limits) { l.MaxDatagrams = int(l.Span) + 1 },
 		func(l *Limits) { l.MaxDatagramBytes = fecv2.MaxDatagramBytes + 1 }, func(l *Limits) { l.MaxFragments = 4097 },
@@ -123,10 +130,21 @@ func TestConstructorCannotInstallBeforePromotion(t *testing.T) {
 		if candidate, err := New(r.scope, limits); candidate != nil || !errors.Is(err, ErrInvalid) {
 			t.Fatal("invalid constructor bounds accepted")
 		}
-		if p.Snapshot() != before {
+		if bytes, err := RequiredInitialBytes(limits); err == nil || bytes != 0 {
+			t.Fatal("invalid limits produced an initial byte requirement")
+		}
+		if candidate, err := NewPrepaid(r.scope, limits, prepaid); candidate != nil || !errors.Is(err, ErrInvalid) {
+			t.Fatal("invalid prepaid constructor bounds accepted")
+		}
+		if p.Snapshot() != before || prepaid.Snapshot() != beforeLease {
 			t.Fatal("invalid constructor leaked credits")
 		}
 	}
+	candidate, err := NewPrepaid(r.scope, r.limits, prepaid)
+	if err != nil {
+		t.Fatalf("invalid prepaid construction bound the caller lease: %v", err)
+	}
+	candidate.Close()
 }
 
 func TestGroupFailureRollsBackAllOriginalsAndCredits(t *testing.T) {
