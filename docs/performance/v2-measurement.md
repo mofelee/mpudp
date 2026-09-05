@@ -19,6 +19,9 @@ it does not establish a causal throughput improvement.
 The [directional-authenticator comparison](v2-authenticator-20260905.md) records
 lower v2 sender/receiver allocation costs with prepaid HMAC state, alongside
 mixed throughput and host-pressure limits.
+The [prepaid-send workspace comparison](v2-send-workspace-20260905.md) protects
+accepted-original progress at full byte credit and records the same-workload
+allocation, throughput and host-pressure evidence.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.
