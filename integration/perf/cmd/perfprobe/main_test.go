@@ -126,78 +126,113 @@ func availableAddress(t *testing.T, network string) string {
 
 func TestProtocolMatrixRoundTrip(t *testing.T) {
 	for _, protocol := range []string{"tcp", "udp", "kcp", "mpudp", "kcp-mpudp"} {
-		for _, direction := range []string{"upload", "download"} {
-			t.Run(protocol+"/"+direction, func(t *testing.T) {
-				var captured bytes.Buffer
-				output = &captured
-				defer func() { output = os.Stdout }()
-				o := options{Mode: "server", Protocol: protocol, Direction: direction, ID: "loopback", Seconds: 1, Payload: 1200, Flows: 2,
-					KCPMTU: 1400, KCPWindow: 1024, RateMbps: 1, Control: availableAddress(t, "tcp"), Address: availableAddress(t, "udp")}
-				client := o
-				client.Mode = "client"
-				client.Diagnostics = protocol == "kcp" || protocol == "kcp-mpudp"
-				if protocol == "mpudp" || protocol == "kcp-mpudp" {
-					dir := t.TempDir()
-					o.Config, client.Config = filepath.Join(dir, "server.yaml"), filepath.Join(dir, "client.yaml")
-					common := "fec:\n  data_shards: 3\n  parity_shards: 2\npsk: private-loopback-marker\n"
-					if err := os.WriteFile(o.Config, []byte(fmt.Sprintf("listen: %s\n%s", o.Address, common)), 0600); err != nil {
-						t.Fatal(err)
+		profiles := []string{"v1"}
+		if protocol == "mpudp" || protocol == "kcp-mpudp" {
+			profiles = append(profiles, "v2", "v2-aggregation")
+		}
+		for _, profile := range profiles {
+			for _, direction := range []string{"upload", "download"} {
+				t.Run(protocol+"/"+profile+"/"+direction, func(t *testing.T) {
+					var captured bytes.Buffer
+					output = &captured
+					defer func() { output = os.Stdout }()
+					o := options{Mode: "server", Protocol: protocol, Direction: direction, ID: "loopback", Seconds: 1, Payload: 1200, Flows: 2,
+						KCPMTU: 1400, KCPWindow: 1024, RateMbps: 1, Control: availableAddress(t, "tcp"), Address: availableAddress(t, "udp")}
+					if profile != "v1" {
+						// This short test verifies adapter/control wiring. Offered-load
+						// performance and ACK starvation belong to measured runs.
+						o.Flows, o.RateMbps = 1, 0.025
 					}
-					if err := os.WriteFile(client.Config, []byte(fmt.Sprintf("carriers:\n  - %s\n%s", o.Address, common)), 0600); err != nil {
-						t.Fatal(err)
-					}
-				}
-				done := make(chan error, 1)
-				go func() { done <- run(o) }()
-				if err := run(client); err != nil {
-					t.Fatal(err)
-				}
-				if err := <-done; err != nil {
-					t.Fatal(err)
-				}
-				if bytes.Contains(captured.Bytes(), []byte("private-loopback-marker")) {
-					t.Fatal("PSK leaked in output")
-				}
-				decoder := json.NewDecoder(&captured)
-				var receiver *summary
-				for {
-					var row json.RawMessage
-					if err := decoder.Decode(&row); errors.Is(err, io.EOF) {
-						break
-					} else if err != nil {
-						t.Fatal(err)
-					}
-					var record summary
-					if err := json.Unmarshal(row, &record); err != nil {
-						t.Fatal(err)
-					}
-					if record.Type == "summary" && record.Role == "receiver" {
-						receiver = &record
-					}
-				}
-				if receiver == nil || receiver.VerifiedBytes == 0 || receiver.CorruptFrames != 0 || receiver.Flows != 2 {
-					t.Fatalf("invalid receiver result: %+v", receiver)
-				}
-				if len(receiver.Samples) != 1 || receiver.Samples[0].VerifiedBytes != receiver.VerifiedBytes {
-					t.Fatal("summary does not match receiver window")
-				}
-				if receiver.EchoRTT.Scheduled != uint64(client.Seconds*5*client.Flows) {
-					t.Fatalf("lost scheduled probe opportunities: %+v", receiver.EchoRTT)
-				}
-				if client.Diagnostics {
-					if len(receiver.Final.KCPCorrelation) != client.Flows {
-						t.Fatal("missing KCP diagnostic flow snapshots")
-					}
-					for _, trace := range receiver.Final.KCPCorrelation {
-						if trace.PacketCorrelationAvailable != (protocol == "kcp-mpudp") {
-							t.Fatal("incorrect packet correlation boundary")
+					client := o
+					client.Mode = "client"
+					client.Diagnostics = protocol == "kcp" || protocol == "kcp-mpudp"
+					if protocol == "mpudp" || protocol == "kcp-mpudp" {
+						dir := t.TempDir()
+						o.Config, client.Config = filepath.Join(dir, "server.yaml"), filepath.Join(dir, "client.yaml")
+						common := "fec:\n  data_shards: 3\n  parity_shards: 2\npsk: private-loopback-marker\n"
+						if profile != "v1" {
+							common += fmt.Sprintf("protocol: datagram\nwire: {version: v2}\naggregation: {enabled: %t, max_delay: 10ms, max_queued_datagrams: 8}\n", profile == "v2-aggregation")
 						}
-						if protocol == "kcp-mpudp" && (trace.InboundPushSegments == 0 || trace.OutboundACKSegments == 0 || trace.MatchedACKs == 0) {
-							t.Fatalf("missing actual KCP/MPUDP header observations: %+v", trace)
+						if err := os.WriteFile(o.Config, []byte(fmt.Sprintf("listen: %s\n%s", o.Address, common)), 0600); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(client.Config, []byte(fmt.Sprintf("carriers:\n  - %s\n%s", o.Address, common)), 0600); err != nil {
+							t.Fatal(err)
 						}
 					}
-				}
-			})
+					done := make(chan error, 1)
+					go func() { done <- run(o) }()
+					if err := run(client); err != nil {
+						t.Fatal(err)
+					}
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+					if bytes.Contains(captured.Bytes(), []byte("private-loopback-marker")) {
+						t.Fatal("PSK leaked in output")
+					}
+					decoder := json.NewDecoder(&captured)
+					var receiver *summary
+					summaries, metadataRows := 0, 0
+					for {
+						var row json.RawMessage
+						if err := decoder.Decode(&row); errors.Is(err, io.EOF) {
+							break
+						} else if err != nil {
+							t.Fatal(err)
+						}
+						var record summary
+						if err := json.Unmarshal(row, &record); err != nil {
+							t.Fatal(err)
+						}
+						if record.Type == "summary" && record.Role == "receiver" {
+							receiver = &record
+						}
+						if record.Type == "summary" {
+							summaries++
+							if profile != "v1" && (record.LocalDrain.SupportedSessions != o.Flows || record.LocalDrain.CompletedSessions != o.Flows || record.LocalDrain.FailedSessions != 0) {
+								t.Fatalf("v2 tail did not complete local drain: %+v", record.LocalDrain)
+							}
+						}
+						if record.Type == "metadata" && (protocol == "mpudp" || protocol == "kcp-mpudp") {
+							var metadata struct {
+								Config struct {
+									Profile string `json:"mpudp_profile"`
+								} `json:"config"`
+							}
+							if err := json.Unmarshal(row, &metadata); err != nil || metadata.Config.Profile != profile {
+								t.Fatalf("wrong MPUDP profile metadata: %s, %v", row, err)
+							}
+							metadataRows++
+						}
+					}
+					if summaries != 2 || ((protocol == "mpudp" || protocol == "kcp-mpudp") && metadataRows != 2) {
+						t.Fatalf("missing side evidence: summaries %d metadata %d", summaries, metadataRows)
+					}
+					if receiver == nil || receiver.VerifiedBytes == 0 || receiver.CorruptFrames != 0 || receiver.DuplicateFrames != 0 || receiver.Flows != o.Flows {
+						t.Fatalf("invalid receiver result: %+v", receiver)
+					}
+					if len(receiver.Samples) != 1 || receiver.Samples[0].VerifiedBytes != receiver.VerifiedBytes {
+						t.Fatal("summary does not match receiver window")
+					}
+					if receiver.EchoRTT.Scheduled != uint64(client.Seconds*5*client.Flows) {
+						t.Fatalf("lost scheduled probe opportunities: %+v", receiver.EchoRTT)
+					}
+					if client.Diagnostics {
+						if len(receiver.Final.KCPCorrelation) != client.Flows {
+							t.Fatal("missing KCP diagnostic flow snapshots")
+						}
+						for _, trace := range receiver.Final.KCPCorrelation {
+							if trace.PacketCorrelationAvailable != (protocol == "kcp-mpudp") {
+								t.Fatal("incorrect packet correlation boundary")
+							}
+							if protocol == "kcp-mpudp" && (trace.InboundPushSegments == 0 || trace.OutboundACKSegments == 0 || trace.MatchedACKs == 0) {
+								t.Fatalf("missing actual KCP/MPUDP header observations: %+v", trace)
+							}
+						}
+					}
+				})
+			}
 		}
 	}
 }

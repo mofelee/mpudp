@@ -94,6 +94,8 @@ jobs:
         with:
           go-version: 1.24.x
           cache-dependency-path: integration/perf/go.sum
+      - name: Install v2 benchmark YAML encoder
+        run: python3 -m pip install PyYAML==6.0.2
       - name: Validate calibration accounting and cleanup
         run: python3 -m unittest discover -s scripts/perf -p 'test_*.py'
       - name: Verify benchmark modules

@@ -48,7 +48,10 @@ func (c framedStream) Write(b []byte) (int, error) {
 	return total, nil
 }
 
-type datagramConn struct{ session mpudp.Session }
+type datagramConn struct {
+	session mpudp.Session
+	writer  *admissionWriter
+}
 
 func (c datagramConn) Read(b []byte) (int, error) {
 	p, err := c.session.ReadPacket()
@@ -61,12 +64,23 @@ func (c datagramConn) Read(b []byte) (int, error) {
 	return copy(b, p), nil
 }
 func (c datagramConn) Write(b []byte) (int, error) {
-	if err := c.session.WritePacket(b); err != nil {
+	var err error
+	if c.writer != nil {
+		err = c.writer.writePacket(context.Background(), b)
+	} else {
+		err = c.session.WritePacket(b)
+	}
+	if err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
-func (c datagramConn) Close() error { return c.session.Close() }
+func (c datagramConn) Close() error {
+	if c.writer != nil {
+		c.writer.cancel()
+	}
+	return c.session.Close()
+}
 
 type udpConn struct {
 	*net.UDPConn
@@ -104,9 +118,10 @@ func (c *udpConn) Write(b []byte) (int, error) {
 // KCP must see transient MPUDP send failures as packet loss. Returning such
 // failures to kcp-go permanently stops its output loop; count each one instead.
 type packetConn struct {
-	s     mpudp.Session
-	drops atomic.Uint64
-	trace *kcpTrace
+	s      mpudp.Session
+	writer *admissionWriter
+	drops  atomic.Uint64
+	trace  *kcpTrace
 }
 
 var virtualRemote = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
@@ -131,7 +146,12 @@ func (p *packetConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 		started = time.Now()
 		writeID = p.trace.outgoing(b, started)
 	}
-	err := p.s.WritePacket(b)
+	var err error
+	if p.writer != nil {
+		err = p.writer.writePacket(context.Background(), b)
+	} else {
+		err = p.s.WritePacket(b)
+	}
 	if p.trace != nil {
 		p.trace.returned(b, writeID, started, time.Now(), err)
 	}
@@ -144,7 +164,12 @@ func (p *packetConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 	}
 	return len(b), nil
 }
-func (p *packetConn) Close() error                     { return p.s.Close() }
+func (p *packetConn) Close() error {
+	if p.writer != nil {
+		p.writer.cancel()
+	}
+	return p.s.Close()
+}
 func (p *packetConn) LocalAddr() net.Addr              { return virtualRemote }
 func (p *packetConn) SetDeadline(time.Time) error      { return errors.New("use KCP session deadline") }
 func (p *packetConn) SetReadDeadline(time.Time) error  { return errors.New("use KCP session deadline") }
@@ -161,6 +186,7 @@ type transports struct {
 	kcp            []*kcp.UDPSession
 	kcpTraces      []*kcpTrace
 	adapters       []*packetConn
+	writers        []*admissionWriter
 	listener       io.Closer
 	sockets        []io.Closer
 	paths          int
@@ -168,6 +194,7 @@ type transports struct {
 }
 
 func (t *transports) close() {
+	t.stopAdmissions()
 	for _, c := range t.conns {
 		_ = c.Close()
 	}
@@ -204,7 +231,7 @@ func openTransports(o options) (*transports, error) {
 	}
 	t.peer = p
 	t.paths = len(cfg.Carriers)
-	t.configMetadata = map[string]any{"fec": cfg.FEC, "transport": cfg.Transport, "limits": cfg.Limits, "timers": cfg.Timers, "configured_carriers": len(cfg.Carriers)}
+	t.configMetadata = mpudpConfigMetadata(cfg)
 	// Reflection keeps this probe buildable against the v0.1.0 regression SHA,
 	// before the optional diagnostics API existed.
 	m := reflect.ValueOf(p).MethodByName("SetDiagnosticsEnabled")
@@ -232,10 +259,15 @@ func (t *transports) addKCP(c *kcp.UDPSession, o options, trace *kcpTrace) (mess
 }
 
 func (t *transports) wrapSession(s mpudp.Session, o options) (messageConn, error) {
-	if o.Protocol == "mpudp" {
-		return datagramConn{s}, nil
+	var w *admissionWriter
+	if _, ok := s.(localFlusher); ok {
+		w = newAdmissionWriter(s)
+		t.writers = append(t.writers, w)
 	}
-	p := &packetConn{s: s}
+	if o.Protocol == "mpudp" {
+		return datagramConn{session: s, writer: w}, nil
+	}
+	p := &packetConn{s: s, writer: w}
 	if o.Diagnostics {
 		p.trace = newKCPTrace(true)
 	}

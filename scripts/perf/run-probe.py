@@ -9,6 +9,8 @@ The default matrix has 696 cases and at least 61.9 hours of measurement windows,
 before setup, collection and cleanup. Use --plan to review the selected matrix;
 filter --protocols/--paths/--directions/--payloads for a bounded subset. Reduced
 windows are smoke tests and never satisfy the formal measurement gate.
+--mpudp-profiles defaults to v1; explicit v2 and v2-aggregation selections add
+separate MPUDP cases without repeating native TCP/UDP/KCP baselines.
 """
 import argparse
 import concurrent.futures
@@ -34,7 +36,18 @@ spec.loader.exec_module(calibrate)
 ROOT = Path(__file__).resolve().parents[2]
 PROTOCOLS = ("tcp", "udp", "kcp", "mpudp", "kcp-mpudp")
 MPUDP = ("mpudp", "kcp-mpudp")
+MPUDP_PROFILES = ("v1", "v2", "v2-aggregation")
 DATA_SHARD_OVERHEAD = 71  # v1: prefix 24 + metadata 15 + HMAC-SHA256 32.
+V2_DATA_SHARD_OVERHEAD = 94
+V2_MANIFEST_OVERHEAD = 24  # One manifest prefix and one fragment descriptor.
+V2_MAX_FRAGMENTS = 256
+V2_QUEUE_BYTES = 1 << 20
+V2_QUEUE_DATAGRAMS = 256
+ADMISSION_COUNTERS = ("backpressured_packets", "rejected_attempts", "retry_attempts", "wait_ns",
+                      "canceled_packets", "timeout_packets")
+ADMISSION_POLICY = {"max_wait_ns": 1000000000, "retry_wait_ns": 100000,
+                    "retry_scope": "whole_datagram_resource_limit", "local_drain_limit_ns": 3000000000}
+LOCAL_DRAIN_SCOPE = "admitted_mpudp_datagrams_local_socket_attempts"
 PROFILE_SUFFIXES = ("cpu", "allocs", "heap", "mutex", "block")
 REMOTE_PATH = "/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -59,8 +72,19 @@ def read_secret(path):
     return value
 
 
-def payload_size(label, protocol, args):
-    limit = min(args.max_datagram_size, args.data_shards * (args.udp_budget - DATA_SHARD_OVERHEAD))
+def v2_group_bytes(args):
+    return min(V2_QUEUE_BYTES, args.data_shards * (args.udp_budget - V2_DATA_SHARD_OVERHEAD))
+
+
+def datagram_limit(args, profile="v1"):
+    if profile == "v1":
+        return min(args.max_datagram_size, args.data_shards * (args.udp_budget - DATA_SHARD_OVERHEAD))
+    return min(args.max_datagram_size, args.v2_max_original_bytes,
+               V2_MAX_FRAGMENTS * (v2_group_bytes(args) - V2_MANIFEST_OVERHEAD))
+
+
+def payload_size(label, protocol, args, profile="v1"):
+    limit = datagram_limit(args, profile)
     if label == "max":
         if protocol == "mpudp":
             return limit
@@ -69,7 +93,7 @@ def payload_size(label, protocol, args):
         return args.stream_max_payload
     size = int(label)
     if protocol == "mpudp" and size > limit:
-        raise ValueError("requested MPUDP payload exceeds negotiated v1 fixed budget")
+        raise ValueError(f"requested MPUDP payload exceeds {profile} original Datagram budget")
     if protocol == "udp" and size > args.physical_mtu - 28:
         raise ValueError("requested UDP payload exceeds reference IPv4 path budget")
     return size
@@ -81,22 +105,28 @@ def matrix(args):
                                    args.flows, args.diagnostics, range(1, args.rounds + 1))
     for protocol, paths, direction, label, flows, diagnostics, round_number in dimensions:
         layouts = ("mpudp",) if protocol in MPUDP else ("single", "parallel") if paths > 1 else ("single",)
-        for layout in layouts:
+        profiles = args.mpudp_profiles if protocol in MPUDP else (None,)
+        for layout, profile in itertools.product(layouts, profiles):
             workers = paths if layout == "parallel" else 1
             case = {"protocol": protocol, "candidate_paths": paths, "layout": layout,
                     "active_paths": paths if protocol in MPUDP or layout == "parallel" else 1,
                     "workers": workers, "flows_per_worker": flows, "total_flows": flows * workers,
                     "single_flow": flows * workers == 1, "direction": direction,
-                    "payload_label": label, "message_bytes": payload_size(label, protocol, args),
+                    "payload_label": label, "message_bytes": payload_size(label, protocol, args, profile or "v1"),
                     "verification_header_bytes": 40, "diagnostics": diagnostics == "on",
                     "round": round_number, "seconds": args.seconds, "warmup_seconds": args.warmup,
                     "formal_window": args.seconds >= 300 and args.warmup >= 20 and args.rounds >= 3,
                     "product_acceptance": False}
             case["case_id"] = (f"{protocol}-p{paths}-{layout}-{direction}-b{label}-f{flows}-"
                                f"diag{diagnostics}-r{round_number}")
+            if profile is not None:
+                case.update(mpudp_profile=profile, wire_version="v1" if profile == "v1" else "v2",
+                            max_original_bytes=datagram_limit(args, profile))
+                if profile != "v1":
+                    case["case_id"] += "-" + profile
             if case["message_bytes"] < 64 or case["message_bytes"] * flows > 64 * 1024 * 1024:
                 raise ValueError("message and flow sizes exceed probe memory bounds")
-            if protocol == "kcp-mpudp" and args.kcp_mtu > min(args.max_datagram_size, args.data_shards * (args.udp_budget - DATA_SHARD_OVERHEAD)):
+            if protocol == "kcp-mpudp" and args.kcp_mtu > datagram_limit(args, profile):
                 raise ValueError("KCP MTU exceeds MPUDP negotiated Datagram budget")
             result.append(case)
     if len({c["case_id"] for c in result}) != len(result):
@@ -111,11 +141,38 @@ def mpudp_config(args, topology, case, side, secret):
                       "max_pending_fec_blocks": args.pending_blocks,
                       "receive_queue_capacity": args.queue_capacity,
                       "delivery_queue_capacity": args.queue_capacity}}
+    profile = case.get("mpudp_profile", "v1")
+    if profile != "v1":
+        cfg.update(protocol="datagram", wire={"version": "v2"}, repair={"enabled": False})
+        cfg["transport"].update(max_receive_udp_payload=args.udp_budget,
+                                mtu_discovery="fixed", budget_strategy="session")
+        cfg["limits"].update(max_datagram_size=datagram_limit(args, profile),
+                             max_fragments_per_datagram=V2_MAX_FRAGMENTS)
+        cfg["aggregation"] = {"enabled": profile == "v2-aggregation",
+                              "max_delay": f"{args.v2_aggregation_max_delay_us}us",
+                              "max_records": args.v2_aggregation_max_records,
+                              "max_queued_datagrams": V2_QUEUE_DATAGRAMS,
+                              "max_queued_bytes": V2_QUEUE_BYTES,
+                              "max_group_bytes": v2_group_bytes(args)}
+        rate_key = "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps"
+        cfg["scheduler"] = {rate_key: {path_id: args.v2_path_rate_bps
+                                      for path_id in range(1, case["candidate_paths"] + 1)}}
     if side == "client":
         cfg["carriers"] = [f"{address}:{args.data_port}" for address in topology["server_addresses"][:case["candidate_paths"]]]
     else:
         cfg["listen"] = f"0.0.0.0:{args.data_port}"
     return cfg
+
+
+def mpudp_config_bytes(config):
+    if config.get("wire", {}).get("version") != "v2":
+        return json.dumps(config).encode()
+    try:
+        import yaml
+    except ImportError as error:
+        raise ValueError("v2 profiles require PyYAML; install PyYAML==6.0.2 before running the matrix") from error
+    # JSON quotes integer map keys, which strict v2 scheduler parsing rejects.
+    return yaml.safe_dump(config, sort_keys=False, allow_unicode=False).encode()
 
 
 def records(path):
@@ -218,6 +275,10 @@ def verify_telemetry(value, case, source_sha):
     if any(not finite_nonnegative(process.get(key)) for key in ("cpu_user_seconds", "cpu_system_seconds")):
         raise ValueError("missing process CPU telemetry")
     require_counters(value, ("kcp_timeout_retransmits", "adapter_write_drops"), "transport")
+    admission = value.get("mpudp_admission")
+    require_counters(admission, ADMISSION_COUNTERS, "MPUDP admission")
+    if case["protocol"] not in MPUDP and any(admission[key] for key in ADMISSION_COUNTERS):
+        raise ValueError("native protocol unexpectedly reports MPUDP admission pressure")
     available = value.get("mpudp_statistics_available")
     if type(available) is not bool:
         raise ValueError("missing MPUDP statistics availability")
@@ -251,6 +312,57 @@ def verify_telemetry(value, case, source_sha):
         if value["kcp_timeout_retransmits"] != snmp["LostSegs"]:
             raise ValueError("KCP timeout telemetry disagrees with SNMP")
     verify_kcp_correlation(value, case)
+
+
+def verify_mpudp_config(metadata, case, side, parameters):
+    cfg = metadata.get("config")
+    if case["protocol"] not in MPUDP:
+        if cfg is not None:
+            raise ValueError("native protocol unexpectedly reports MPUDP configuration")
+        return
+    profile = case.get("mpudp_profile", "v1")
+    version = "v1" if profile == "v1" else "v2"
+    if (not isinstance(cfg, dict) or cfg.get("mpudp_profile") != profile or
+            cfg.get("wire_version") != version or cfg.get("protocol") != "datagram" or
+            not isinstance(cfg.get("repair"), dict) or cfg["repair"].get("enabled") is not False):
+        raise ValueError("MPUDP profile, wire protocol or repair differs from requested configuration")
+    for section, expected in (
+            ("fec", {"DataShards": parameters.data_shards, "ParityShards": parameters.parity_shards}),
+            ("limits", {"MaxDatagramSize": parameters.max_datagram_size if version == "v1" else datagram_limit(parameters, profile),
+                        "MaxPendingFECBlocks": parameters.pending_blocks,
+                        "ReceiveQueueCapacity": parameters.queue_capacity,
+                        "DeliveryQueueCapacity": parameters.queue_capacity}),
+            ("transport", {"MaxUDPPayload": parameters.udp_budget}),
+            ("udp_caps", {"send_hard_cap": parameters.udp_budget, "receive_hard_cap": parameters.udp_budget})):
+        value = cfg.get(section)
+        if not isinstance(value, dict) or any(type(value.get(key)) is not type(want) or value[key] != want
+                                              for key, want in expected.items()):
+            raise ValueError(f"MPUDP {section} differs from requested configuration")
+    carriers = case["candidate_paths"] if side == "client" else 0
+    if type(cfg.get("configured_carriers")) is not int or cfg["configured_carriers"] != carriers:
+        raise ValueError("MPUDP configured Carrier count differs from requested role")
+    aggregation = {"enabled": profile == "v2-aggregation"}
+    scheduler = {"outbound_path_rates_bps": {}, "inbound_path_rates_bps": {}}
+    if version == "v2":
+        aggregation.update(max_delay_ns=parameters.v2_aggregation_max_delay_us * 1000,
+                           max_records=parameters.v2_aggregation_max_records,
+                           max_queued_datagrams=V2_QUEUE_DATAGRAMS, max_queued_bytes=V2_QUEUE_BYTES,
+                           max_group_bytes=v2_group_bytes(parameters))
+        key = "outbound_path_rates_bps" if side == "client" else "inbound_path_rates_bps"
+        scheduler[key] = {str(path_id): parameters.v2_path_rate_bps
+                          for path_id in range(1, case["candidate_paths"] + 1)}
+        scheduler["default_path_rate_bps"] = 100000000
+        transport = cfg["transport"]
+        if (transport.get("MTUDiscovery") != "fixed" or transport.get("BudgetStrategy") != "session" or
+                type(transport.get("MaxReceiveUDPPayload")) is not int or
+                transport["MaxReceiveUDPPayload"] != parameters.udp_budget or
+                type(cfg["limits"].get("MaxFragmentsPerDatagram")) is not int or
+                cfg["limits"]["MaxFragmentsPerDatagram"] != V2_MAX_FRAGMENTS):
+            raise ValueError("MPUDP v2 transport or fragment policy differs from requested configuration")
+    for section, expected in (("aggregation", aggregation), ("scheduler", scheduler)):
+        # JSON representation also distinguishes booleans from integer values.
+        if json.dumps(cfg.get(section), sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ValueError(f"MPUDP {section} differs from requested configuration")
 
 
 def verify_latency(value, case):
@@ -290,6 +402,10 @@ def receiver_overlap(pairs, case):
 
 def verify_pair(client_path, server_path, case, worker_id, source_sha, parameters):
     sides = {"client": records(client_path), "server": records(server_path)}
+    return verify_pair_records(sides, case, worker_id, source_sha, parameters)
+
+
+def verify_pair_records(sides, case, worker_id, source_sha, parameters):
     summaries = {}
     receiver_side = "server" if case["direction"] == "upload" else "client"
     for side, rows in sides.items():
@@ -317,6 +433,15 @@ def verify_pair(client_path, server_path, case, worker_id, source_sha, parameter
         expected_paths = case["candidate_paths"] if case["protocol"] in MPUDP else 1
         if metadata.get("path_count") != expected_paths or summary.get("path_count") != expected_paths:
             raise ValueError("actual configured path count does not match matrix")
+        if json.dumps(metadata.get("admission_policy"), sort_keys=True) != json.dumps(ADMISSION_POLICY, sort_keys=True):
+            raise ValueError("MPUDP admission retry policy differs from bounded probe policy")
+        verify_mpudp_config(metadata, case, side, parameters)
+        drain = summary.get("local_drain")
+        require_counters(drain, ("supported_sessions", "completed_sessions", "failed_sessions", "duration_ns"), "local drain")
+        expected_supported = case["flows_per_worker"] if case["protocol"] in MPUDP and case.get("mpudp_profile", "v1") != "v1" else 0
+        if (drain.get("scope") != LOCAL_DRAIN_SCOPE or drain["supported_sessions"] != expected_supported or
+                drain["completed_sessions"] != expected_supported or drain["failed_sessions"] != 0):
+            raise ValueError("MPUDP local drain is incomplete or has the wrong completion boundary")
         instant(summary.get("started_utc"))
         require_counters(summary, ("verified_bytes", "verified_packets", "send_errors", "read_errors", "corrupt_frames", "duplicate_frames", "too_old_frames"), "summary")
         for key in ("initial", "final"):
@@ -406,10 +531,12 @@ class ProbeRunner:
             self.control_address = str(ipaddress.IPv4Address(hostnames[0]))
 
     def deploy_config(self, host, name, config):
-        path = self.remote_dirs[host] + "/" + name + ".json"
+        encoded = mpudp_config_bytes(config)
+        extension = ".yaml" if config.get("wire", {}).get("version") == "v2" else ".json"
+        path = self.remote_dirs[host] + "/" + name + extension
         self.python(host, "import os,sys; f=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); "
                     "s=os.fdopen(f,'wb'); s.write(sys.stdin.buffer.read()); s.close()", path,
-                    data=json.dumps(config).encode())
+                    data=encoded)
         return path
 
     def stop_unit(self, host, unit):
@@ -627,6 +754,8 @@ def parse_args(argv=None):
     parser.add_argument("--plan", action="store_true", help="write matrix and manifest without SSH or load")
     parser.add_argument("--paths", type=int, nargs="+", choices=(1, 2, 3, 5), default=[1, 2, 3, 5])
     parser.add_argument("--protocols", nargs="+", choices=PROTOCOLS, default=list(PROTOCOLS))
+    parser.add_argument("--mpudp-profiles", nargs="+", choices=MPUDP_PROFILES, default=["v1"],
+                        help="MPUDP wire/aggregation profiles; native protocols are not duplicated")
     parser.add_argument("--directions", nargs="+", choices=("upload", "download"), default=["upload", "download"])
     parser.add_argument("--payloads", nargs="+", choices=("64", "1200", "1400", "max"), default=["64", "1200", "1400", "max"])
     parser.add_argument("--flows", type=int, nargs="+", default=[1])
@@ -644,6 +773,12 @@ def parse_args(argv=None):
     parser.add_argument("--data-shards", type=int, default=3)
     parser.add_argument("--parity-shards", type=int, default=2)
     parser.add_argument("--max-datagram-size", type=int, default=65536)
+    parser.add_argument("--v2-max-original-bytes", type=int, default=65536,
+                        help="additional v2 original Datagram ceiling (64..1048576)")
+    parser.add_argument("--v2-path-rate-bps", type=int, default=100000000,
+                        help="explicit configured rate for each selected v2 path; not a measured rate")
+    parser.add_argument("--v2-aggregation-max-delay-us", type=int, default=250)
+    parser.add_argument("--v2-aggregation-max-records", type=int, default=32)
     parser.add_argument("--stream-max-payload", type=int, default=65536)
     parser.add_argument("--queue-capacity", type=int, default=4096)
     parser.add_argument("--pending-blocks", type=int, default=8192)
@@ -661,11 +796,23 @@ def parse_args(argv=None):
     if not args.flows or any(not 1 <= flows <= 64 for flows in args.flows):
         parser.error("each flow count must be 1..64")
     if not 1 <= args.data_shards <= 255 or not 1 <= args.parity_shards <= 255 or args.data_shards + args.parity_shards > 256:
-        parser.error("FEC shard counts outside v1 range")
+        parser.error("FEC shard counts outside GF(2^8) range")
     if not 92 <= args.physical_mtu <= 65535 or not 72 <= args.udp_budget <= args.physical_mtu - 28:
         parser.error("UDP budget must fit the stated IPv4 physical MTU")
     if not 64 <= args.max_datagram_size <= 16777216 or not 64 <= args.stream_max_payload <= 16777216 or not 1 <= args.queue_capacity <= 65536 or not 1 <= args.pending_blocks <= 65536:
         parser.error("message size or queue capacity outside bounded range")
+    if (not 64 <= args.v2_max_original_bytes <= V2_QUEUE_BYTES or
+            not 1000 <= args.v2_path_rate_bps <= 1000000000000 or
+            not 1 <= args.v2_aggregation_max_delay_us <= 10000 or
+            not 1 <= args.v2_aggregation_max_records <= 256):
+        parser.error("v2 original, path rate or aggregation setting outside bounded range")
+    if len(set(args.mpudp_profiles)) != len(args.mpudp_profiles):
+        parser.error("MPUDP profiles must not contain duplicates")
+    if any(protocol in MPUDP for protocol in args.protocols) and any(profile != "v1" for profile in args.mpudp_profiles):
+        if args.udp_budget < 512:
+            parser.error("v2 requires UDP send and receive budgets of at least 512 bytes")
+        if args.source_sha == calibrate.BASELINE_SHA:
+            parser.error("the original product baseline supports only the v1 MPUDP profile")
     if not 64 <= args.kcp_mtu <= min(1500, args.physical_mtu - 28) or not 1 <= args.kcp_window <= 65536:
         parser.error("KCP settings outside implementation/path bounds")
     if not math.isfinite(args.rate_mbps) or not 0 <= args.rate_mbps <= 1000000:
@@ -683,6 +830,10 @@ def main(argv=None):
     args = parse_args(argv)
     topology = calibrate.topology(args.topology)
     cases = matrix(args)
+    for case in cases:
+        if case.get("wire_version") == "v2":
+            for side in ("client", "server"):
+                mpudp_config_bytes(mpudp_config(args, topology, case, side, "plan-only-redacted-key"))
     secret = read_secret(args.psk_file) if any(p in MPUDP for p in args.protocols) and not args.plan else None
     digest = sha256(args.binary)
     if args.binary_sha256 and digest != args.binary_sha256:
@@ -693,6 +844,11 @@ def main(argv=None):
         "source_sha": args.source_sha, "baseline_sha": calibrate.BASELINE_SHA, "binary_sha256": digest,
         "run_id": args.output.name, "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "topology": topology, "parameters": parameters, "data_shard_overhead": DATA_SHARD_OVERHEAD,
+        "data_shard_overhead_by_profile": {"v1": DATA_SHARD_OVERHEAD,
+            "v2": V2_DATA_SHARD_OVERHEAD, "v2-aggregation": V2_DATA_SHARD_OVERHEAD},
+        "v2_fragment_manifest_overhead": V2_MANIFEST_OVERHEAD,
+        "v2_aggregation_queue": {"max_datagrams": V2_QUEUE_DATAGRAMS, "max_bytes": V2_QUEUE_BYTES},
+        "admission_policy": ADMISSION_POLICY, "local_drain_scope": LOCAL_DRAIN_SCOPE,
         "runner_source_sha": calibrate.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
         "runner_dirty": bool(calibrate.run(["git", "-C", str(ROOT), "status", "--porcelain"])),
         "runner_sha256": {path.name: sha256(path) for path in sorted(Path(__file__).parent.glob("*.py"))}})

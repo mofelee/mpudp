@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -229,8 +230,15 @@ func run(o options) (runErr error) {
 	if err := connectFlows(control, t, o); err != nil {
 		return err
 	}
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), localDrainLimit)
+	_, err = t.drain(startupContext)
+	cancelStartup()
+	if err != nil {
+		return fmt.Errorf("startup local drain: %w", err)
+	}
 	build, _ := debug.ReadBuildInfo()
-	if err := emit(map[string]any{"type": "metadata", "side": o.Mode, "source_sha": sourceSHA, "options": o, "path_count": t.paths, "config": t.configMetadata, "build": build, "verification_header_bytes": headerSize, "dedup_window_packets": dedupSize}); err != nil {
+	if err := emit(map[string]any{"type": "metadata", "side": o.Mode, "source_sha": sourceSHA, "options": o, "path_count": t.paths, "config": t.configMetadata, "build": build, "verification_header_bytes": headerSize, "dedup_window_packets": dedupSize,
+		"admission_policy": map[string]any{"max_wait_ns": int64(admissionWaitLimit), "retry_wait_ns": int64(admissionRetryWait), "retry_scope": "whole_datagram_resource_limit", "local_drain_limit_ns": int64(localDrainLimit)}}); err != nil {
 		return err
 	}
 	finishProfiles, err := startProfiles(o.ProfilePrefix)
@@ -250,7 +258,13 @@ func run(o options) (runErr error) {
 		if err := controlWrite(control, controlMessage{Kind: "start"}); err != nil {
 			return err
 		}
-		result, err = receive(t, o, start)
+		result, err = receive(t, o, start, func() error {
+			if err := controlWrite(control, controlMessage{Kind: "drain"}); err != nil {
+				return err
+			}
+			_, err := controlRead(control, "drained")
+			return err
+		})
 		if err != nil {
 			return err
 		}
