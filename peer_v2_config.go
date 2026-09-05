@@ -106,7 +106,7 @@ func v2CreditLimits(cfg config.Config, runtimeBytes uint64) (creditv2.Limits, er
 	// and fixed handshake/component claims; the ledger imposes its global cap.
 	shards := uint64(cfg.FEC.DataShards + cfg.FEC.ParityShards)
 	perSession := uint64(cfg.Aggregation.MaxQueuedDatagrams) + uint64(cfg.Limits.MaxPendingFECBlocks)*(shards+2) +
-		uint64(cfg.Limits.MaxDatagramReassemblies) + uint64(cfg.Limits.DeliveryQueueCapacity) + 16
+		uint64(cfg.Limits.MaxDatagramReassemblies) + uint64(cfg.Limits.DeliveryQueueCapacity) + uint64(sessionv2.InitialCount) + 12
 	reservations := min(uint64(creditv2.MaxReservations), uint64(cfg.Limits.MaxSessions)*perSession)
 	return creditv2.Limits{
 		MaxPeerBytes: peerBytes, MaxSessionBytes: min(uint64(cfg.Limits.MaxSessionRetainedBytes), peerBytes),

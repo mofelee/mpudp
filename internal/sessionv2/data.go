@@ -49,7 +49,7 @@ func (c *Controller) driveData(now time.Time, result *Result) error {
 			if count == 0 {
 				return ErrNotReady
 			}
-			output, err := c.queue.Seal(now, c.forced > c.completed)
+			output, err := c.queue.SealWithWorkspace(now, c.forced > c.completed, c.outputWorkspace)
 			if err != nil || output == nil {
 				return err
 			}
@@ -81,22 +81,15 @@ func (c *Controller) driveData(now time.Time, result *Result) error {
 				return ErrNotReady
 			}
 		}
-		// Keep the conservative two-packet assembly budget even though the
-		// nil-destination encoder uses one backing allocation.
-		packetBytes := wirev2.TypedBodyOverhead + wirev2.FECBundlePrefixSize + wirev2.FECRecordHeaderSize + int(c.sendContext.ShardBytes)
-		lease, err := c.setup.Scope.Reserve(creditv2.Claim{Bytes: uint64(2 * packetBytes)})
-		if err != nil {
-			return err
-		}
+		// InitialAssembly keeps the conservative two-packet allowance charged
+		// between synchronous sends; original admission cannot consume it.
 		bundle := wirev2.FECBundle{Header: wirev2.Header{Type: wirev2.TypeFECBundle, SessionID: c.setup.ID}, Route: p.route(), Records: []wirev2.FECRecord{{GroupID: view.GroupID, EncodingEpoch: view.EncodingEpoch, LogicalBytes: view.Group.LogicalBytes, ShardIndex: uint8(c.outNext), Payload: view.Group.Shards[c.outNext]}}}
 		packet, err := c.sendAuth.AppendFECBundle(nil, bundle, c.sendLookup, int(p.sendBudget))
 		if err != nil {
-			lease.Release()
 			return err
 		}
 		sent := c.emit(p, p.sender, p.binding, packet, now, result)
 		clear(packet)
-		lease.Release()
 		if !sent {
 			return nil
 		}

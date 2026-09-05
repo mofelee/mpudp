@@ -173,6 +173,10 @@ error 使用独立的一次性 latch，不会因 packet ingress 已满而丢失�
 - v2 的原 Datagram 和编码组各用独立有界终态窗口；ring、接收状态、FEC 输出和待交付
   payload 由 Session/Peer 额度计费，失败或关闭先清理存储再释放额度。
 
+同步 v2 controller 在握手完成前预留一个已封闭 FEC 组的输出额度和一次报文组装额度。
+已接纳的原报文不能占用这个[发送进度工作区](design/v2-send-workspace.zh-CN.md)，即使
+尚未消费的原报文及其已消费前缀已占满剩余 Session 或 Peer 额度。
+
 额度计量已预留义务和 Peer/Session 拥有的存储，不是进程 RSS。Go allocator/GC 保留的
 内存及 codec 共享查找表不包含在这些 ownership 计数中。
 
