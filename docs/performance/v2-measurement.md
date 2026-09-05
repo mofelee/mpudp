@@ -16,6 +16,9 @@ formal throughput and capacity acceptance remain open.
 The [allocation-cost comparison](v2-allocations-20260905.md) records reduced
 v2 sender allocations, mixed throughput changes and separate transport timing;
 it does not establish a causal throughput improvement.
+The [directional-authenticator comparison](v2-authenticator-20260905.md) records
+lower v2 sender/receiver allocation costs with prepaid HMAC state, alongside
+mixed throughput and host-pressure limits.
 
 The runner can compare the public Linux v2 Datagram runtime with v1. It retains
 the receiver-verified business-byte accounting and one Session per business flow.
