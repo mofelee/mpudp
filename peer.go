@@ -31,6 +31,16 @@ type Session interface {
 	Close() error
 }
 
+// DatagramSession extends a v2 Datagram Session with bounded local send fences.
+// Flush waits for originals admitted before the call to finish their socket
+// attempts; it does not acknowledge remote delivery. CloseGracefully stops new
+// writes, flushes that frontier and closes even when its context expires.
+type DatagramSession interface {
+	Session
+	Flush(context.Context) error
+	CloseGracefully(context.Context) error
+}
+
 // Listener accepts authenticated inbound Sessions. Accept is context-aware
 // and safe for concurrent use. Close is idempotent, stops inbound admission,
 // closes accepted Sessions, and unblocks pending Accept calls.
@@ -42,6 +52,7 @@ type Listener interface {
 // Peer owns all runtime sockets, Sessions, bounded queues, and the single
 // logical-deadline driver for one validated configuration.
 type Peer struct {
+	v2       *v2Peer
 	mu       sync.RWMutex
 	config   config.Config
 	random   io.Reader
@@ -98,7 +109,7 @@ func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if cfg.EffectiveWireVersion() != config.WireVersionV1 {
+	if cfg.EffectiveWireVersion() == config.WireVersionV2 && !supportedV2Config(cfg) {
 		return nil, ErrProtocolUnavailable
 	}
 	if parent == nil {
@@ -112,6 +123,9 @@ func newPeerWithContextAndDependencies(parent context.Context, cfg config.Config
 	}
 	if err := deps.validate(); err != nil {
 		return nil, err
+	}
+	if cfg.EffectiveWireVersion() == config.WireVersionV2 {
+		return newV2Peer(parent, cfg, random, deps)
 	}
 
 	runtimeContext, cancel := context.WithCancel(parent)
@@ -197,11 +211,17 @@ func (p *Peer) Config() config.Config {
 // authenticated initiator handshake, and returns immediately. WritePacket
 // reports ErrNotReady until a compatible listener acknowledges the Session.
 func (p *Peer) NewSession() (Session, error) {
+	if p.v2 != nil {
+		return p.v2.newSession()
+	}
 	return p.newInitiatorSession()
 }
 
 // Listener returns the single active listener handle for this Peer.
 func (p *Peer) Listener() (Listener, error) {
+	if p.v2 != nil {
+		return p.v2.publicListener()
+	}
 	p.mu.RLock()
 	if p.closed {
 		p.mu.RUnlock()
@@ -238,6 +258,9 @@ func (p *Peer) Close() error {
 // String reports bounded lifecycle metadata without formatting configuration
 // secrets, Session IDs, packet contents, or transport error causes.
 func (p *Peer) String() string {
+	if p.v2 != nil {
+		return p.v2.string()
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return fmt.Sprintf("Peer{mode:%s sessions:%d closed:%t}", modeOf(p.config), len(p.sessions), p.closed)

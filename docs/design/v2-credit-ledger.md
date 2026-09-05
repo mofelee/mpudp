@@ -3,7 +3,8 @@
 `internal/creditv2` implements the shared ownership accounting required by
 [configuration ownership limits](v2-configuration-api.md#ownership-limits) and
 [joint contract section 11](v2-joint-contract.md#11-resource-scheduler-and-error-contract).
-It is not connected to Peer, handshake, FEC, KCP or smux runtime code. #20 and
+The Linux fixed/session Datagram [public runtime](../API.md) uses it for
+handshake, FEC and delivery ownership. KCP and smux remain unavailable; #20 and
 #25 remain open. Authentication, deadlines, buffer allocation, window
 advertisements, control admission and dependency lifecycle remain callers'
 responsibilities. This ledger measures reserved obligations and owned bytes,

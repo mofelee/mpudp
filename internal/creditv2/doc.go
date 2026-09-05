@@ -1,5 +1,5 @@
 // Package creditv2 reserves bounded v2 ownership before protocol admission.
-// It is not connected to the runtime and does not authenticate, allocate
+// The fixed Datagram runtime uses it; the ledger does not authenticate, allocate
 // payloads, advertise windows, wait for credits, or clear caller-owned buffers.
 // All reservations share one Peer lock, atomically charging Peer and Session.
 // Callers release leases only after the corresponding storage or obligation

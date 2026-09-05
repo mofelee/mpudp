@@ -22,6 +22,8 @@ func TestUnavailableProtocolRejectsBeforeRuntimeDependencies(t *testing.T) {
 			cfg.Listen, cfg.Carriers = "127.0.0.1:9000", []string{"example.invalid:9001"}
 			if protocol == config.ProtocolKCP {
 				cfg.FEC = config.FECConfig{}
+			} else {
+				cfg.Repair.Enabled = true
 			}
 			before := cfg.Clone()
 			deps := runtimeDependencies{

@@ -55,7 +55,7 @@ func (s SchedulerConfig) InboundPathRateBPS(pathID int) int64 {
 	return DefaultPathRateBPS
 }
 
-// DefaultV2 returns explicit v2 settings without activating the v2 runtime.
+// DefaultV2 returns explicit v2 settings without creating runtime resources.
 // An empty protocol selects Datagram. Callers still supply roles, PSK and
 // positive Datagram FEC. Validate never fills omitted Go struct fields.
 func DefaultV2(protocol Protocol) Config {

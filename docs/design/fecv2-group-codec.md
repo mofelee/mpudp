@@ -2,10 +2,10 @@
 
 `internal/fecv2` implements the logical manifest and equal-length RS group
 format in [joint contract section 6](v2-joint-contract.md#6-fec-packing-and-reassembly).
-It is not connected to the v1 or v2 runtime. #21 remains open: queue admission,
-timed packing, authenticated bundles, epoch acknowledgements, reassembly,
-repair and migration ownership, socket budgets, and performance acceptance
-still require implementation and integration.
+It is used by the Linux fixed/session Datagram [public runtime](../API.md)
+through the bounded aggregation and receive controllers; the codec itself is
+socket-free. #21 remains open for its full network/performance acceptance,
+with repair and migration ownership still requiring later integration.
 
 The codec protects a four-byte manifest prefix, twenty-byte descriptors, and
 concatenated fragment bytes together. Descriptors use nonzero increasing

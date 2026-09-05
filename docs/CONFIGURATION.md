@@ -1,238 +1,290 @@
-# MPUDP 配置参考
+# MPUDP Configuration Reference
 
-配置是单个 YAML 文档。解析器启用 `yaml.v3` 的 `KnownFields` 严格模式：未知字段、
-重复键、错误类型、额外 YAML 文档和数值溢出都返回
-`config.ErrInvalidConfig`（它与 `mpudp.ErrInvalidConfig` 是同一个 sentinel）。省略可选
-字段会应用默认值；显式填写 `0` 不等同于省略，并会按对应范围严格校验。
-所有整数参数只接受 YAML integer，拒绝小数、浮点数（包括 `120.0`）、指数浮点表示、
-数字字符串和布尔值；不会将 `120.5` 静默截断为 `120`。合法整数的 YAML 十六进制、
-八进制、二进制和下划线分隔形式仍按整数解码，再校验对应字段范围。
+[简体中文](CONFIGURATION.zh-CN.md)
 
-配置文件最大为 1 MiB（`config.MaxConfigBytes`）。`Parse` 在解析前检查 byte slice
-长度；`Decode` 最多读取 1 MiB + 1 byte 来判断超限，不会把任意大的文件无界读入
-内存。任何位置的显式 YAML `null`（包括 `~` 和空 mapping value）都是错误，不能借此
-把已提供但类型错误的字段伪装成“省略”；只有真正未出现的可选字段会应用默认值。
+Configuration is one YAML document. Strict `yaml.v3` decoding rejects unknown
+fields, duplicate keys, wrong types, additional documents and numeric overflow
+with `config.ErrInvalidConfig`, the same sentinel as `mpudp.ErrInvalidConfig`.
+Only omitted optional fields receive defaults. Explicit zero is validated as
+zero. Integers must be YAML integers: floats, exponent-form floats, numeric
+strings and booleans reject; valid hexadecimal/octal/binary/underscore integer
+notation is decoded before range checks. Durations are Go duration strings.
 
-Go 代码直接构造 v1 配置时应从 `cfg := config.Default()` 开始；v2 使用
-`config.DefaultV2(config.ProtocolDatagram)` 或 `config.DefaultV2(config.ProtocolKCP)`，
-再设置角色、FEC 和 PSK。v2 helper 仅提供配置默认值，不会启用尚不可用的运行时。
-`Config` 的零值不会在 `Validate`/`NewPeer` 中被静默改写为默认值。这样配置文件中的显式
-数值零和程序中的数值零具有同样的严格语义。兼容旧版 Go struct literal 时，新增的
-`Protocol == ""` 和 `Wire.Version == ""` 分别按 `datagram` 和 `v1` 解释，原对象不被
-改写；`EffectiveProtocol()` 和 `EffectiveWireVersion()` 返回这两个有效选择。显式 YAML
-空字符串不适用这个兼容规则，会被拒绝。
+The file limit is 1 MiB (`config.MaxConfigBytes`). `Parse` checks input length;
+`Decode` reads at most the limit plus one byte. Explicit YAML null, including
+`~` and empty mapping values, is invalid everywhere.
 
-## 运行模式
+Go callers start with `config.Default()` for v1 or
+`config.DefaultV2(config.ProtocolDatagram)` / `DefaultV2(config.ProtocolKCP)`
+for v2, then set roles, FEC and PSK. Helpers return configuration without
+creating resources. `Validate` and `NewPeer` do not silently fill numeric zeros
+in direct Go literals. Empty Go `Protocol`/`Wire.Version` preserve legacy
+Datagram/v1 semantics without modifying the object; explicit empty YAML
+strings reject. `EffectiveProtocol()` / `EffectiveWireVersion()` expose this
+compatibility behavior.
 
-至少配置 `carriers` 或 `listen` 之一：
+## Roles
 
-| 配置 | 模式 | 含义 |
+At least one of `carriers` and `listen` is required:
+
+| Configuration | Mode | Meaning |
 |---|---|---|
-| 只有 `carriers` | initiator | 可以主动创建 Session |
-| 只有 `listen` | listener | 可以接受 Session |
-| 两者都有 | dual | 同一 Peer 同时具备两种能力 |
+| `carriers` only | initiator | Creates outbound Sessions |
+| `listen` only | listener | Accepts inbound Sessions |
+| Both | dual | Supports both roles independently |
 
-`carriers` 中每一项都是远端 UDP `host:port`，不是本地绑定地址或本地源端口。远端
-host 不能为空，也不能是 `0.0.0.0`/`::`；支持 DNS 名、IPv4 和带方括号的 IPv6。
-端口范围为 1 到 65535。大小写、IP 文本和端口规范化后重复的 Carrier 会被拒绝，
-最多允许 256 项。`listen` 是本地 `host:port`，因此允许省略 host，例如 `:9000`。
-地址只做无副作用的语法校验；解析配置时不会进行 DNS 查询或打开 socket。
+Each Carrier is a remote UDP `host:port`, not a local bind address. Hosts must
+be nonempty and not unspecified addresses; DNS names, IPv4 and bracketed IPv6
+are supported. Ports are 1..65535. Normalized duplicate remotes reject; at
+most 256 Carriers are allowed. `listen` is local and permits an omitted host,
+such as `:9000`. Validation performs no DNS lookup or socket creation.
 
-配置中不存在 `peer.id` 或 `session_id`。这两个名称会作为未知字段被拒绝。SessionID
-由运行时使用 `crypto/rand.Reader` 生成 16 个字节，不绑定 UDP 五元组。
+`peer.id` and `session_id` are unknown fields. Runtime SessionIDs use 16 random
+bytes and are not configured or tied to a UDP tuple.
 
-## 协议与 wire 版本
+## Protocol Availability
 
-`protocol` 与上面的 initiator/listener/dual 角色独立，必须是字符串 `datagram` 或 `kcp`，
-省略时为 `datagram`。`wire.version` 必须是字符串 `v1` 或 `v2`，省略时为 `v1`。
-大小写变体、空字符串、数字、布尔值、错误容器、未知字段和显式 `null` 均被拒绝。
-`config.Default()` 显式设置 `ProtocolDatagram` 和 `WireVersionV1`。
+`protocol: datagram|kcp` is independent of roles and defaults to `datagram`.
+`wire.version: v1|v2` defaults to `v1`. Invalid types, case variants, empty
+strings and null reject. `config.Default()` explicitly chooses Datagram/v1.
 
-| 配置选择 | `Parse` / `Validate` | `NewPeer` / `NewPeerContext` |
+| Selection | Parse / Validate | NewPeer / NewPeerContext |
 |---|---|---|
-| 省略新字段，或 `datagram` + `v1` | 按既有 FEC/资源规则验证 | 既有 v1 Datagram 运行时 |
-| `kcp` + 省略版本或 `v1` | `ErrInvalidConfig` | `ErrInvalidConfig` |
-| `datagram` + `v2` | 必须显式提供正数 k/r；UDP 上限至少 512 | `ErrProtocolUnavailable` |
-| `kcp` + `v2` | 省略 FEC 得到 0/0；显式非零或负数 FEC 无效；UDP 上限至少 512 | 合法配置返回 `ErrProtocolUnavailable` |
+| Omitted fields, or Datagram/v1 | Existing positive FEC/resource rules | Existing v1 Datagram |
+| KCP with omitted version or v1 | `ErrInvalidConfig` | `ErrInvalidConfig` |
+| Datagram/v2 | Positive k/r required; UDP caps at least 512 | Linux fixed/session, repair off; aggregation optional |
+| KCP/v2 | Omitted FEC becomes 0/0; explicit nonzero/negative FEC rejects | Valid configuration returns `ErrProtocolUnavailable` |
 
-当前增量只实现配置边界，尚未接入 v2 握手运行时、数据面或 KCP Session。配置解析成功不表示
-该协议可运行。两个构造函数先验证配置，再拒绝尚未实现的 v2，且不访问运行时 context、
-随机源、socket 或 timer 依赖，也不启动 goroutine。不会静默回退到 v1。
-共享 v2 transport、scheduler、资源上限、接收超时、aggregation、repair、KCP tuning 和 mux
-配置已经支持严格解析。配置上限验证不表示已经分配资源或启用数据面。
+Linux v2 supports authenticated handshake, fixed Session budgets, equal-size
+FEC groups, original-Datagram reassembly and optional aggregation. KCP,
+`repair.enabled: true`, `mtu_discovery: plpmtud`,
+`budget_strategy: per_carrier`, and v2 on non-Linux platforms remain unavailable.
+After validation, valid unsupported selections return `ErrProtocolUnavailable`
+before touching runtime context, randomness, sockets or timers. There is no
+automatic v1 fallback. Linux sockets must support required PMTU enforcement
+and destination-address-bound replies; inability to configure them fails startup.
 
-### V2 共享配置
+The parser also recognizes the shared and future protocol settings below.
+Successful parsing does not allocate their maximum resources or activate an
+unsupported feature. The current v2 Peer dispatcher is serial, with a 20ms
+context for each synchronous socket attempt. Encoding/sending for one Session
+can delay others. `max_send_workers` is not an implemented parallel pool, and
+path-queue configuration does not imply the full #22 scheduling/health policy.
+Operator-supplied rates are not measured bandwidth or #16 performance evidence.
 
-以下字段仅在 `wire.version: v2` 下有效；v1 显式提供这些字段，即使是零值或空 map，也会
-被拒绝。省略新字段的 v1 默认值保持不变。完整范围与后续协议字段见
-[v2 配置设计表](design/v2-configuration-api.md)。
+## Shared V2 Settings
 
-| 字段 | v2 默认值 | 范围 |
+These fields require explicit v2. V1 rejects them even when explicitly zero or
+empty; omitted new fields preserve v1 defaults. The
+[joint configuration design](design/v2-configuration-api.md) distinguishes the
+implemented subset from future protocol contracts.
+
+| Field | V2 Default | Range |
 |---|---:|---|
-| `transport.max_receive_udp_payload` | 最终 `max_udp_payload` | 512..65507 |
-| `transport.mtu_discovery` | `fixed` | `fixed` 或 `plpmtud` |
-| `transport.budget_strategy` | `session` | `session` 或 `per_carrier` |
+| `transport.max_receive_udp_payload` | Final `max_udp_payload` | 512..65507 |
+| `transport.mtu_discovery` | `fixed` | `fixed` or `plpmtud` |
+| `transport.budget_strategy` | `session` | `session` or `per_carrier` |
 | `transport.max_retained_epochs` | 2 | 1..8 |
 | `transport.max_epoch_age` | `5s` | `100ms`..`60s` |
-| `transport.max_migrations` | 2 | 1..2；配置值不自动启用迁移 |
-| `transport.plpmtud.base_udp_payload` | 512 | 必须为 512 |
+| `transport.max_migrations` | 2 | 1..2; does not enable migration |
+| `transport.plpmtud.base_udp_payload` | 512 | Exactly 512 |
 | `transport.plpmtud.probe_interval` | `1s` | `100ms`..`60s` |
-| `transport.plpmtud.max_outstanding_per_path` | 1 | 必须为 1 |
+| `transport.plpmtud.max_outstanding_per_path` | 1 | Exactly 1 |
 | `limits.max_pending_handshakes` | 256 | 1..4096 |
 | `limits.max_pending_accepts` | 256 | 1..65536 |
 | `limits.max_peer_retained_bytes` | 268435456 | 1 MiB..1 GiB |
-| `limits.max_session_retained_bytes` | 16777216 | 1 MiB..Peer 上限 |
+| `limits.max_session_retained_bytes` | 16777216 | 1 MiB..Peer ceiling |
 | `limits.max_datagram_reassemblies` | 1024 | 1..65536 |
 | `limits.max_fragments_per_datagram` | 256 | 1..4096 |
-| `limits.max_migration_transaction_bytes` | 8388608 | 1..8 MiB，且不超过 Session |
+| `limits.max_migration_transaction_bytes` | 8388608 | 1..8 MiB, at most Session ceiling |
 | `limits.max_streams_per_session` | 128 | 1..4096 |
 | `limits.max_peer_streams` | 4096 | 1..65536 |
-| `limits.max_stream_retained_bytes` | KCP 为 262144 + 配置的 MaxFrameSize；默认 278528 | 正数且不超过 Session；启用 mux 时至少为该初始窗口值 |
+| `limits.max_stream_retained_bytes` | KCP: 262144 + configured MaxFrameSize (278528 by default) | Positive, at most Session; mux requires this initial window |
 | `limits.max_path_queued_packets` | 256 | 1..4096 |
-| `limits.max_path_queued_bytes` | 1048576 | 512..Session 上限 |
+| `limits.max_path_queued_bytes` | 1048576 | 512..Session ceiling |
 | `limits.max_send_workers` | 8 | 1..32 |
 | `timers.datagram_reassembly_timeout` | `10s` | `100ms`..`60s` |
 | `timers.group_decode_timeout` | `10s` | `100ms`..`60s` |
 
-`transport.plpmtud` 只允许在 `plpmtud` 模式出现；fixed 模式下连空配置块也会拒绝。
-`outbound_path_budgets` / `inbound_path_budgets` 只用于 fixed/per_carrier，元素形如
-`{path_id: 1, max_udp_payload: 1200}`。initiator 的 outbound 列表必须完整覆盖配置的
-Carrier 索引；listener 的 inbound 列表独立覆盖连续 1..N 索引，并受 endpoint 上限约束。
-双角色的两个列表互不补全，未使用角色必须省略对应列表。索引可按任意顺序列出，但不能
-重复、缺失或重编号；每个预算必须在 512..本地发送硬上限之间。
+`transport.plpmtud` is valid only in PLPMTUD mode; even an empty block rejects in
+fixed mode. `outbound_path_budgets` / `inbound_path_budgets` are recognized only
+for fixed/per_carrier, with entries such as
+`{path_id: 1, max_udp_payload: 1200}`. Outbound entries must cover all Carrier
+indices; listener inbound entries independently cover contiguous 1..N within
+the Endpoint limit. The roles do not fill each other's lists. Unused-role
+lists must be omitted. Duplicate/missing/reindexed paths reject. Budgets are
+512..local send hard cap. This policy remains unavailable in the runtime.
 
-`scheduler.outbound_path_rates_bps` / `inbound_path_rates_bps` 是可省略的 PathID map，
-例如 `{1: 100000000, 2: 50000000}`。每个 rate 范围为 1000..1000000000000 bit/s，未列出
-的合法 PathID 使用 100000000。键和值均严格要求 YAML integer，`1.5` 键或 `1` 与 `0x1`
-形成的重复键会被拒绝。outbound 键必须在 Carrier 范围内；inbound 键受反向静态列表或
-`limits.max_endpoints_per_session` 限制。Go `Clone()` 深复制两个列表和两个 rate map。
+`scheduler.outbound_path_rates_bps` / `inbound_path_rates_bps` are optional
+PathID maps, for example `{1: 100000000, 2: 50000000}`. Rates are
+1000..1000000000000 bit/s; omitted valid paths use 100000000. Keys and values
+must be YAML integers; normalized duplicate keys such as `1` and `0x1` reject.
+Outbound keys fit Carrier count; inbound keys fit a static reverse profile or
+`max_endpoints_per_session`. `Clone()` deep-copies both lists and both maps.
 
-所有字节上限都是配置约束，不代表最大值同时获得预留。降低 Session 上限时，可能需要
-同步显式降低 migration/path/stream 等默认上限；解析器不会暗中裁剪这些配置值。UDP
-发送和接收硬上限互相独立，不能把反向接收能力当作本地已验证的路径 MTU。
+Byte limits are ceilings, not simultaneous reservations of every maximum.
+Lowering a Session ceiling may require explicit reductions of dormant default
+migration/path/stream limits; parsing never silently clips them. Send and
+receive UDP hard caps are independent; reverse receive capability does not
+prove local path MTU.
 
-### V2 协议配置
+## Protocol Settings
 
-默认值只填入所选协议的 section。Datagram 的 aggregation/repair 默认关闭；KCP 的 mux
-默认关闭，但 fast/early retransmit 和 congestion control 默认开启。布尔值严格要求 YAML
-boolean，拒绝数字、字符串 `"false"`、`yes`/`no` 等隐式转换；显式 `false` 不会被默认值覆盖。
+Defaults populate only the selected protocol. Datagram aggregation/repair and
+KCP mux default off. KCP fast/early retransmit and congestion control default
+on. Booleans must be YAML booleans; numbers, strings and implicit `yes`/`no`
+reject. Explicit false is never replaced by a default.
 
-| 字段 | 默认值 | 范围或约束 |
+| Field | Default | Range / Rule |
 |---|---:|---|
-| `aggregation.enabled` | false | v2 Datagram |
+| `aggregation.enabled` | false | V2 Datagram |
 | `aggregation.max_delay` | `250us` | `1us`..`10ms` |
-| `aggregation.max_records` | 32 | 1..256 |
-| `aggregation.max_queued_datagrams` | 256 | 1..65536 |
-| `aggregation.max_queued_bytes` | 1048576 | 1..Session 上限 |
-| `aggregation.max_group_bytes` | 1048576 | 24..16777216，运行时还受 k*ShardBytes 限制 |
-| `repair.enabled` | false | v2 Datagram，保持正数 FEC |
+| `aggregation.max_records` | 32 | 1..256 descriptors |
+| `aggregation.max_queued_datagrams` | 256 | 1..65536 originals |
+| `aggregation.max_queued_bytes` | 1048576 | 1..Session ceiling |
+| `aggregation.max_group_bytes` | 1048576 | 24..16777216; also bounded by k*ShardBytes |
+| `repair.enabled` | false | V2 Datagram with positive FEC; runtime unavailable when true |
 | `repair.max_age` | `5s` | `100ms`..`60s` |
 | `repair.max_attempts` | 3 | 1..16 |
-| `repair.max_cached_blocks` | 1024 | 1..65536，且不超过 outstanding group span |
-| `repair.max_cached_bytes` | 8388608 | 1..Session 上限 |
-| `repair.max_outstanding_datagram_span` | 65536 | 1..65536，运行时还受对端窗口限制 |
-| `repair.max_outstanding_group_span` | 65536 | 1..65536，运行时还受对端窗口限制 |
-| `kcp.fast_retransmit.enabled` | true | false 同时禁用 fast/early，保留 RTO |
-| `kcp.fast_retransmit.threshold` | 2 | 1..255；不自动开启已禁用策略 |
+| `repair.max_cached_blocks` | 1024 | 1..65536, at most group span |
+| `repair.max_cached_bytes` | 8388608 | 1..Session ceiling |
+| `repair.max_outstanding_datagram_span` | 65536 | 1..65536, also bounded by peer receive span |
+| `repair.max_outstanding_group_span` | 65536 | 1..65536, also bounded by peer receive span |
+| `kcp.fast_retransmit.enabled` | true | False disables fast/early, retaining RTO |
+| `kcp.fast_retransmit.threshold` | 2 | 1..255; does not enable a disabled policy |
 | `kcp.update_interval` | `10ms` | `10ms`..`100ms` |
 | `kcp.send_window_segments` | 1024 | 32..65535 |
 | `kcp.receive_window_segments` | 1024 | 32..65535 |
-| `kcp.congestion_control` | true | 只有显式 false 才关闭 |
-| `stream_mux.enabled` | false | v2 KCP |
+| `kcp.congestion_control` | true | False requires explicit configuration |
+| `stream_mux.enabled` | false | V2 KCP |
 | `stream_mux.max_frame_size` | 16384 | 128..65535 |
 | `stream_mux.max_pending_opens` | 128 | 1..128 |
 | `stream_mux.open_timeout` | `5s` | `100ms`..`5s` |
-| `stream_mux.max_control_record_bytes` | 256 | 必须为 256 |
-| `stream_mux.max_queued_control_bytes` | 32768 | 256..32768，且受 Session 上限约束 |
+| `stream_mux.max_control_record_bytes` | 256 | Exactly 256 |
+| `stream_mux.max_queued_control_bytes` | 32768 | 256..32768 and Session/Peer charged |
 
-所选协议中的 tuning 数值即使在 optional feature 关闭时也会检查范围。另一协议或 v1 中
-只允许 `aggregation: {enabled: false}`、`repair: {enabled: false}` 和
-`stream_mux: {enabled: false}` 这类不带其他字段的中性声明；空 mapping 或额外参数均
-无效。`kcp` 没有顶层 `enabled` 字段，任何显式 KCP section 都要求 `protocol: kcp` 和 v2。
+Selected-protocol tuning remains range-checked when its optional feature is
+disabled. On another protocol or v1, only bare neutral declarations such as
+`aggregation: {enabled: false}`, `repair: {enabled: false}` and
+`stream_mux: {enabled: false}` are allowed; empty maps or extra fields reject.
+There is no top-level `kcp.enabled`: any KCP section requires KCP/v2.
 
-启用 repair 时，两个接收超时都必须至少覆盖 `repair.max_age`。启用 mux 时，stream
-保留字节至少覆盖 `262144 + MaxFrameSize`，Session 还须容纳独立 control 初始窗口、
-一个 business 初始窗口和 queued control。省略 stream 字节上限时按最终配置的 frame size
-计算默认值，显式提供的值不会被覆盖。
+Repair requires both receive timeouts to cover `repair.max_age`. Mux requires
+stream bytes of at least `262144 + MaxFrameSize`, with independent control and
+business initial windows plus queued control fitting the Session. Omitted
+stream bytes use the final configured frame size; explicit values are preserved.
+These are validation necessities, not allocated backend memory. KCP/mux
+implementations must reserve actual buffers and simultaneous copies before
+advertising receive credit; `window_segments * 1500` is not an accounting
+formula. Both runtimes remain unavailable.
 
-这些只是配置必要条件，实际 KCP backend、协商窗口及同时保留的控制队列副本必须由运行时
-在宣告能力前统一获得 Session/Peer credits。这里不使用 `window_segments * 1500` 伪装成
-后端真实内存预留，也不因窗口配置验证通过而自动创建 KCP、mux 或 v2 Session。
+## Aggregation And Ownership
 
-## 最小示例
+With aggregation disabled, `WritePacket` waits for the original's local socket
+attempts. Enabled aggregation copies the whole original and reserves its queue
+ID/bytes before returning success. Capacity failure returns `ErrResourceLimit`
+without a partial prefix. `max_records` counts fragment descriptors;
+`max_queued_datagrams` counts whole originals, including empty Datagrams.
+The oldest admission fixes `max_delay`; capacity, descriptor count, expiry or
+`DatagramSession.Flush(ctx)` seals a group. This is not a hard timing guarantee
+under operating-system scheduling or shared dispatcher load.
+
+Flush waits only for local shard attempts through its captured admission
+frontier, not remote reads/ACKs. Cancellation does not retract accepted work.
+`CloseGracefully(ctx)` stops writes, drains within the context and closes;
+ordinary Close may discard unsent work. See the [public API](API.md).
+
+Fixed Peer ingress/listener/accept storage is deducted from the global byte
+budget first. Handshake reserves the future Session, pending accept and actual
+initial component storage. Installation consumes those dedicated leases without
+charging twice. Subsequent payload, FEC/group/reassembly and queued deliveries
+remain Session/Peer charged; dropped deliveries release ownership. Session
+count is a ceiling, not a guarantee under byte pressure. Runtime construction
+or admission can return `ErrResourceLimit` when initial storage does not fit.
+These ceilings bound ownership and reservations, not process RSS: Go
+allocator/GC retention and shared codec lookup tables are outside the counters.
+
+## Examples
+
+This minimal example preserves v1:
 
 ```yaml
 carriers:
   - "192.0.2.11:4000"
   - "[2001:db8::11]:4000"
-
-fec:
-  data_shards: 3
-  parity_shards: 2
-
+fec: {data_shards: 3, parity_shards: 2}
 psk: "development-only-example-key"
-
 transport:
   max_udp_payload: 1200
 ```
 
-Datagram 的 `fec.data_shards` 和 `fec.parity_shards` 都必须大于 0，总数不得超过 256。这个范围
-选择 `github.com/klauspost/reedsolomon` 的标准 GF(2^8) profile；运行时按这组参数为
-每个方向创建 encoder/decoder。
+For the supported Linux v2 path, add:
 
-## PSK 管理
+```yaml
+protocol: datagram
+wire: {version: v2}
+aggregation: {enabled: true}
+```
 
-`psk` 必须是非空 YAML scalar 字符串，UTF-8 编码后最多 4096 bytes。解析器不支持
-`psk_file`、环境变量展开或 shell 插值；配置中的 `${NAME}` 只是字面密钥内容。PSK 只用于
-HMAC-SHA-256 认证与完整性保护，不加密 Payload。
+The omitted discovery/budget policies default to fixed/session; repair remains
+off. Datagram k and r must both be positive, with sum at most 256, using the
+pinned Reed-Solomon GF(2^8) profile.
 
-本文和仓库内其他示例的 `development-only-example-key` 仅供开发测试，不能部署到生产。
-生产密钥必须高熵且独立生成。推荐通过 secret manager 或受保护的模板流程创建 mode 0600
-配置文件，或者由嵌入程序直接构造 `config.NewSecret`；环境变量可能经进程信息、崩溃转储或
-诊断工具泄漏，不应被默认视为安全存储。任何密钥都不得写入日志、错误、命令行参数或诊断
-artifact。
+<a id="psk-管理"></a>
 
-`Secret.String`、`GoString`、Config 格式化和 YAML 输出统一显示 `[REDACTED]`；只有显式
-调用 `Secret.Bytes()` 才能取得一个副本。校验和运行时错误不包含密钥值。
+## PSK Management
 
-## UDP payload budget
+`psk` must be a nonempty string, at most 4096 UTF-8 bytes. There is no `psk_file`,
+environment expansion or shell interpolation: `${NAME}` is literal key text.
+PSK provides HMAC-SHA-256 integrity, not payload encryption.
 
-为避免混淆，本文使用以下四个大小概念：
+Example keys are development-only. Production keys should be independently
+generated high-entropy secrets, provided through protected mode-0600 configuration
+or `config.NewSecret`. Never include keys in logs, arguments or artifacts.
+Environment variables are not inherently protected from process/crash tools.
+Secret/config formatting and YAML output use `[REDACTED]`; `Secret.Bytes()`
+explicitly returns a copy.
 
-| 术语 | 定义 |
+## UDP Payload Budget
+
+For v1, distinguish:
+
+| Term | Meaning |
 |---|---|
-| Path MTU | 一个完整 IP packet 在路径上的大小上限 |
-| UDP payload | UDP header 之后的 bytes，包括完整 MPUDP wire packet |
-| shard data capacity | 协商 UDP payload 减去固定 71-byte `DATA_SHARD` wire overhead |
-| Datagram 上限 | `min(k * shard data capacity, limits.max_datagram_size)` |
+| Path MTU | Maximum complete IP packet size |
+| UDP payload | Bytes after UDP header, including complete MPUDP packet |
+| Shard capacity | Negotiated payload minus 71-byte DATA_SHARD overhead |
+| Original limit | min(k * shard capacity, max_datagram_size) |
 
-| 字段 | 默认值 | 合法闭区间 | 归属 |
+| Field | Default | Range | Meaning |
 |---|---:|---:|---|
-| `transport.max_udp_payload`，v1 | 1200 bytes | 72..65507 bytes | 完整 MPUDP UDP payload |
-| `transport.max_udp_payload`，v2 配置 | 1200 bytes | 512..65507 bytes | 配置验证；v2 运行时尚不可用 |
+| V1 `transport.max_udp_payload` | 1200 | 72..65507 | Complete local UDP payload |
+| V2 `transport.max_udp_payload` | 1200 | 512..65507 | Complete local UDP payload send hard cap |
 
-`max_udp_payload` 是 UDP header 之后的完整 MPUDP wire packet 上限，包括 MPUDP
-prefix、type-specific body、完整 32-byte HMAC tag 和 packet payload。它不是 IP MTU，
-也不是单纯的 RS shard data capacity。72 bytes 是固定 v0.1 layout 中强制控制包
-（PING/PONG）的完整最小预算；65507 是保守的 UDP payload 硬上限。1200 为 IPv6
-minimum link MTU 留出了 IP/UDP header 空间，但它不是探测出的 Path MTU，也不能保证
-穿过管理员配置得更小的下层隧道。部署者必须按所有 Carrier 中已知的最小安全 UDP
-payload 向下配置。Linux DF/PMTU socket mode 只阻止本地分片；远端 ICMP Packet Too Big
-被过滤时仍可能形成静默黑洞。v0.1 不实现由
-[#13](https://github.com/mofelee/mpudp/issues/13) 跟踪的 PLPMTUD/自适应预算。
+The payload cap includes prefix, type body, full 32-byte authentication tag
+and payload. It is neither IP MTU nor just RS data. V1's 72-byte minimum covers
+mandatory PING/PONG. The 1200 default leaves IPv6-minimum-MTU header room but
+does not prove smaller tunnels are safe. Operators must choose a safe budget
+for every Carrier. Linux DF/PMTU prevents local fragmentation; filtered ICMP
+can still cause a silent black hole. PLPMTUD (#13) remains unavailable.
 
-本字段是 Session 全局声明值。HELLO 字段声明发送方的本地能力，整个 HELLO packet 也
-按发送方本地预算编码。HELLO_ACK 字段声明响应方的本地能力，但整个 ACK packet 按双方
-声明值的较小值编码。认证握手成功后，每个方向冻结该协商预算；后续 PING、PONG、
-`DATA_SHARD` 和 CLOSE 都按它编码。CLOSE 的固定 wire size 是 56 bytes。由
-[#14](https://github.com/mofelee/mpudp/issues/14) 跟踪的 per-Carrier budget 和不等长
-shard 不属于 v0.1。
+V1 freezes one negotiated minimum after HELLO/HELLO_ACK; PING, PONG, DATA_SHARD
+and CLOSE use it. CLOSE is 56 bytes. V2 advertises independent send/receive hard
+caps and bootstraps at 512 bytes. It does not send configured larger DATA until
+authenticated path-budget/encoding-context exchange completes. Each direction
+stays within local send and peer receive hard caps.
 
-## 资源上限
+For a v2 single-entry FEC bundle, equal shard capacity is `budget - 94`; logical
+group bytes are also bounded by min(`aggregation.max_group_bytes`, k*ShardBytes).
+An original can span groups within peer size/fragment ceilings. This differs
+from v1's 71-byte overhead and is not measured throughput evidence. Dynamic
+MTU shrink/migration and per-Carrier layout (#14) remain unavailable.
 
-| 字段 | 默认值 | 合法闭区间 |
+## Resource And Timer Limits
+
+| Field | Default | Range |
 |---|---:|---:|
-| `limits.max_datagram_size` | 65536 bytes | 1..16777216 bytes |
+| `limits.max_datagram_size` | 65536 bytes | 1..16777216 |
 | `limits.max_pending_fec_blocks` | 1024 | 1..65536 |
 | `limits.receive_queue_capacity` | 256 | 1..65536 |
 | `limits.delivery_queue_capacity` | 256 | 1..65536 |
@@ -240,60 +292,28 @@ shard 不属于 v0.1。
 | `limits.max_endpoints_per_session` | 256 | 1..256 |
 | `limits.max_handshake_attempts` | 8 | 1..64 |
 
-`max_datagram_size` 是进程资源上限，不是 wire 可发送上限。实际 `WritePacket` 上限
-还要取 FEC 从协商 UDP budget 推导出的值与该资源上限中的较小值。运行时在任何 FEC
-分配、PacketID 消耗或 shard 发送之前执行检查；超过时返回 `mpudp.ErrMessageTooLarge`。
+`max_datagram_size` is a resource ceiling, also intersected with effective FEC/
+peer limits before any payload/ID admission. `max_pending_fec_blocks` bounds
+pending v1 blocks/v2 groups; terminal history is independent of pending
+capacity. Ingress and delivery queues drop newest items when full. V1 accept
+uses receive queue capacity; v2 uses pre-reserved `max_pending_accepts` slots.
+Unauthenticated sources cannot create established Session/Endpoint state.
+V1 retry/jitter settings do not enable v2 DATA repair.
 
-`max_pending_fec_blocks` 同时限制每个 decoder 的未完成 block 数量和 bounded completed
-PacketID cache 容量；完成项 TTL 使用 `timers.endpoint_ttl`。`receive_queue_capacity`
-约束 transport callback 到 Peer dispatcher 的 pre-auth ingress，满载时非阻塞丢弃最新
-event。`delivery_queue_capacity` 约束已恢复 Datagram 的每 Session 交付队列，同样采用
-drop-newest。Listener accept queue 也使用 receive 容量；满载时关闭并释放最新创建的
-Session。
-
-`max_sessions` 和 `max_endpoints_per_session` 限制认证成功后可创建的运行时状态；未认证
-来源不能消费这些配额。`max_handshake_attempts` 为每个 Carrier 的主动 bootstrap 提供硬
-重试上限，DATA 不使用该重试能力。握手 jitter 没有独立配置字段，由运行时固定为
-`handshake_retry_interval / 4` 的上限。
-
-## 时间参数
-
-YAML 中时间值必须是带单位的 Go duration 字符串，不能写成裸整数。
-
-| 字段 | 默认值 | 合法闭区间 |
+| V1 Timer | Default | Range |
 |---|---:|---:|
 | `timers.decode_timeout` | `3s` | `100ms`..`1m` |
 | `timers.endpoint_ttl` | `2m` | `5s`..`24h` |
 | `timers.keepalive_interval` | `15s` | `1s`..`5m` |
 | `timers.handshake_retry_interval` | `1s` | `100ms`..`1m` |
 
-Peer dispatcher 使用一个可复用 timer 驱动所有 Session 的 handshake retry、keepalive、
-Endpoint expiry 和 FEC sweep；不会为每个 packet 或 Endpoint 创建 timer/goroutine。
-`decode_timeout` 从首个 shard 到达时固定，`endpoint_ttl` 从最近一次有效认证活动计算，
-`keepalive_interval` 按 Carrier/Endpoint 安排 probe。Close 会取消这些 deadline 并等待
-dispatcher 退出。
+V1 uses one timer for handshake retry, keepalive, Endpoint expiry and FEC sweep;
+decode timeout starts with the first shard, while Endpoint TTL follows valid
+authenticated activity. V2 uses one timer for its own handshake/control retry,
+aggregation and `group_decode_timeout`/`datagram_reassembly_timeout`. Receive
+deadlines begin on first admitted shard/original fragment and duplicates do not
+refresh them. This is not #22 fast path-health probing. Close cancels deadlines
+and waits for owned runtime work.
 
-完整覆盖所有可选项的示例：
-
-```yaml
-listen: "0.0.0.0:9000"
-fec: {data_shards: 3, parity_shards: 2}
-psk: "development-only-example-key" # 仅供开发测试；生产环境必须安全注入高熵密钥
-transport:
-  max_udp_payload: 1200
-limits:
-  max_datagram_size: 65536
-  max_pending_fec_blocks: 1024
-  receive_queue_capacity: 256
-  delivery_queue_capacity: 256
-  max_sessions: 1024
-  max_endpoints_per_session: 256
-  max_handshake_attempts: 8
-timers:
-  decode_timeout: "3s"
-  endpoint_ttl: "2m"
-  keepalive_interval: "15s"
-  handshake_retry_interval: "1s"
-```
-
-第三方模块、许可证和未来分发义务见 [依赖审计](DEPENDENCIES.md)。
+Dependency versions, licenses and distribution requirements are in the
+[dependency audit](DEPENDENCIES.md).

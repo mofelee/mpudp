@@ -2,7 +2,7 @@
 // It owns no sockets, goroutines, timers, or outbound queue. A single caller
 // must serialize every Engine method and supply nondecreasing explicit times.
 // Emit, Install, and disposal callbacks must be bounded and must not reenter
-// the same Engine. This package is not connected to the public Peer runtime.
+// the same Engine. The public fixed Datagram runtime supplies these callbacks.
 package handshakev2
 
 import (

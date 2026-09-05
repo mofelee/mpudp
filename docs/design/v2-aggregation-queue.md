@@ -3,9 +3,10 @@
 `internal/aggregationv2` combines the [prefix packer](fecv2-group-codec.md) and
 [ownership ledger](v2-credit-ledger.md) into a bounded queue under one frozen
 encoding epoch. It implements the queue portion of the
-[v2 admission contract](v2-joint-contract.md#public-write-semantics), with no
-runtime activation, sockets, timers, workers or public Flush/graceful-close
-fences. #20 and #21 remain open. The owner drives time and sealing explicitly.
+[v2 admission contract](v2-joint-contract.md#public-write-semantics). The Linux
+fixed/session Datagram [public runtime](../API.md) supplies time, sealing and
+socket-completion fences. This package itself owns no sockets, timers or
+workers. #20 and #21 remain open for their remaining acceptance requirements.
 
 ## Admission And Bounds
 
@@ -106,6 +107,6 @@ go test ./internal/aggregationv2
 go test -race ./internal/aggregationv2
 ```
 
-This foundation makes no throughput, latency, socket-delivery or public
-Flush/CloseGracefully claim. Future receive reassembly must reserve its own
-storage and retain original deadlines rather than borrowing sender credits.
+These component tests make no throughput or latency claim. Public
+Flush/CloseGracefully belongs to the runtime adapter; receive reassembly owns
+separate storage and original deadlines rather than borrowing sender credits.
