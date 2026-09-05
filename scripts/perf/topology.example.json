@@ -1,0 +1,10 @@
+{
+  "client": "mpudp-client",
+  "server": "mpudp-server",
+  "hypervisor": "ks",
+  "routers": ["mpudp-wan1", "mpudp-wan2", "mpudp-wan3", "mpudp-wan4", "mpudp-wan5"],
+  "server_addresses": ["10.206.1.2", "10.206.2.2", "10.206.3.2", "10.206.4.2", "10.206.5.2"],
+  "rate_mbit_per_path": 100,
+  "one_way_delay_ms": 20,
+  "metering_layer": "HTB router egress skb length; L3/L2 accounting requires calibration; netem 1000 packets; offloads disabled"
+}
