@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from test_probe_runner import arguments, pair_records, SOURCE_SHA, telemetry_fixture
+from test_probe_runner import arguments, pair_records, SOURCE_SHA, telemetry_fixture, v2_receive_fixture
 
 
 spec = importlib.util.spec_from_file_location("probe_report", Path(__file__).with_name("report-probe.py"))
@@ -38,6 +38,38 @@ def fixture():
 
 
 class AccountingTests(unittest.TestCase):
+    def test_v2_receive_reports_counter_deltas_and_decreasing_ending_gauges(self):
+        before, after = sample(0, "receiver"), sample(5, "receiver")
+        self.assertNotIn("v2_receive", reporter.side_cost(before, after))
+        before["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture(100, 20)
+        after["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture(110, 3)
+        got = reporter.side_cost(before, after)["v2_receive"]
+        self.assertEqual(got["counter_deltas"], {key: 10 for key in reporter.runner.V2_RECEIVE_COUNTERS})
+        self.assertEqual(got["end_gauge_snapshot"], {key: 3 for key in reporter.runner.V2_RECEIVE_GAUGES})
+
+    def test_v2_receive_rejects_presence_changes_and_regressing_counters(self):
+        for missing in (0, 1):
+            before, after = sample(0, "receiver"), sample(5, "receiver")
+            (before, after)[1-missing]["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture()
+            with self.assertRaisesRegex(ValueError, "presence changed"):
+                reporter.side_cost(before, after)
+        for key in reporter.runner.V2_RECEIVE_COUNTERS:
+            before, after = sample(0, "receiver"), sample(5, "receiver")
+            before["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture(10)
+            after["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture(10)
+            after["telemetry"]["mpudp"]["v2_receive"][key] = 9
+            with self.assertRaisesRegex(ValueError, "regressing counter"):
+                reporter.side_cost(before, after)
+
+    def test_v2_receive_boundary_values_are_validated_without_archive_wrapper(self):
+        for key in reporter.runner.V2_RECEIVE_COUNTERS + reporter.runner.V2_RECEIVE_GAUGES:
+            before, after = sample(0, "receiver"), sample(5, "receiver")
+            before["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture()
+            after["telemetry"]["mpudp"]["v2_receive"] = v2_receive_fixture()
+            del after["telemetry"]["mpudp"]["v2_receive"][key]
+            with self.assertRaisesRegex(ValueError, "v2 receive"):
+                reporter.side_cost(before, after)
+
     def test_large_lifetime_counters_and_drain_do_not_inflate_rates(self):
         receive, send, pair = fixture()
         send[-1]["telemetry"]["mpudp"]["paths"][0]["sent_bytes"] += 99999999
@@ -179,6 +211,35 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(case["workers"][0]["verified_bytes"], 120)
                 self.assertEqual(case["receiver_results"][0]["echo_rtt"]["p95_ms"], 1)
                 self.assertAlmostEqual(case["workers"][0]["sender"]["cpu_core_percent"], 30)
+
+    def test_complete_v2_artifact_reports_optional_receive_statistics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = self.artifacts(root)
+
+            def add_receive(value):
+                if isinstance(value, dict):
+                    if value.get("mpudp_statistics_available"):
+                        second = int(reporter.runner.instant(value["at_utc"])) % 60
+                        value["mpudp"]["v2_receive"] = v2_receive_fixture(100 + second, 100 - second)
+                    else:
+                        for child in value.values():
+                            add_receive(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        add_receive(child)
+
+            for side in ("client", "server"):
+                path = root / case["case_id"] / f"{side}-0.jsonl"
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                add_receive(rows)
+                path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            self.index(root)
+            worker = reporter.report(root)["cases"][0]["workers"][0]
+            for side in ("sender", "receiver"):
+                got = worker[side]["v2_receive"]
+                self.assertEqual(got["counter_deltas"], {key: 5 for key in reporter.runner.V2_RECEIVE_COUNTERS})
+                self.assertEqual(got["end_gauge_snapshot"], {key: 93 for key in reporter.runner.V2_RECEIVE_GAUGES})
 
     def test_rejects_incomplete_mislabeled_or_duplicate_artifacts(self):
         for failure in ("cleanup", "sha", "hash_format", "duplicate", "profile", "drain"):

@@ -44,6 +44,25 @@ type FECStatistics struct {
 	PendingBytesHighWater      uint64 `json:"pending_bytes_high_water"`
 }
 
+// V2ReceiveStatistics contains authenticated FEC handler attempts, resource
+// rejection attempts and group lifecycle counters. Original admission retries
+// count separately. ExpiredGroups includes terminal expiry/error events, not
+// Close. Pending and credit fields are current aggregate gauges, not totals.
+type V2ReceiveStatistics struct {
+	ReceivedFECBundles          uint64 `json:"received_fec_bundles"`
+	PacketScratchRejections     uint64 `json:"packet_scratch_rejections"`
+	NewGroupRejections          uint64 `json:"new_group_rejections"`
+	OriginalAdmissionRejections uint64 `json:"original_admission_rejections"`
+	DecodedGroups               uint64 `json:"decoded_groups"`
+	CompletedGroups             uint64 `json:"completed_groups"`
+	ExpiredGroups               uint64 `json:"expired_groups"`
+	PendingGroups               int64  `json:"pending_groups"`
+	DecodedPendingGroups        int64  `json:"decoded_pending_groups"`
+	PendingOriginals            int64  `json:"pending_originals"`
+	CreditBytes                 uint64 `json:"credit_bytes"`
+	CreditReservations          int64  `json:"credit_reservations"`
+}
+
 // PathStatistics counts UDP traffic for an anonymous path or socket aggregate.
 // Path never contains a remote address or Session ID.
 type PathStatistics struct {
@@ -66,20 +85,21 @@ type PathStatistics struct {
 // and need not describe the same instant during concurrent I/O.
 // Subtract successive snapshots and divide by elapsed time for bytes/s or PPS.
 type Statistics struct {
-	CapturedAt         time.Time         `json:"captured_at"`
-	DiagnosticsEnabled bool              `json:"diagnostics_enabled"`
-	IngressAccepted    uint64            `json:"ingress_accepted"`
-	IngressDrops       uint64            `json:"ingress_drops"`
-	DeliveryAccepted   uint64            `json:"delivery_accepted"`
-	DeliveryDrops      uint64            `json:"delivery_drops"`
-	DeliveredPackets   uint64            `json:"delivered_packets"`
-	DeliveredBytes     uint64            `json:"delivered_bytes"`
-	SentDatagrams      uint64            `json:"sent_datagrams"`
-	SentDatagramBytes  uint64            `json:"sent_datagram_bytes"`
-	IngressQueue       LatencyStatistics `json:"ingress_queue"`
-	SendLatency        LatencyStatistics `json:"send_latency"`
-	FEC                FECStatistics     `json:"fec"`
-	Paths              []PathStatistics  `json:"paths"`
+	CapturedAt         time.Time            `json:"captured_at"`
+	DiagnosticsEnabled bool                 `json:"diagnostics_enabled"`
+	IngressAccepted    uint64               `json:"ingress_accepted"`
+	IngressDrops       uint64               `json:"ingress_drops"`
+	DeliveryAccepted   uint64               `json:"delivery_accepted"`
+	DeliveryDrops      uint64               `json:"delivery_drops"`
+	DeliveredPackets   uint64               `json:"delivered_packets"`
+	DeliveredBytes     uint64               `json:"delivered_bytes"`
+	SentDatagrams      uint64               `json:"sent_datagrams"`
+	SentDatagramBytes  uint64               `json:"sent_datagram_bytes"`
+	IngressQueue       LatencyStatistics    `json:"ingress_queue"`
+	SendLatency        LatencyStatistics    `json:"send_latency"`
+	FEC                FECStatistics        `json:"fec"`
+	V2Receive          *V2ReceiveStatistics `json:"v2_receive,omitempty"`
+	Paths              []PathStatistics     `json:"paths"`
 	// ListenerPaths counts authenticated, protocol-accepted traffic in at most
 	// 256 lifetime slots plus listener-overflow. Paths retains the raw socket
 	// aggregate, including rejected packets. An accepted CLOSE is attributed
@@ -160,6 +180,9 @@ func (p *Peer) Statistics() Statistics {
 	}
 	if overflow != nil {
 		s.ListenerPaths = append(s.ListenerPaths, pathStatistics("listener-overflow", overflow))
+	}
+	if p.v2 != nil {
+		s.V2Receive = p.v2.receiveStatistics()
 	}
 	return s
 }

@@ -27,6 +27,7 @@ type Controller struct {
 	groups                         map[uint64]*pendingGroup
 	groupHead, groupTail           uint64
 	decodedGroups                  int
+	receiveCounters                ReceiveCounters
 	groupWindow                    *recvwindow.Window
 	groupWindowLease, controlLease *creditv2.Lease
 	sendContext, receiveContext    wirev2.EncodingContext

@@ -45,6 +45,10 @@ V2_QUEUE_BYTES = 1 << 20
 V2_QUEUE_DATAGRAMS = 256
 ADMISSION_COUNTERS = ("backpressured_packets", "rejected_attempts", "retry_attempts", "wait_ns",
                       "canceled_packets", "timeout_packets")
+V2_RECEIVE_COUNTERS = ("received_fec_bundles", "packet_scratch_rejections", "new_group_rejections",
+                       "original_admission_rejections", "decoded_groups", "completed_groups", "expired_groups")
+V2_RECEIVE_GAUGES = ("pending_groups", "decoded_pending_groups", "pending_originals",
+                     "credit_bytes", "credit_reservations")
 ADMISSION_POLICY = {"max_wait_ns": 1000000000, "retry_wait_ns": 100000,
                     "retry_scope": "whole_datagram_resource_limit", "local_drain_limit_ns": 3000000000}
 LOCAL_DRAIN_SCOPE = "admitted_mpudp_datagrams_local_socket_attempts"
@@ -286,8 +290,13 @@ def verify_telemetry(value, case, source_sha):
         raise ValueError("current MPUDP build is missing statistics")
     if case["protocol"] not in MPUDP and available:
         raise ValueError("native protocol unexpectedly reports MPUDP statistics")
+    mpudp = value.get("mpudp")
+    if isinstance(mpudp, dict) and "v2_receive" in mpudp:
+        if (not available or case["protocol"] not in MPUDP or
+                case.get("mpudp_profile", "v1") not in ("v2", "v2-aggregation")):
+            raise ValueError("unexpected v2 receive statistics for this protocol/profile")
+        require_counters(mpudp["v2_receive"], V2_RECEIVE_COUNTERS + V2_RECEIVE_GAUGES, "v2 receive")
     if available:
-        mpudp = value.get("mpudp")
         require_counters(mpudp, ("ingress_accepted", "ingress_drops", "delivery_accepted", "delivery_drops",
                          "delivered_packets", "delivered_bytes", "sent_datagrams", "sent_datagram_bytes"), "MPUDP")
         if mpudp.get("diagnostics_enabled") is not case["diagnostics"]:

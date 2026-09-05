@@ -88,6 +88,18 @@ def side_cost(first, last):
     if a.get("mpudp_statistics_available") != b.get("mpudp_statistics_available"):
         raise ValueError("MPUDP statistics availability changed inside interval")
     if a.get("mpudp_statistics_available"):
+        has_receive = ["v2_receive" in value["mpudp"] for value in (a, b)]
+        if has_receive[0] != has_receive[1]:
+            raise ValueError("v2 receive statistics presence changed inside interval")
+        if has_receive[0]:
+            before_receive, after_receive = a["mpudp"]["v2_receive"], b["mpudp"]["v2_receive"]
+            for value in (before_receive, after_receive):
+                runner.require_counters(value, runner.V2_RECEIVE_COUNTERS + runner.V2_RECEIVE_GAUGES,
+                                        "v2 receive")
+            result["v2_receive"] = {
+                "counter_deltas": delta(before_receive, after_receive, runner.V2_RECEIVE_COUNTERS),
+                "end_gauge_snapshot": {key: after_receive[key] for key in runner.V2_RECEIVE_GAUGES},
+            }
         paths = []
         maps = []
         for value in (a, b):

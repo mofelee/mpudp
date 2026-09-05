@@ -213,6 +213,28 @@ select。
 基本 ingress、交付、admission 和 socket 计数，但尚不提供同等的内部 FEC/路径诊断覆盖；
 零值不能解释成没有丢包或恢复。v2 `SentDatagrams` 统计成功 admission，并非远端交付。
 
+v2 额外提供可选的 `v2_receive` 对象，v1 不输出该字段。
+`received_fec_bundles` 统计通过认证与路由检查后进入 FEC handler 的尝试，包含 body 校验失败和资源拒绝。
+`packet_scratch_rejections`、`new_group_rejections`、`original_admission_rejections`
+分别统计这三个阶段的资源上限拒绝；original admission 每次失败的重试都会再次累计。
+在 Session admission 时预留 packet scratch 的实现中，packet scratch 拒绝计数保持为零。
+`decoded_groups` 统计成功完成 FEC 解码的组，`completed_groups` 统计组内所有解码 fragment
+原子进入 original 重组的次数，并不代表完整 original 已交付。`expired_groups` 统计终止性的
+超时或错误事件，不包含 Close。累计计数在 Session 释放和 Peer 关闭后继续保留。
+
+`pending_groups`、`decoded_pending_groups`、`pending_originals` 是所有存活 Session 的当前
+占用；decoded-pending 组也包含在 pending 组数内。`credit_bytes` 和 `credit_reservations`
+采样整个 Peer ledger 的当前占用，包含 pending handshake、接收和发送中的工作，以及应用仍持有的
+交付数据，不是仅接收方向的 credit。字节表示已计费的所有权或预留责任，不代表 heap 或 RSS。
+这些 gauge 可以下降，不能当作累计计数。采样仅获取一次 v2 owner mutex，读取 controller 的标量
+状态和一次 Peer credit 快照；接收事件不会复制路径或增加 credit 快照读取。
+`CapturedAt` 在开始收集前记录，也早于可能发生的 mutex 等待，不保证所有字段都恰好在该时刻读取。
+
+性能 runner 兼容缺少 `v2_receive` 的旧 v2 归档。字段存在时，所有已定义的 counter 和 gauge
+都必须是非负整数；v1 或原生协议不能输出该对象。区间报告分别输出 `counter_deltas` 和
+`end_gauge_snapshot`，拒绝所选边界之间的累计计数回退或对象存在性变化。gauge 下降是合法的，
+报告保留其结束时快照，不计算差分。
+
 默认记录 ingress accepted/drop、delivery accepted/drop、成功写入的 Datagram 和实际
 `ReadPacket` 返回的 payload 字节，以及 FEC 完成、需要 parity 的恢复 block/缺失 data
 shard、pending 超时、decoder-full、pending duplicate、已完成 ID 的 late shard，以及

@@ -192,6 +192,7 @@ func (r *v2Peer) dispose(s *v2Session) {
 	close(s.done)
 	s.notify()
 	if s.controller != nil {
+		r.retiredReceive.Add(s.controller.ReceiveStatistics().ReceiveCounters)
 		s.controller.Close()
 	}
 	for len(s.delivery) > 0 {
