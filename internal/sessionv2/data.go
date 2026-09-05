@@ -81,7 +81,8 @@ func (c *Controller) driveData(now time.Time, result *Result) error {
 				return ErrNotReady
 			}
 		}
-		// Wire assembly owns a temporary body and envelope simultaneously.
+		// Keep the conservative two-packet assembly budget even though the
+		// nil-destination encoder uses one backing allocation.
 		packetBytes := wirev2.TypedBodyOverhead + wirev2.FECBundlePrefixSize + wirev2.FECRecordHeaderSize + int(c.sendContext.ShardBytes)
 		lease, err := c.setup.Scope.Reserve(creditv2.Claim{Bytes: uint64(2 * packetBytes)})
 		if err != nil {

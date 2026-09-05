@@ -137,12 +137,12 @@ func (s *v2Session) waitFence(ctx context.Context, frontier uint64) error {
 			r.mu.Unlock()
 			return err
 		}
-		snapshot := s.controller.Snapshot()
+		completed, failedFrom, sendError := s.controller.Completion()
 		var failure error
-		if snapshot.FailedFrom != 0 && snapshot.FailedFrom <= frontier {
-			failure = mapV2Error(snapshot.SendError)
+		if failedFrom != 0 && failedFrom <= frontier {
+			failure = mapV2Error(sendError)
 		}
-		if snapshot.CompletedThrough >= frontier {
+		if completed >= frontier {
 			r.mu.Unlock()
 			return failure
 		}
